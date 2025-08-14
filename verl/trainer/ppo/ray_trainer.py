@@ -61,6 +61,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.trainer.ppo.one_logger_integration import OneLoggerInstrumented
 
 WorkerType = type[Worker]
 
@@ -291,7 +292,7 @@ def compute_advantage(
     return data
 
 
-class RayPPOTrainer:
+class RayPPOTrainer(OneLoggerInstrumented):
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
     This trainer orchestrates distributed PPO training across multiple nodes and GPUs,
