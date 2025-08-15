@@ -36,7 +36,7 @@ class Tracking:
 
     supported_backend = ["wandb", "mlflow", "swanlab", "vemlp_wandb", "tensorboard", "console", "clearml", "trackio"]
 
-    def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
+    def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None, **kwargs):
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -55,7 +55,7 @@ class Tracking:
             settings = None
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
-            wandb.init(project=project_name, name=experiment_name, config=config, settings=settings)
+            wandb.init(project=project_name, name=experiment_name, config=config, settings=settings, id=kwargs.get('config', {}).get('wandb_id', None), resume='allow')
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:

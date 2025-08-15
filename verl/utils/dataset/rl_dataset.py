@@ -17,6 +17,8 @@
 import copy
 import logging
 import os
+import json
+import pandas as pd
 import re
 from collections import defaultdict
 from typing import Optional
@@ -33,6 +35,11 @@ from verl.utils.model import compute_position_id_with_mask
 
 logger = logging.getLogger(__name__)
 
+def _to_hf_dataset(df: pd.DataFrame) -> datasets.Dataset:
+    """
+    Convert a pandas DataFrame to a 🤗 datasets.Dataset, dropping the pandas index.
+    """
+    return datasets.Dataset.from_pandas(df, preserve_index=False)
 
 def collate_fn(data_list: list[dict]) -> dict:
     """
@@ -132,7 +139,24 @@ class RLHFDataset(Dataset):
         dataframes = []
         for parquet_file in self.data_files:
             # read parquet files and cache
-            dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+            if parquet_file.endswith('.parquet'):
+                # read parquet files and cache
+                dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+            elif parquet_file.endswith('.jsonl'):
+                d = []
+                with open(parquet_file, 'r') as f:
+                    num_lines = 0
+                    for i, line in enumerate(f):
+                        num_lines += 1
+                        try:
+                            line = json.loads(line)
+                            line['extra_info']['line_number'] = json.dumps(i+1)
+                            d.append(line)
+                        except:
+                            pass
+                print(f'Read {len(d)}/{num_lines} lines for {parquet_file}')
+                dataframe = pd.DataFrame(d)
+                dataframe = _to_hf_dataset(dataframe)
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
