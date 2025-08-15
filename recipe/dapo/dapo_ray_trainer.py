@@ -16,6 +16,7 @@ FSDP PPO Trainer with Ray-based single controller.
 This trainer supports model-agonistic model initialization with huggingface
 """
 
+import random
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -48,6 +49,16 @@ class RayDAPOTrainer(RayPPOTrainer):
     """
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
+
+    def _filter_and_fill_prompts(self, kept_prompt_uids, prompt_uid2metric_std, num_prompt_in_batch, num_gen_batches):
+        num_remaining = self.config.data.train_batch_size - num_prompt_in_batch - len(kept_prompt_uids)
+        if (num_gen_batches >= self.config.algorithm.filter_groups.max_num_gen_batches) and num_remaining > 0:
+            kept_prompt_uids_set = set(kept_prompt_uids)
+            not_kept_prompt_uids = [uid for uid, std in prompt_uid2metric_std.items() if uid not in kept_prompt_uids_set]
+            random.shuffle(not_kept_prompt_uids)
+            return not_kept_prompt_uids[:num_remaining]
+        else:
+            return []
 
     def fit(self):
         """
@@ -234,6 +245,8 @@ class RayDAPOTrainer(RayPPOTrainer):
                             for uid, std in prompt_uid2metric_std.items()
                             if std > 0 or len(prompt_uid2metric_vals[uid]) == 1
                         ]
+
+                        kept_prompt_uids.extend(self._filter_and_fill_prompts(kept_prompt_uids, prompt_uid2metric_std, num_prompt_in_batch, num_gen_batches))
                         num_prompt_in_batch += len(kept_prompt_uids)
 
                         kept_traj_idxs = []
