@@ -221,6 +221,34 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    metrics = compute_data_metrics_reward(batch, metrics)
+
+    return metrics
+
+def compute_data_metrics_reward(batch, metrics):
+    """
+    Replacement for compute_data_metrics that also looks for
+    batch.non_tensor_batch["metrics"] produced by the reward fn.
+    """
+    # Did the reward function attach extra metrics?
+    for k, v in batch.non_tensor_batch.items():
+        if not k.startswith('reward/'):
+            continue
+        # `extra` may already be a dict of scalar values
+        if isinstance(v, (list, np.ndarray)):
+            # an unnamed vector – log its mean
+            try:
+                metrics[k] = float(np.mean(v))
+            except:
+                print(f"Error computing mean of {k}")
+        elif isinstance(v, dict):
+            pass
+        else:
+            try:
+                metrics[k] = float(v)
+            except:
+                pass
+
     return metrics
 
 
@@ -380,7 +408,7 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
 
 
 def process_validation_metrics(
-    data_sources: list[str], sample_inputs: list[str], infos_dict: dict[str, list[Any]], seed: int = 42
+    data_sources: list[str], sample_inputs: list[str], infos_dict: dict[str, list[Any]], seed: int = 42, multiple_pass_at_k: bool = False
 ) -> dict[str, dict[str, dict[str, float]]]:
     """
     Process validation metrics into a structured format with statistical analysis.
@@ -448,7 +476,7 @@ def process_validation_metrics(
 
                     ns = []
                     n = 2
-                    while n < n_resps:
+                    while (n < n_resps) and multiple_pass_at_k:
                         ns.append(n)
                         n *= 2
                     ns.append(n_resps)
