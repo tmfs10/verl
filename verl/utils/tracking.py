@@ -55,7 +55,7 @@ class Tracking:
         "file",
     ]
 
-    def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None):
+    def __init__(self, project_name, experiment_name, default_backend: str | list[str] = "console", config=None, **kwargs):
         if isinstance(default_backend, str):
             default_backend = [default_backend]
         for backend in default_backend:
@@ -77,7 +77,20 @@ class Tracking:
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
             entity = os.environ.get("WANDB_ENTITY", None)
-            wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
+            wandb_id = kwargs.get("wandb_id")
+            if wandb_id is None and config is not None:
+                wandb_id = config.get("wandb_id", None)
+            if wandb_id is None and config is not None and config.get("trainer", None) is not None:
+                wandb_id = config["trainer"].get("wandb_id", None)
+            wandb.init(
+                project=project_name,
+                name=experiment_name,
+                entity=entity,
+                config=config,
+                settings=settings,
+                id=wandb_id,
+                resume="allow",
+            )
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:
