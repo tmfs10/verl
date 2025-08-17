@@ -176,7 +176,7 @@ class RLHFDataset(Dataset):
                         num_lines += 1
                         try:
                             line = json.loads(line)
-                            line.setdefault("extra_info", {})["line_number"] = json.dumps(i + 1)
+                            line.setdefault("extra_info", {})["line_number"] = json.dumps(i)
                             d.append(line)
                         except Exception:
                             pass
