@@ -143,3 +143,5 @@ class RolloutConfig(BaseConfig):
     layered_summon: bool = False
 
     layer_name_map: dict = field(default_factory=dict)
+
+    seed: int = 0

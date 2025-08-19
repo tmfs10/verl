@@ -145,10 +145,13 @@ def main_task(config):
     assert config.data.n_samples >= 1, "n_samples should always >= 1"
 
     os.makedirs(config.data.output_path, exist_ok=True)
-    indices_done_path = os.path.join(config.data.output_path, f'rank_{config.rank}_indices_done.txt')
+    seed = config.rollout.seed
+    indices_done_path = os.path.join(config.data.output_path, f'rank_{config.rank}_{seed}_indices_done.txt')
 
     if not config.resume:
         shutil.rmtree(config.data.output_path, ignore_errors=True)
+
+    assert config.data.batch_size % (config.trainer.n_gpus_per_node * config.trainer.nnodes) == 0, f"batch_size {config.data.batch_size} must be divisible by n_gpus_per_node {config.trainer.n_gpus_per_node} * nnodes {config.trainer.nnodes}"
 
     from verl.utils import hf_processor
     processor = hf_processor(local_path, trust_remote_code=True, use_fast=True)
@@ -158,7 +161,7 @@ def main_task(config):
     dataset = GenerateDataset(data_files=[config.data.path], tokenizer=tokenizer, processor=processor, config=config.data, exclude_indices_file=indices_done_path, rank=config.rank, world_size=config.world_size)
     dataloader = StatefulDataLoader(dataset, batch_size=config.data.batch_size, shuffle=config.data.shuffle, num_workers=config.data.dataloader.num_workers, collate_fn=collate_fn)
 
-    config.data.output_path = os.path.join(config.data.output_path, f'rank_{config.rank}.jsonl')
+    config.data.output_path = os.path.join(config.data.output_path, f'rank_{config.rank}_{seed}.jsonl')
 
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
@@ -178,7 +181,7 @@ def main_task(config):
 
     with open(config.data.output_path, mode) as f, open(indices_done_path, mode) as f_done:
         iteration = 0
-        for batch_dict in dataloader:
+        for i_batch, batch_dict in enumerate(dataloader):
             iteration += 1
             timing = {}
             metrics = {}
@@ -204,6 +207,7 @@ def main_task(config):
             timing['generation_start'] = time.time()
             data_gen_batch = wg.generate_sequences(data_gen_batch)
             timing['generation_end'] = time.time()
+            print(f'Generated batch: {i_batch}')
             timing['generation_duration'] = timing['generation_end'] - timing['generation_start']
 
             output_ids = data_gen_batch.batch["responses"]
