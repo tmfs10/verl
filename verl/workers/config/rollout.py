@@ -227,6 +227,7 @@ class RolloutConfig(BaseConfig):
 
     layer_name_map: dict = field(default_factory=dict)
 
+<<<<<<< HEAD
     sglang_engine_mode: str = "local"
 
     limit_images: Optional[int] = None
@@ -244,6 +245,8 @@ class RolloutConfig(BaseConfig):
     mtp: MtpConfig = field(default_factory=MtpConfig)
 
     qat: Optional[dict] = None
+
+    seed: int = 0
 
     def __post_init__(self):
         """Validate the rollout config"""
