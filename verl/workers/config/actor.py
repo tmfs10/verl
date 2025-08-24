@@ -74,13 +74,18 @@ class PolicyLossConfig(BaseConfig):
     The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
 
     Args:
-        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg'.
+        loss_mode (str): Loss function mode. Options: 'vanilla', 'clip-cov', 'kl-cov', 'gpg', 'topr'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
         kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
         ppo_kl_coef (float): KL divergence penalty coefficient.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
+        topr_a_pos (float): Lower clipping bound a+ for TOPR sequence ratio when advantage is non-negative.
+        topr_b_pos (float): Upper clipping bound b+ for TOPR sequence ratio when advantage is non-negative.
+        topr_a_neg (float): Lower clipping bound a- for TOPR sequence ratio when advantage is negative.
+        topr_b_neg (float): Upper clipping bound b- for TOPR sequence ratio when advantage is negative.
+        topr_use_seq_geom_ratio (bool): Use geometric-mean sequence ratio exp(mean(log r_t)) for stability.
     """
 
     loss_mode: str = "vanilla"
@@ -90,6 +95,12 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+    # TOPR-specific parameters (asymmetric clipping on sequence-level importance ratio)
+    topr_a_pos: float = 0.0
+    topr_b_pos: float = 1.0e6
+    topr_a_neg: float = 0.0
+    topr_b_neg: float = 1.0
+    topr_use_seq_geom_ratio: bool = True
 
 
 @dataclass
