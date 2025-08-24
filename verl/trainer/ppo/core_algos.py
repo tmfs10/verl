@@ -975,6 +975,86 @@ def compute_policy_loss_gpg(old_log_prob, log_prob, advantages, response_mask, l
     return pg_loss, torch.tensor(0.0), torch.tensor(0.0), torch.tensor(0.0)
 
 
+@register_policy_loss("topr")
+def compute_policy_loss_topr(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | ActorConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Tapered Off-Policy REINFORCE (TOPR) style loss using advantages.
+
+    Implements Eq. (11) of the paper (see https://arxiv.org/pdf/2503.14286)
+    but substitutes the return R(τ) with the sequence advantage A(τ).
+
+    We compute a sequence-level importance ratio r_seq = exp(mean_t (log π - log π_old))
+    and apply asymmetric clipping on r_seq depending on the sign of A(τ):
+        - If A(τ) >= 0, use clip [a+, b+] (often [0, +inf])
+        - If A(τ) < 0,  use clip [a-, b-] (often [0, 1])
+
+    Then we weight token-wise log-prob gradients by the (stop-grad) clipped r_seq and A(τ).
+
+    Args:
+        old_log_prob: (bs, T)
+        log_prob:     (bs, T)
+        advantages:   (bs, T) token-wise advantages
+        response_mask:(bs, T)
+        loss_agg_mode: aggregation method
+        config: Actor/Algo config. TOPR hyperparams are read from config.policy_loss.
+    """
+
+    assert config is not None
+    assert isinstance(config, ActorConfig)
+
+    # Read TOPR hyperparameters with reasonable defaults
+    a_pos = getattr(config.policy_loss, "topr_a_pos", 1.0)
+    b_pos = getattr(config.policy_loss, "topr_b_pos", 1.0)
+    a_neg = getattr(config.policy_loss, "topr_a_neg", 0.0)
+    b_neg = getattr(config.policy_loss, "topr_b_neg", 1.0)
+    use_seq_geom_ratio = getattr(config.policy_loss, "topr_use_seq_geom_ratio", True)
+
+    # Compute per-token log-importance, clamp for numerical stability
+    negative_approx_kl = log_prob - old_log_prob  # (bs, T)
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+
+    if use_seq_geom_ratio:
+        # sequence-level geometric mean of ratios: exp(mean over valid tokens of log ratio))
+        seq_lengths = torch.sum(response_mask, dim=-1).clamp(min=1)
+        seq_log_ratio = torch.sum(negative_approx_kl * response_mask, dim=-1) / seq_lengths  # (bs,)
+        r_seq = torch.exp(seq_log_ratio).unsqueeze(-1)  # (bs,1)
+    else:
+        # use per token ratios
+        r_seq = torch.exp(negative_approx_kl) # (bs, T)
+
+    # Asymmetric clipping depending on sign of A(τ)
+    r_pos = torch.clamp(r_seq, min=a_pos, max=b_pos)
+    r_neg = torch.clamp(r_seq, min=a_neg, max=b_neg)
+    r_taper = torch.where(advantages >= 0, r_pos, r_neg)  # (bs,)
+
+    # Stop gradient through the ratio, as per importance weight treatment
+    r_taper = r_taper.detach().unsqueeze(-1)  # (bs,1)
+
+    # Token-wise loss: - A(τ) * r_taper * log π_θ(y_t|...)
+    pg_losses = -advantages * r_taper * log_prob
+
+    # Aggregate
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    # Metrics: PPO-style KL on tokens; clipfrac indicates how often negative side was activated
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    # crude indicator: whether r_seq was clipped on negative side
+    was_clipped_neg = (advantages < 0) & ((r_seq < a_neg) | (r_seq > b_neg))
+    was_clipped_pos = (advantages >= 0) & ((r_seq < a_pos) | (r_seq > b_pos))
+    # broadcast to tokens for masked mean
+    pg_clipfrac = verl_F.masked_mean(was_clipped_pos.float(), response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean(was_clipped_neg.float(), response_mask)
+
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+
 @register_policy_loss("clip_cov")
 def compute_policy_loss_clip_cov(
     old_log_prob: torch.Tensor,
@@ -1207,6 +1287,69 @@ def compute_policy_loss_geo_mean(
     pg_clipfrac = verl_F.masked_mean((clipped * (advantages > 0)).float(), response_mask)
     pg_clipfrac_lower = verl_F.masked_mean((clipped * (advantages < 0)).float(), response_mask)
 
+    return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
+
+@register_policy_loss("cispo")
+def compute_policy_loss_cispo(
+    old_log_prob: torch.Tensor,           # (bs, T)
+    log_prob: torch.Tensor,               # (bs, T)
+    advantages: torch.Tensor,             # (bs, T)
+    response_mask: torch.Tensor,          # (bs, T) in {0,1}
+    loss_agg_mode: str = "token-mean",
+    config: Optional[DictConfig | ActorConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    print('WARNING: COMPUTE_POLICY_LOSS_CISPO IS NOT FULLY TESTED OR DEBUGGED YET')
+
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+    clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+    clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
+        "clip_ratio_c", 3.0
+    )
+
+    cliprange = clip_ratio
+    cliprange_low = clip_ratio_low
+    cliprange_high = clip_ratio_high
+
+    assert clip_ratio_c > 1.0, (
+        "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+        + f" but get the value: {clip_ratio_c}."
+    )
+
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+
+    # Eq. (4): weight is stop-grad of a clipped IS ratio; multiply with Â and log πθ
+    # sequence-level log-ratio (sum over masked tokens)
+    negative_approx_kl = log_prob - old_log_prob                   # (bs, T)
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+
+    r_hat = torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)  # - clip(ratio, 1-cliprange, 1+cliprange)
+
+    # stop-gradient as required by Eq. (4)
+    r_hat = r_hat.detach()
+
+    # REINFORCE with token-wise advantages and log-probs
+    # loss is negative objective
+    pg_losses = - r_hat * advantages * log_prob                              # (bs, T)
+
+    # aggregate like Eq. (4): average over all valid tokens
+    pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+    # metrics (keep contract with callers)
+    clipped = (torch.ne(torch.clamp(ratio, 1.0 - cliprange_low, 1.0 + cliprange_high), ratio)).float()
+    # define per-token clipfrac for consistency: broadcast sequence decision to its tokens
+    pg_clipfrac = verl_F.masked_mean(clipped, response_mask)
+
+    # PPO-style KL metric for logging
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 

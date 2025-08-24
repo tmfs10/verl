@@ -137,6 +137,7 @@ class RLHFDataset(Dataset):
 
     def _read_files_and_tokenize(self):
         dataframes = []
+        skip_acc_bounds = self.config.get("skip_acc_bounds", None)
         for parquet_file in self.data_files:
             # read parquet files and cache
             if parquet_file.endswith('.parquet'):
@@ -150,6 +151,13 @@ class RLHFDataset(Dataset):
                         num_lines += 1
                         try:
                             line = json.loads(line)
+                            if skip_acc_bounds is not None:
+                                if 'scores' in line:
+                                    acc = [score['acc'] for score in line['scores']]
+                                    assert len(acc) > 0, f"Expected at least one score, got {len(acc)}"
+                                    acc = sum(acc) / len(acc)
+                                    if acc < skip_acc_bounds[0] or acc > skip_acc_bounds[1]:
+                                        continue
                             if 'extra_info' not in line:
                                 line['extra_info'] = {}
                             line['extra_info']['line_number'] = json.dumps(i)
