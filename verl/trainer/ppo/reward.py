@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib.util
+import inspect
 import multiprocessing
 import os
 import sys
@@ -28,6 +29,25 @@ from verl import DataProto
 from verl.utils.reward_score import default_compute_score
 from verl.workers.reward_manager import get_reward_manager_cls
 from verl.workers.reward_manager.abstract import AbstractRewardManager, RawRewardFn
+
+
+def _select_kwargs_for_callable(fn: Any, provided: dict[str, Any]) -> dict[str, Any]:
+    """Return only kwargs accepted by callable `fn`.
+
+    - If `fn` accepts var-keywords (i.e., **kwargs), return all provided.
+    - Otherwise, filter to names present in the signature.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):  # builtins or callables without signature
+        return {}
+
+    # If accepts **kwargs, pass everything
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return dict(provided)
+
+    accepted = {name for name in sig.parameters.keys()}
+    return {k: v for k, v in provided.items() if k in accepted}
 
 
 def _call_with_kwargs(raw_fn, extra_kwargs, *args, **kwargs):
@@ -148,7 +168,11 @@ def load_reward_manager(
     )
 
 
-def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[torch.Tensor, dict[str, Any]]:
+def compute_reward(
+    data: DataProto,
+    reward_fn: AbstractRewardManager | RawRewardFn,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute reward for a batch of data.
     Args:
@@ -157,20 +181,29 @@ def compute_reward(data: DataProto, reward_fn: AbstractRewardManager) -> tuple[t
     Returns:
         Tuple of reward tensor and extra info dictionary.
     """
+    # Determine the effective callable to inspect
+    call_target = reward_fn
+    if not inspect.isfunction(reward_fn) and hasattr(reward_fn, "__call__"):
+        call_target = reward_fn.__call__
+
+    filtered_kwargs = _select_kwargs_for_callable(call_target, kwargs)
+
     try:
-        reward_result = reward_fn(data, return_dict=True)
+        reward_result = reward_fn(data, return_dict=True, **filtered_kwargs)
         reward_tensor = reward_result["reward_tensor"]
         reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
     except Exception as e:
         print(f"Error in reward_fn: {e}")
-        reward_tensor = reward_fn(data)
+        # Fallback to legacy call without return_dict
+        fallback_kwargs = _select_kwargs_for_callable(call_target, {})
+        reward_tensor = reward_fn(data, **fallback_kwargs)
         reward_extra_infos_dict = {}
 
     return reward_tensor, reward_extra_infos_dict
 
 
 @ray.remote(num_cpus=1)
-def compute_reward_async(data: DataProto, config=None, tokenizer=None, reward_fn=None):
+def compute_reward_async(data: DataProto, config=None, tokenizer=None, reward_fn=None, **kwargs):
     """
     Load the reward manager and compute the reward for a batch of data.
     This is meant to be run in a separate Ray worker.
@@ -185,4 +218,4 @@ def compute_reward_async(data: DataProto, config=None, tokenizer=None, reward_fn
             config, tokenizer, num_examine=0, **config.reward_model.get("reward_kwargs", {})
         )
 
-    return compute_reward(data, reward_fn)
+    return compute_reward(data, reward_fn, **kwargs)

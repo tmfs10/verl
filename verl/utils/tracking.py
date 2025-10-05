@@ -53,9 +53,13 @@ class Tracking:
             import wandb
 
             settings = None
+            wandb_id = None
+            print(f"{config=}")
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
-            wandb.init(project=project_name, name=experiment_name, config=config, settings=settings, id=kwargs.get('config', {}).get('wandb_id', None), resume='allow')
+            wandb_id = config.get('wandb_id', None) if config is not None else None
+            assert wandb_id is not None, "wandb_id is required"
+            wandb.init(project=project_name, name=experiment_name, config=config, settings=settings, id=wandb_id, resume='allow')
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:

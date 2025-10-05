@@ -1,4 +1,5 @@
 import json
+import math
 from collections import defaultdict
 
 import numpy as np
@@ -25,12 +26,18 @@ def main(config):
     output_eval_dir = config.data.output_path
     os.makedirs(output_eval_dir, exist_ok=True)
     output_filepaths = [f for f in os.listdir(output_eval_dir) if f.endswith(".jsonl")]
-    max_line_number = max([int(f.split(".")[0]) for f in output_filepaths]) if output_filepaths else -1
+    max_line_number = max([int(f.split(".")[0][len("eval_"):]) for f in output_filepaths]) if output_filepaths else -1
     rank = config.get("rank", 0)
     world_size = config.get("world_size", 1)
+    num_lines = 0
     with open(config.data.val_files, "r") as f:
         for i, line in enumerate(f):
-            if i % world_size != rank:
+            num_lines += 1
+    rank_batch_size = int(math.ceil(num_lines / world_size))
+    rank_batches = [[rank_batch_size * local_rank, min(rank_batch_size * (local_rank + 1), num_lines)] for local_rank in range(world_size)]
+    with open(config.data.val_files, "r") as f:
+        for i, line in enumerate(f):
+            if i < rank_batches[rank][0] or i >= rank_batches[rank][1]:
                 continue
             data = json.loads(line)
             line_number = data.get('extra_info', {}).get('line_number', None)
@@ -75,7 +82,6 @@ def main(config):
         with open(output_filepath, "w") as f:
             for i, d in enumerate(batch):
                 responses = responses_str[j:j+num_outputs[i]]
-                answers = [score_result[j]['answer_str'] for j in range(num_outputs[i])]
                 d['response_strs'] = responses
                 d['scores'] = score_result[j:j+num_outputs[i]]
                 j += num_outputs[i]

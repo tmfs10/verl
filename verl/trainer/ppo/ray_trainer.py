@@ -715,15 +715,22 @@ class RayPPOTrainer(OneLoggerInstrumented):
             # evaluate using reward_function
             if self.val_reward_fn is None:
                 raise ValueError("val_reward_fn must be provided for validation.")
-            result = self.val_reward_fn(test_batch, return_dict=True)
-            reward_tensor = result["reward_tensor"]
+            # Route through compute_reward to pass optional kwargs like actor_wg
+            reward_tensor, reward_extras = compute_reward(
+                test_batch, self.val_reward_fn, actor_wg=self.actor_rollout_wg
+            )
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
             print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
-            if "reward_extra_info" in result:
-                for key, lst in result["reward_extra_info"].items():
+            if reward_extras:
+                for key, lst in reward_extras.items():
+                    if key == "reward":
+                        continue
+                    # Ensure list type
+                    if isinstance(lst, torch.Tensor):
+                        lst = lst.detach().cpu().tolist()
                     reward_extra_infos_dict[key].extend(lst)
                     print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
 
@@ -1157,7 +1164,10 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             else:
                                 gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
                             batch = batch.union(gen_baseline_output)
-                            reward_baseline_tensor = self.reward_fn(batch)
+                            # Compute baseline reward with optional kwargs (e.g., actor_wg)
+                            reward_baseline_tensor, _ = compute_reward(
+                                batch, self.reward_fn, actor_wg=self.actor_rollout_wg
+                            )
                             reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
 
                             batch.pop(batch_keys=list(gen_baseline_output.batch.keys()))
@@ -1190,9 +1200,13 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             batch = batch.union(reward_tensor)
 
                         if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
+                            future_reward = compute_reward_async.remote(
+                                data=batch, reward_fn=self.reward_fn, actor_wg=self.actor_rollout_wg
+                            )
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            reward_tensor, reward_extra_infos_dict = compute_reward(
+                                batch, self.reward_fn, actor_wg=self.actor_rollout_wg
+                            )
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
