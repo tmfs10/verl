@@ -300,9 +300,13 @@ class RayTrainerOffPolicy(RayTrainer):
                             )
                         elif self.config.reward_model.launch_reward_fn_async:
                             used_async_reward = True
-                            future_reward = compute_reward_async.remote(data=batch, reward_fn=self.reward_fn)
+                            future_reward = compute_reward_async.remote(
+                                data=batch, reward_fn=self.reward_fn, actor_wg=self.actor_rollout_wg
+                            )
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            reward_tensor, reward_extra_infos_dict = compute_reward(
+                                batch, self.reward_fn, actor_wg=self.actor_rollout_wg
+                            )
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):

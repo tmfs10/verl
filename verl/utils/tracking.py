@@ -74,6 +74,7 @@ class Tracking:
             import wandb
 
             settings = None
+            wandb_id = None
             if config and config["trainer"].get("wandb_proxy", None):
                 settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
             entity = os.environ.get("WANDB_ENTITY", None)

@@ -27,6 +27,7 @@ from pprint import pprint
 from typing import Any, Optional
 
 import numpy as np
+import ray
 import torch
 from omegaconf import OmegaConf, open_dict
 from torch.utils.data import Dataset, Sampler
@@ -49,7 +50,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
-from verl.trainer.ppo.reward import extract_reward
+from verl.trainer.ppo.reward import compute_reward, compute_reward_async, extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils import tensordict_utils as tu
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
@@ -577,16 +578,25 @@ class RayPPOTrainer(OneLoggerInstrumented):
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
 
             # evaluate using reward_function
-            reward_tensor, reward_extra_info = extract_reward(test_batch)
-
+            val_reward_fn = getattr(self, "val_reward_fn", None)
+            if val_reward_fn is not None:
+                reward_tensor, reward_extra_info = compute_reward(
+                    test_batch, val_reward_fn, actor_wg=self.actor_rollout_wg
+                )
+            else:
+                reward_tensor, reward_extra_info = extract_reward(test_batch)
             scores = reward_tensor.sum(-1).cpu().tolist()
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
             for key, values in reward_extra_info.items():
+                if key == "reward":
+                    continue
                 if key not in reward_extra_infos_dict:
                     reward_extra_infos_dict[key] = []
-                if isinstance(values, np.ndarray):
+                if isinstance(values, torch.Tensor):
+                    reward_extra_infos_dict[key].extend(values.detach().cpu().tolist())
+                elif isinstance(values, np.ndarray):
                     reward_extra_infos_dict[key].extend(values.tolist())
                 else:
                     reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
@@ -1338,14 +1348,21 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             if curr_step_profile:
                                 self.async_rollout_manager.stop_profile()
                             batch = batch.union(gen_baseline_output)
-                            # compute reward model score on batch
+                            reward_fn = getattr(self, "reward_fn", None)
                             rm_scores = None
-                            if self.use_rm and "rm_scores" not in batch.batch.keys():
-                                batch_reward = self._compute_reward_colocate(batch)
-                                batch = batch.union(batch_reward)
+                            if reward_fn is not None:
+                                reward_baseline_tensor, _ = compute_reward(
+                                    batch, reward_fn, actor_wg=self.actor_rollout_wg
+                                )
+                                reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
+                            else:
+                            # compute reward model score on batch
+                                if self.use_rm and "rm_scores" not in batch.batch.keys():
+                                    rm_scores = self._compute_reward_colocate(batch)
+                                    batch = batch.union(rm_scores)
 
-                            # Compute or extract reward for REMAX baseline
-                            reward_baseline_tensor = batch.batch["rm_scores"].sum(dim=-1)
+                                # Compute or extract reward for REMAX baseline
+                                reward_baseline_tensor = batch.batch["rm_scores"].sum(dim=-1)
 
                             keys_to_pop = set(gen_baseline_output.batch.keys())
                             if rm_scores is not None:
@@ -1377,14 +1394,22 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
+                    future_reward = None
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
                             batch = batch.union(batch_reward)
 
-                        # extract reward_tensor and reward_extra_infos_dict for training
-                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        reward_fn = getattr(self, "reward_fn", None)
+                        if reward_fn is not None and self.config.reward_model.launch_reward_fn_async:
+                            future_reward = compute_reward_async.remote(data=batch, reward_fn=reward_fn, actor_wg=self.actor_rollout_wg)
+                        elif reward_fn is not None:
+                            reward_tensor, reward_extra_infos_dict = compute_reward(
+                                batch, reward_fn, actor_wg=self.actor_rollout_wg
+                            )
+                        else:
+                            reward_tensor, reward_extra_infos_dict = extract_reward(batch)
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1450,6 +1475,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
                     with marked_timer("adv", timing_raw, color="brown"):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
+                        if future_reward is not None:
+                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
