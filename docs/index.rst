@@ -62,6 +62,7 @@ verl is fast with:
    examples/ppo_code_architecture
    examples/gsm8k_example
    examples/multi_modal_example
+   examples/skypilot_examples
 
 .. toctree::
    :maxdepth: 1
@@ -69,6 +70,7 @@ verl is fast with:
 
    algo/ppo.md
    algo/grpo.md
+   algo/collabllm.md
    algo/dapo.md
    algo/spin.md
    algo/sppo.md
@@ -85,6 +87,7 @@ verl is fast with:
    workers/fsdp_workers
    workers/megatron_workers
    workers/sglang_worker
+   workers/model_engine
 
 .. toctree::
    :maxdepth: 1
@@ -94,6 +97,7 @@ verl is fast with:
    perf/perf_tuning
    README_vllm0.8.md
    perf/device_tuning
+   perf/verl_profiler_system.md
    perf/nsight_profiling.md
 
 .. toctree::
@@ -127,8 +131,9 @@ verl is fast with:
    amd_tutorial/amd_build_dockerfile_page.rst
    amd_tutorial/amd_vllm_page.rst
    ascend_tutorial/ascend_quick_start.rst
-   ascend_tutorial/ascend_profiling.rst
+   ascend_tutorial/ascend_profiling_zh.rst
    ascend_tutorial/ascend_profiling_en.rst
+   ascend_tutorial/ascend_sglang_quick_start.rst
 
 .. toctree::
    :maxdepth: 1

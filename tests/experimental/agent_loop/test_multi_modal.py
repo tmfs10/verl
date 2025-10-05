@@ -22,7 +22,7 @@ from omegaconf import DictConfig
 from PIL import Image
 from transformers.utils import get_json_schema
 
-from tests.experimental.agent_loop.agent_utils import init_agent_loop_manager
+from verl.experimental.agent_loop import AgentLoopManager
 from verl.protocol import DataProto
 from verl.tools.base_tool import BaseTool, OpenAIFunctionToolSchema
 from verl.tools.schemas import ToolResponse
@@ -44,14 +44,16 @@ def init_config() -> DictConfig:
             ],
         )
 
-    model_path = "Qwen/Qwen2.5-VL-3B-Instruct"
+    model_path = os.path.expanduser("~/models/Qwen/Qwen2.5-VL-3B-Instruct")
     config.actor_rollout_ref.model.path = model_path
     config.actor_rollout_ref.rollout.name = os.environ["ROLLOUT_NAME"]
     config.actor_rollout_ref.rollout.mode = "async"
+    config.actor_rollout_ref.rollout.enforce_eager = True
     config.actor_rollout_ref.rollout.prompt_length = 4096
     config.actor_rollout_ref.rollout.response_length = 4096
     config.actor_rollout_ref.rollout.n = 4
     config.actor_rollout_ref.rollout.agent.num_workers = 2
+    config.actor_rollout_ref.rollout.skip_tokenizer_init = True
 
     return config
 
@@ -146,7 +148,7 @@ def test_multimodal_tool_agent(init_config):
     init_config.actor_rollout_ref.rollout.multi_turn.tool_config_path = tool_config_path
     init_config.actor_rollout_ref.rollout.multi_turn.max_parallel_calls = 1
     init_config.actor_rollout_ref.rollout.multi_turn.max_user_turns = 1
-    agent_loop_manager = init_agent_loop_manager(init_config)
+    agent_loop_manager = AgentLoopManager(init_config)
 
     # =========================== 2. Generate sequences with multimodal prompts ===========================
     raw_prompts = [
@@ -175,6 +177,8 @@ def test_multimodal_tool_agent(init_config):
         non_tensor_batch={
             "raw_prompt": np.array([np.array(prompt) for prompt in raw_prompts], dtype=object),
             "agent_name": np.array(["tool_agent"] * len(raw_prompts)),
+            "data_source": np.array(["openai/gsm8k"] * len(raw_prompts)),
+            "reward_model": np.array([{"style": "rule", "ground_truth": "1.0"}] * len(raw_prompts)),
         },
     )
     batch = batch.repeat(n)
