@@ -1,0 +1,67 @@
+defaults:
+  # use existing model + rollout config types
+  - _self_
+
+# Distributed trainer env
+nnodes: 1
+n_gpus_per_node: 8
+device: cuda
+
+ray_kwargs:
+  ray_init:
+    num_cpus: null
+    runtime_env: {}
+  ray_wait_register_center_timeout: 300
+
+model:
+  _target_: verl.workers.config.model.HFModelConfig
+  path: ~/models/Qwen2-7B-Instruct
+  external_lib: null
+  load_tokenizer: true
+  trust_remote_code: false
+  override_config:
+    model_dtype: bfloat16
+
+rollout:
+  _target_: verl.workers.config.RolloutConfig
+  name: hf
+  mode: sync
+  do_sample: true
+  temperature: 1.0
+  top_k: 50
+  top_p: 0.7
+  prompt_length: 1024
+  response_length: 256
+
+data:
+  _target_: trainer.es.config.ESDataConfig
+  path: ~/data/rlhf/math/test.parquet
+  prompt_key: prompt
+  reward_fn_key: data_source
+  ground_truth_key: ground_truth
+  apply_chat_template_kwargs: {}
+
+algorithm:
+  _target_: trainer.es.config.ESAlgoConfig
+  total_iters: 100
+  n_directions: 64
+  sigma: 0.02
+  lr: 0.01
+  weight_decay: 0.0
+  antithetic: true
+  normalize: standardize
+  seed: 0
+  rollout_batch_size: 64
+  rollout_batches_per_iter: 1
+  grad_clip_norm: null
+
+reward_model:
+  _target_: trainer.es.config.ESRewardConfig
+  enable: true
+  reward_manager: naive
+  reward_kwargs: {}
+
+custom_reward_function:
+  path: null
+  name: compute_score
+  reward_kwargs: {}
