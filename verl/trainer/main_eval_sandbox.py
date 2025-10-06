@@ -50,12 +50,25 @@ def main(config):
             dataset.append(data)
     print(f"Processing {len(dataset)} items. Starting from line {max_line_number+1}")
 
+    unit_tests_to_use = config.reward_model['reward_fn_args']['code']['unit_tests_to_use']
+    print('Unit tests to use: ', unit_tests_to_use, type(unit_tests_to_use))
+
     batch_size = config.data.batch_size
     compute_score = get_custom_reward_fn(config)
     for i in range(0, len(dataset), batch_size):
         print(f"Processing batch {i} of size {batch_size}")
         batch = dataset[i:i+batch_size]
         ground_truths = [item["reward_model"]["ground_truth"] for item in batch]
+        indices = []
+        for i in range(len(batch)):
+            gt = json.loads(ground_truths[i])
+            num_tests = sum([len(gt[f'{t}_test_cases']['input']) for t in unit_tests_to_use])
+            if num_tests > 0:
+                indices.append(i)
+
+        batch = [batch[i] for i in indices]
+        ground_truths = [ground_truths[i] for i in indices]
+
         extras = [item["extra_info"] for item in batch]
         max_line_number = max([json.loads(item["extra_info"]["line_number"]) for item in batch])
         outputs = [item.pop("outputs") for item in batch]
@@ -70,7 +83,7 @@ def main(config):
             solution_strs=responses_str,
             ground_truths=ground_truths,
             extra_infos=extras,
-            **config.reward_model.get("reward_kwargs", {}),
+            **config.reward_model.get("reward_fn_args", {}),
         )
         print(f"Computed {len(score_result)} scores")
 
