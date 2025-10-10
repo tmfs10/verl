@@ -7,6 +7,16 @@ nnodes: 1
 n_gpus_per_node: 8
 device: cuda
 
+trainer:
+  project_name: verl_es
+  experiment_name: es_baseline
+  logger: ["console"]
+  wandb_proxy: null
+  wandb_id: null
+  val_before_train: true
+  val_only: false
+  test_freq: -1
+
 ray_kwargs:
   ray_init:
     num_cpus: null

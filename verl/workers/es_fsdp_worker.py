@@ -24,6 +24,7 @@ from verl.single_controller.base.decorator import Dispatch, register
 from trainer.es.config import ESAlgoConfig, ESConfig, ESDataConfig, ESRewardConfig
 from trainer.es.noise import iter_flat_params, stateless_normal_like
 from trainer.es.rollout import HFGenerationArgs, hf_generate_batch, tokenize_batch_chat
+from trainer.es.metrics import compute_rollout_reward_timing_metrics
 
 
 def _init_dist_if_needed(timeout_s: int = 600):
@@ -168,14 +169,16 @@ class ESFSDPWorker(Worker):
                 eps = stateless_normal_like(p, dir_seed=dir_seed, key=key)
                 p.add_(scale * eps)
 
-    def _eval_return(self) -> float:
+    def _eval_return(self) -> tuple[float, dict[str, float]]:
         bsz = self.algo.rollout_batch_size or 1
         total = len(self.rollout_state.chat_list)
         indices = list(range(self.rank, total, self.world_size))[:bsz]
         if len(indices) == 0:
-            return 0.0
+            return 0.0, {"meta/n_samples": 0.0}
 
         chats = [self.rollout_state.chat_list[i] for i in indices]
+        import time
+        timing_raw = {}
         input_ids, attn, pos = tokenize_batch_chat(
             tokenizer=self.tokenizer,
             chat_list=chats,
@@ -183,6 +186,7 @@ class ESFSDPWorker(Worker):
             apply_chat_template_kwargs=self.data_cfg.apply_chat_template_kwargs,
         )
 
+        t0 = time.perf_counter()
         data = hf_generate_batch(
             model=self.model,
             input_ids=input_ids,
@@ -192,6 +196,7 @@ class ESFSDPWorker(Worker):
             eos_token_id=self.tokenizer.eos_token_id,
             pad_token_id=self.tokenizer.pad_token_id,
         )
+        timing_raw["gen"] = time.perf_counter() - t0
 
         non_tensor_batch = {}
         if self.rollout_state.ground_truth is not None:
@@ -201,9 +206,12 @@ class ESFSDPWorker(Worker):
             non_tensor_batch[self.data_cfg.reward_fn_key] = [self.rollout_state.data_source[i] for i in indices]
         data.non_tensor_batch.update(non_tensor_batch)
 
-        reward_tensor, _ = compute_reward(data, self.reward_fn)
+        reward_tensor, reward_extra_infos = compute_reward(data, self.reward_fn)
         returns = reward_tensor.sum(dim=1).mean().item()
-        return float(returns)
+        metrics = compute_rollout_reward_timing_metrics(
+            data=data, reward_tensor=reward_tensor, reward_extra_info=reward_extra_infos, timing_raw=timing_raw
+        )
+        return float(returns), metrics
 
     def _gather_dir_returns(self, local_entries: List[Tuple[int, float, float]]):
         gathered: List[List[Tuple[int, float, float]]] = [None for _ in range(self.world_size)]  # type: ignore
@@ -253,37 +261,160 @@ class ESFSDPWorker(Worker):
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.algo.grad_clip_norm)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def run_es(self):
+    def es_step(self, step_idx: int = 0):
         torch.manual_seed(int(self.algo.seed))
         total_dirs = int(self.algo.n_directions)
+        import time
+        step_start = time.perf_counter()
+        local_dir_stats: List[Tuple[int, float, float]] = []
 
-        for it in range(int(self.algo.total_iters)):
-            local_dir_stats: List[Tuple[int, float, float]] = []
-            for dir_idx in self._iter_assigned_dirs(total_dirs):
-                self._apply_perturbation(dir_seed=dir_idx, scale=float(self.algo.sigma))
-                r_plus = self._eval_return()
-                self._apply_perturbation(dir_seed=dir_idx, scale=-float(self.algo.sigma))
+        # aggregate metrics across local evals
+        agg: dict[str, float] = {}
 
-                if self.algo.antithetic:
-                    self._apply_perturbation(dir_seed=dir_idx, scale=-float(self.algo.sigma))
-                    r_minus = self._eval_return()
-                    self._apply_perturbation(dir_seed=dir_idx, scale=float(self.algo.sigma))
+        def _merge(m):
+            nonlocal agg
+            for k, v in m.items():
+                if k.startswith("meta/"):
+                    agg[k] = agg.get(k, 0.0) + float(v)
+                elif k.endswith("/max"):
+                    agg[k] = max(agg.get(k, float("-inf")), float(v))
+                elif k.endswith("/min"):
+                    agg[k] = min(agg.get(k, float("inf")), float(v))
+                elif k.endswith("/mean") or k.startswith("reward/") or k.startswith("timing_") or k.startswith("response_length/") or k.startswith("prompt_length/") or k == "response/aborted_ratio":
+                    agg.setdefault(f"__sum__/{k}", 0.0)
+                    agg[f"__sum__/{k}"] += float(v) * m.get("meta/n_samples", 1.0)
                 else:
-                    r_minus = 0.0
+                    agg[k] = float(v)
 
-                local_dir_stats.append((dir_idx, float(r_plus), float(r_minus)))
+        for dir_idx in self._iter_assigned_dirs(total_dirs):
+            self._apply_perturbation(dir_seed=dir_idx, scale=float(self.algo.sigma))
+            r_plus, met_plus = self._eval_return()
+            self._apply_perturbation(dir_seed=dir_idx, scale=-float(self.algo.sigma))
 
-            dir_stats = self._gather_dir_returns(local_dir_stats)
-            adv = self._compute_advantages(dir_stats)
-            seeds = [idx for idx, _, _ in dir_stats]
-            coeffs = adv.tolist()
+            if self.algo.antithetic:
+                self._apply_perturbation(dir_seed=dir_idx, scale=-float(self.algo.sigma))
+                r_minus, _ = self._eval_return()
+                self._apply_perturbation(dir_seed=dir_idx, scale=float(self.algo.sigma))
+            else:
+                r_minus = 0.0
 
-            self._accumulate_param_space_grad(seeds, coeffs)
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
+            local_dir_stats.append((dir_idx, float(r_plus), float(r_minus)))
+            _merge(met_plus)
 
-            if self.rank == 0:
-                avg_r = sum([(p + max(0.0, m)) for _, p, m in dir_stats]) / max(1, len(dir_stats))
-                print(
-                    f"[ES:ray] iter={it} dirs={total_dirs} sigma={self.algo.sigma:.3g} lr={self.algo.lr:.3g} avg_r={avg_r:.4f}"
-                )
+        dir_stats = self._gather_dir_returns(local_dir_stats)
+        adv = self._compute_advantages(dir_stats)
+        seeds = [idx for idx, _, _ in dir_stats]
+        coeffs = adv.tolist()
+
+        self._accumulate_param_space_grad(seeds, coeffs)
+        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+
+        step_time = time.perf_counter() - step_start
+        agg["timing_s/step"] = step_time
+
+        # finalize means
+        n_samples = agg.get("meta/n_samples", 0.0)
+        if n_samples > 0:
+            for k in list(agg.keys()):
+                if k.startswith("__sum__/"):
+                    name = k.removeprefix("__sum__/")
+                    agg[name] = agg[k] / n_samples
+                    del agg[k]
+
+        return agg
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def validate(self, max_samples: int | None = None):
+        """Run validation rollout on this rank's shard of the dataset and return aggregated metrics.
+
+        Returns a dict with metrics and meta counters to be aggregated on the driver.
+        Keys are unprefixed (e.g., 'reward/mean'); the driver will prefix with 'val/'.
+        """
+        import math
+        import time
+
+        # Build validation generation args from rollout.val_kwargs if available
+        val_cfg = getattr(self.rollout_cfg, "val_kwargs", None)
+        gen_args = HFGenerationArgs(
+            do_sample=(val_cfg.do_sample if val_cfg is not None else self.gen_args.do_sample),
+            temperature=(val_cfg.temperature if val_cfg is not None else self.gen_args.temperature),
+            top_p=(val_cfg.top_p if val_cfg is not None else self.gen_args.top_p),
+            top_k=(val_cfg.top_k if val_cfg is not None else self.gen_args.top_k),
+            response_length=self.gen_args.response_length,
+        )
+
+        bsz = self.algo.rollout_batch_size or 1
+        total = len(self.rollout_state.chat_list)
+        # Take this rank's subset
+        rank_indices = list(range(self.rank, total, self.world_size))
+        if max_samples is not None:
+            rank_indices = rank_indices[:max_samples]
+
+        agg: dict[str, float] = {}
+
+        def _merge(m):
+            nonlocal agg
+            for k, v in m.items():
+                if k.startswith("meta/"):
+                    agg[k] = agg.get(k, 0.0) + float(v)
+                elif k.endswith("/max"):
+                    agg[k] = max(agg.get(k, float("-inf")), float(v))
+                elif k.endswith("/min"):
+                    agg[k] = min(agg.get(k, float("inf")), float(v))
+                elif k.endswith("/mean") or k.startswith("reward/") or k.startswith("timing_") or k.startswith("response_length/") or k.startswith("prompt_length/") or k == "response/aborted_ratio":
+                    agg.setdefault(f"__sum__/{k}", 0.0)
+                    agg[f"__sum__/{k}"] += float(v) * m.get("meta/n_samples", 1.0)
+                else:
+                    agg[k] = float(v)
+
+        # Process in batches
+        for i in range(0, len(rank_indices), bsz):
+            batch_indices = rank_indices[i : i + bsz]
+            chats = [self.rollout_state.chat_list[j] for j in batch_indices]
+
+            # Tokenize
+            input_ids, attn, pos = tokenize_batch_chat(
+                tokenizer=self.tokenizer,
+                chat_list=chats,
+                prompt_length=int(self.rollout_cfg.prompt_length),
+                apply_chat_template_kwargs=self.data_cfg.apply_chat_template_kwargs,
+            )
+
+            timing_raw = {}
+            t0 = time.perf_counter()
+            data = hf_generate_batch(
+                model=self.model,
+                input_ids=input_ids,
+                attention_mask=attn,
+                position_ids=pos,
+                gen_args=gen_args,
+                eos_token_id=self.tokenizer.eos_token_id,
+                pad_token_id=self.tokenizer.pad_token_id,
+            )
+            timing_raw["gen"] = time.perf_counter() - t0
+
+            non_tensor_batch = {}
+            if self.rollout_state.ground_truth is not None:
+                non_tensor_batch.setdefault("reward_model", {})
+                non_tensor_batch["reward_model"]["ground_truth"] = [self.rollout_state.ground_truth[j] for j in batch_indices]
+            if self.rollout_state.data_source is not None:
+                non_tensor_batch[self.data_cfg.reward_fn_key] = [self.rollout_state.data_source[j] for j in batch_indices]
+            data.non_tensor_batch.update(non_tensor_batch)
+
+            reward_tensor, reward_extra_infos = compute_reward(data, self.reward_fn)
+            metrics = compute_rollout_reward_timing_metrics(
+                data=data, reward_tensor=reward_tensor, reward_extra_info=reward_extra_infos, timing_raw=timing_raw
+            )
+            _merge(metrics)
+
+        # finalize means
+        n_samples = agg.get("meta/n_samples", 0.0)
+        if n_samples > 0:
+            for k in list(agg.keys()):
+                if k.startswith("__sum__/"):
+                    name = k.removeprefix("__sum__/")
+                    agg[name] = agg[k] / n_samples
+                    del agg[k]
+
+        return agg
