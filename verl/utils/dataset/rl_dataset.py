@@ -136,43 +136,68 @@ class RLHFDataset(Dataset):
             self.data_files[i] = copy_to_local(src=parquet_file, cache_dir=self.cache_dir, use_shm=self.use_shm)
 
     def _read_files_and_tokenize(self):
-        dataframes = []
+        datasets_list = []
         skip_acc_bounds = self.config.get("skip_acc_bounds", None)
-        for parquet_file in self.data_files:
-            # read parquet files and cache
-            if parquet_file.endswith('.parquet'):
-                # read parquet files and cache
-                dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
-            elif parquet_file.endswith('.jsonl'):
-                d = []
-                with open(parquet_file, 'r') as f:
-                    num_lines = 0
-                    for i, line in enumerate(f):
-                        num_lines += 1
-                        try:
-                            line = json.loads(line)
-                            if skip_acc_bounds is not None:
-                                if 'scores' in line:
-                                    acc = [score['acc'] for score in line['scores']]
-                                    assert len(acc) > 0, f"Expected at least one score, got {len(acc)}"
-                                    acc = sum(acc) / len(acc)
-                                    if acc < skip_acc_bounds[0] or acc > skip_acc_bounds[1]:
-                                        continue
-                            if 'extra_info' not in line:
-                                line['extra_info'] = {}
-                            line['extra_info']['line_number'] = json.dumps(i)
-                            d.append(line)
-                        except:
-                            pass
-                print(f'Read {len(d)}/{num_lines} lines for {parquet_file}')
-                dataframe = pd.DataFrame(d)
-                dataframe = _to_hf_dataset(dataframe)
-            dataframes.append(dataframe)
-        self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
+        for path in self.data_files:
+            # Load natively into HF (Arrow-backed, memory-mapped where possible)
+            if path.endswith(".parquet"):
+                ds = datasets.load_dataset("parquet", data_files=path, split="train")
+            elif path.endswith(".jsonl"):
+                # JSON loader keeps nested types in Arrow, unlike pandas
+                ds = datasets.load_dataset("json", data_files=path, split="train")
+            else:
+                continue
+
+            # Optional: accuracy filter fully in Arrow space
+            if skip_acc_bounds is not None and "scores" in ds.column_names:
+                lb, ub = skip_acc_bounds
+                def ok(scores):
+                    # scores: list of dicts with 'acc'
+                    if not scores:
+                        return True
+                    accs = [s.get("acc") for s in scores if isinstance(s, dict) and "acc" in s]
+                    if not accs:
+                        return True
+                    mean_acc = sum(accs) / len(accs)
+                    return lb <= mean_acc <= ub
+                ds = ds.filter(lambda ex: ok(ex["scores"]), num_proc=self.num_workers)
+
+            # Add/merge extra_info + line_number without leaving Arrow
+            def add_line_number(ex, idx):
+                v = ex.get("extra_info")
+                if v is None:
+                    v = {}
+                elif isinstance(v, str):
+                    # tolerate stray stringified dicts
+                    try:
+                        v = json.loads(v)
+                    except Exception:
+                        v = {}
+                elif not isinstance(v, dict):
+                    # tolerate weird struct-like objects
+                    try:
+                        v = dict(v)
+                    except Exception:
+                        v = {}
+                if "line_number" not in v:
+                    v["line_number"] = json.dumps(idx)
+                ex["extra_info"] = v
+                return ex
+
+            ds = ds.map(
+                add_line_number,
+                with_indices=True,
+                num_proc=self.num_workers,
+                desc="Ensuring extra_info.line_number",
+            )
+
+            datasets_list.append(ds)
+
+        self.dataframe: datasets.Dataset = datasets.concatenate_datasets(datasets_list)
         print(f"dataset len: {len(self.dataframe)}")
-
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
         # filter out too long prompts

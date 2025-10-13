@@ -55,6 +55,7 @@ def main(config):
 
     batch_size = config.data.batch_size
     compute_score = get_custom_reward_fn(config)
+    accs = []
     for i in range(0, len(dataset), batch_size):
         print(f"Processing batch {i} of size {batch_size}")
         batch = dataset[i:i+batch_size]
@@ -92,6 +93,11 @@ def main(config):
         j = 0
         output_filepath = os.path.join(output_eval_dir, f"eval_{max_line_number}.jsonl")
         print(f"Writing to {output_filepath}")
+        cur_accs = [s['acc'] for s in score_result]
+        accs.extend(cur_accs)
+        cur_acc = np.mean(cur_accs)
+        acc = np.mean(accs)
+        print(f"Current accuracy: {cur_acc}, Total accuracy: {acc}")
         with open(output_filepath, "w") as f:
             for i, d in enumerate(batch):
                 responses = responses_str[j:j+num_outputs[i]]
