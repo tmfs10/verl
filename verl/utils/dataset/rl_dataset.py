@@ -139,12 +139,13 @@ class RLHFDataset(Dataset):
         datasets_list = []
         skip_acc_bounds = self.config.get("skip_acc_bounds", None)
 
-        for path in self.data_files:
+        # === [CHANGED] iterate with dataset index so we can stamp "<dataset-index>-<line-number>" ===
+        for dataset_idx, path in enumerate(self.data_files):
             # Load natively into HF (Arrow-backed, memory-mapped where possible)
             if path.endswith(".parquet"):
                 ds = datasets.load_dataset("parquet", data_files=path, split="train")
             elif path.endswith(".jsonl"):
-                # JSON loader keeps nested types in Arrow, unlike pandas
+                # Use "json" loader to keep nested types Arrow-native
                 ds = datasets.load_dataset("json", data_files=path, split="train")
             else:
                 continue
@@ -152,8 +153,8 @@ class RLHFDataset(Dataset):
             # Optional: accuracy filter fully in Arrow space
             if skip_acc_bounds is not None and "scores" in ds.column_names:
                 lb, ub = skip_acc_bounds
-                def ok(scores):
-                    # scores: list of dicts with 'acc'
+
+                def _ok(scores):
                     if not scores:
                         return True
                     accs = [s.get("acc") for s in scores if isinstance(s, dict) and "acc" in s]
@@ -161,41 +162,45 @@ class RLHFDataset(Dataset):
                         return True
                     mean_acc = sum(accs) / len(accs)
                     return lb <= mean_acc <= ub
-                ds = ds.filter(lambda ex: ok(ex["scores"]), num_proc=self.num_workers)
 
-            # Add/merge extra_info + line_number without leaving Arrow
-            def add_line_number(ex, idx):
+                ds = ds.filter(lambda ex: _ok(ex["scores"]), num_proc=self.num_workers)
+
+            # === [CHANGED] Always override extra_info["line_number"] with "<dataset_idx>-<line_number>" ===
+            # Keep everything Arrow-native; tolerate odd existing types for extra_info
+            def _ensure_extra_info_with_idx(ex, idx):
                 v = ex.get("extra_info")
                 if v is None:
                     v = {}
                 elif isinstance(v, str):
-                    # tolerate stray stringified dicts
                     try:
                         v = json.loads(v)
                     except Exception:
                         v = {}
                 elif not isinstance(v, dict):
-                    # tolerate weird struct-like objects
                     try:
                         v = dict(v)
                     except Exception:
                         v = {}
-                if "line_number" not in v:
-                    v["line_number"] = json.dumps(idx)
+
+                # Build "<dataset-index>-<line-number>" and store as JSON-encoded string (to match existing convention)
+                combined = f"{dataset_idx}-{idx}"
+                v["line_number"] = json.dumps(combined)  # e.g., "\"3-42\""
+
                 ex["extra_info"] = v
                 return ex
 
             ds = ds.map(
-                add_line_number,
+                _ensure_extra_info_with_idx,
                 with_indices=True,
                 num_proc=self.num_workers,
-                desc="Ensuring extra_info.line_number",
+                desc="Stamping extra_info.line_number with dataset-index",
             )
 
             datasets_list.append(ds)
 
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(datasets_list)
         print(f"dataset len: {len(self.dataframe)}")
+
         self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
 
 
