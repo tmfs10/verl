@@ -19,7 +19,7 @@ import os
 import sys
 import warnings
 from functools import partial
-from typing import Any, Optional
+from typing import Any, Optional, Callable
 
 import ray
 import torch
@@ -113,6 +113,38 @@ def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
     return partial(_call_with_kwargs, raw_fn, reward_kwargs)
 
 
+def default_process_response_for_logprob(prompt: str, response: str) -> str:
+    """Default preprocessor: keep content up to the last '</think>' tag.
+
+    If '</think>' is not found, return the full response.
+    """
+    tag = "</think>"
+    idx = response.rfind(tag)
+    if idx == -1:
+        return response
+    return response[: idx + len(tag)]
+
+
+def default_combine_score(base_results: list[dict | float], masked_means: list[float]) -> list[dict]:
+    """Default combiner: add masked log-prob mean to compute_score output.
+
+    Ensures each output item is a dict with 'score' and includes 'masked_cond_logprob'.
+    """
+    out: list[dict] = []
+    for base, m in zip(base_results, masked_means, strict=True):
+        if isinstance(base, dict):
+            d = dict(base)
+            d["masked_cond_logprob"] = float(m)
+            if "score" in d and isinstance(d["score"], (int, float)):
+                d["score"] = float(d["score"]) + float(m)
+            else:
+                d["score"] = float(m)
+        else:
+            d = {"score": float(base) + float(m), "masked_cond_logprob": float(m)}
+        out.append(d)
+    return out
+
+
 def load_reward_manager(
     config: DictConfig, tokenizer: Any, num_examine: int, **reward_kwargs: Any
 ) -> AbstractRewardManager:
@@ -161,14 +193,36 @@ def load_reward_manager(
         else:
             final_compute_score = default_compute_score
 
-    # Instantiate and return the reward manager with the specified parameters
-    return reward_manager_cls(
+    # Optionally pull combine_score and process_response_for_logprob from the same custom module
+    combine_results_fn: Optional[Callable] = None
+    process_response_for_logprob_fn: Optional[Callable] = None
+    custom_module = sys.modules.get("custom_module", None)
+    if custom_module is not None:
+        if hasattr(custom_module, "combine_score"):
+            combine_results_fn = getattr(custom_module, "combine_score")
+        if hasattr(custom_module, "process_response_for_logprob"):
+            process_response_for_logprob_fn = getattr(custom_module, "process_response_for_logprob")
+
+    # Fallback defaults
+    if combine_results_fn is None:
+        combine_results_fn = default_combine_score
+    if process_response_for_logprob_fn is None:
+        process_response_for_logprob_fn = default_process_response_for_logprob
+
+    # Build init kwargs and filter by reward manager signature for safety
+    init_kwargs = dict(
         tokenizer=tokenizer,
         num_examine=num_examine,
         compute_score=final_compute_score,
         reward_fn_key=config.data.reward_fn_key,
+        combine_results=combine_results_fn,
+        process_response_for_logprob=process_response_for_logprob_fn,
         **reward_kwargs,
     )
+
+    # Filter to accepted kwargs of the class __init__
+    accepted_init_kwargs = _select_kwargs_for_callable(reward_manager_cls.__init__, init_kwargs)
+    return reward_manager_cls(**accepted_init_kwargs)
 
 
 def compute_reward(

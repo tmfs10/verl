@@ -15,5 +15,6 @@
 from .rl_dataset import RLHFDataset
 from .rm_dataset import RMDataset
 from .sft_dataset import SFTDataset
+from .masked_solution_dataset import MaskedSolutionChatDataset
 
-__all__ = ["RLHFDataset", "RMDataset", "SFTDataset"]
+__all__ = ["RLHFDataset", "RMDataset", "SFTDataset", "MaskedSolutionChatDataset"]
