@@ -198,6 +198,10 @@ trainer:
   # Timeout (in seconds) for Ray worker to wait for registration
   ray_wait_register_center_timeout: 300
 
+  # Enable critic-only training mode: do rollouts and update only the critic.
+  # In this mode, the actor model is not loaded and actor updates/checkpoints are skipped.
+  critic_only: False
+
   # Device to run training on (e.g., "cuda", "cpu")
   device: cuda
 

@@ -140,6 +140,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         Worker.__init__(self)
 
         self.config = config
+        # Allow trainer to indicate critic-only mode so rollout worker can avoid loading actor.
+        self._critic_only = kwargs.get("critic_only", False)
         import torch.distributed
 
         if not torch.distributed.is_initialized():
@@ -602,19 +604,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
-        # Full params
-        if torch.distributed.get_world_size() == 1 and fsdp_version(self.actor_module_fsdp) == 1:
-            FSDP.set_state_dict_type(
-                self.actor_module_fsdp,
-                state_dict_type=StateDictType.FULL_STATE_DICT,
-                state_dict_config=FullStateDictConfig(),
-            )
-        elif fsdp_version(self.actor_module_fsdp) == 1:
-            FSDP.set_state_dict_type(
-                self.actor_module_fsdp,
-                state_dict_type=StateDictType.SHARDED_STATE_DICT,
-                state_dict_config=ShardedStateDictConfig(),
-            )
+        # Full params (only relevant when actor module exists)
+        if hasattr(self, "actor_module_fsdp") and self._is_actor:
+            if torch.distributed.get_world_size() == 1 and fsdp_version(self.actor_module_fsdp) == 1:
+                FSDP.set_state_dict_type(
+                    self.actor_module_fsdp,
+                    state_dict_type=StateDictType.FULL_STATE_DICT,
+                    state_dict_config=FullStateDictConfig(),
+                )
+            elif fsdp_version(self.actor_module_fsdp) == 1:
+                FSDP.set_state_dict_type(
+                    self.actor_module_fsdp,
+                    state_dict_type=StateDictType.SHARDED_STATE_DICT,
+                    state_dict_config=ShardedStateDictConfig(),
+                )
 
         # used for LoRA
         self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
@@ -741,6 +744,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         use_shm = self.config.model.get("use_shm", False)
         use_fused_kernels = self.config.model.get("use_fused_kernels", False)
 
+        # In critic-only + rollout-only mode, skip building the actor model entirely.
+        if (not self._is_actor) and self._is_rollout and getattr(self, "_critic_only", False):
+            # Build only the rollout engine; do not create checkpoint manager for actor.
+            self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            return
+
         if self._is_actor or self._is_rollout:
             # we need the model for actor and rollout
             if self._is_actor:
@@ -827,7 +836,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 checkpoint_config=self.config.actor.checkpoint,
             )
 
-        if not self._is_actor and self._is_rollout:
+        if not self._is_actor and self._is_rollout and not getattr(self, "_critic_only", False):
             # If ActorRolloutRefWorker is initialized as a standalone rollout,
             # create a checkpoint manager for FSDP model to allow loading FSDP checkpoints for rollout.
 

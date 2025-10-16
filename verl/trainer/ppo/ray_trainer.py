@@ -315,6 +315,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
+        # Critic-only mode: do rollouts and update only the critic. Actor is not loaded/updated.
+        self.critic_only = config.trainer.get("critic_only", False)
 
         if self.hybrid_engine:
             assert Role.ActorRollout in role_worker_mapping, f"{role_worker_mapping.keys()=}"
@@ -683,7 +685,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=self.config.actor_rollout_ref,
-                role="actor_rollout",
+                role=("rollout" if self.critic_only else "actor_rollout"),
+                critic_only=self.critic_only,
             )
             self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:
@@ -696,8 +699,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
             self.resource_pool_to_cls[resource_pool]["critic"] = critic_cls
 
-        # create reference policy if needed
-        if self.use_reference_policy:
+        # create reference policy if needed (skip in critic-only mode)
+        if self.use_reference_policy and not self.critic_only:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.RefPolicy)
             ref_policy_cls = RayClassWithInitArgs(
                 self.role_worker_mapping[Role.RefPolicy],
@@ -720,19 +723,23 @@ class RayPPOTrainer(OneLoggerInstrumented):
         # See https://github.com/volcengine/verl/blob/master/examples/ray/tutorial.ipynb for more information.
         all_wg = {}
         wg_kwargs = {}  # Setting up kwargs for RayWorkerGroup
-        if OmegaConf.select(self.config.trainer, "ray_wait_register_center_timeout") is not None:
-            wg_kwargs["ray_wait_register_center_timeout"] = self.config.trainer.ray_wait_register_center_timeout
-        if OmegaConf.select(self.config.global_profiler, "steps") is not None:
-            wg_kwargs["profile_steps"] = OmegaConf.select(self.config.global_profiler, "steps")
+        ray_wait_register_center_timeout = self.config.trainer.get("ray_wait_register_center_timeout", None)
+        if ray_wait_register_center_timeout is not None:
+            wg_kwargs["ray_wait_register_center_timeout"] = ray_wait_register_center_timeout
+        profile_steps = self.config.global_profiler.get("steps", None)
+        if profile_steps is not None:
+            wg_kwargs["profile_steps"] = profile_steps
             # Only require nsight worker options when tool is nsys
-            if OmegaConf.select(self.config.global_profiler, "tool") == "nsys":
-                assert (
-                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
-                    is not None
-                ), "worker_nsight_options must be set when using nsys with profile_steps"
-                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(
-                    OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
+            if self.config.global_profiler.get("tool", None) == "nsys":
+                worker_nsight_options = (
+                    self.config.global_profiler.get("global_tool_config", {})
+                    .get("nsys", {})
+                    .get("worker_nsight_options", None)
                 )
+                assert worker_nsight_options is not None, (
+                    "worker_nsight_options must be set when using nsys with profile_steps"
+                )
+                wg_kwargs["worker_nsight_options"] = OmegaConf.to_container(worker_nsight_options)
         wg_kwargs["device_name"] = self.device_name
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
@@ -749,7 +756,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
             self.critic_wg = all_wg["critic"]
             self.critic_wg.init_model()
 
-        if self.use_reference_policy and not self.ref_in_actor:
+        if self.use_reference_policy and not self.ref_in_actor and not self.critic_only:
             self.ref_policy_wg = all_wg["ref"]
             self.ref_policy_wg.init_model()
 
@@ -802,9 +809,10 @@ class RayPPOTrainer(OneLoggerInstrumented):
             self.config.trainer.get("max_critic_ckpt_to_keep", None) if not remove_previous_ckpt_in_save else 1
         )
 
-        self.actor_rollout_wg.save_checkpoint(
-            actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
-        )
+        if not self.critic_only:
+            self.actor_rollout_wg.save_checkpoint(
+                actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
+            )
 
         if self.use_critic:
             critic_local_path = os.path.join(local_global_step_folder, "critic")
@@ -869,9 +877,10 @@ class RayPPOTrainer(OneLoggerInstrumented):
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, "critic")
         # load actor
-        self.actor_rollout_wg.load_checkpoint(
-            actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
-        )
+        if not self.critic_only:
+            self.actor_rollout_wg.load_checkpoint(
+                actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
+            )
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(
@@ -890,8 +899,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
-            self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
-            if self.use_reference_policy:
+            if not self.critic_only:
+                self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
+            if self.use_reference_policy and not self.critic_only:
                 self.ref_policy_wg.start_profile(profile_step=self.global_steps)
             if self.use_critic:
                 self.critic_wg.start_profile(profile_step=self.global_steps)
@@ -901,8 +911,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
     def _stop_profiling(self, do_profile: bool) -> None:
         """Stop profiling for all worker groups if profiling is enabled."""
         if do_profile:
-            self.actor_rollout_wg.stop_profile()
-            if self.use_reference_policy:
+            if not self.critic_only:
+                self.actor_rollout_wg.stop_profile()
+            if self.use_reference_policy and not self.critic_only:
                 self.ref_policy_wg.stop_profile()
             if self.use_critic:
                 self.critic_wg.stop_profile()
@@ -1071,24 +1082,26 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             )
 
                     # recompute old_log_probs
-                    with marked_timer("old_log_prob", timing_raw, color="blue"):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_agg = agg_loss(loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode)
-                        old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                        metrics.update(old_log_prob_metrics)
-                        old_log_prob.batch.pop("entropys")
-                        batch = batch.union(old_log_prob)
+                    if not self.critic_only:
+                        with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                            entropys = old_log_prob.batch["entropys"]
+                            response_masks = batch.batch["response_mask"]
+                            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                            entropy_agg = agg_loss(
+                                loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
+                            )
+                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                            metrics.update(old_log_prob_metrics)
+                            old_log_prob.batch.pop("entropys")
+                            batch = batch.union(old_log_prob)
 
-                        if "rollout_log_probs" in batch.batch.keys():
-                            # TODO: we may want to add diff of probs too.
-                            from verl.utils.debug.metrics import calculate_debug_metrics
+                            if "rollout_log_probs" in batch.batch.keys():
+                                from verl.utils.debug.metrics import calculate_debug_metrics
 
-                            metrics.update(calculate_debug_metrics(batch))
+                                metrics.update(calculate_debug_metrics(batch))
 
-                    if self.use_reference_policy:
+                    if self.use_reference_policy and not self.critic_only:
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
                             if not self.ref_in_actor:
@@ -1114,7 +1127,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
                         # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
+                        if self.config.algorithm.use_kl_in_reward and not self.critic_only:
                             batch, kl_metrics = apply_kl_penalty(
                                 batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
                             )
@@ -1122,11 +1135,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
-
+                        # compute returns (and advantages if needed by actor). For critic-only, discard advantages.
+                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1136,6 +1146,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        if self.critic_only and "advantages" in batch.batch:
+                            # reduce overhead/metrics footprint in critic-only mode
+                            batch.batch.pop("advantages", None)
 
                     # update critic
                     if self.use_critic:
@@ -1144,9 +1157,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
+                    # implement critic warmup; do not update actor in critic-only mode
+                    if (not self.critic_only) and self.config.trainer.critic_warmup <= self.global_steps:
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)

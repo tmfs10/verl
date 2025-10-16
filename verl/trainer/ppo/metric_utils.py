@@ -104,7 +104,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
 
-    advantages = batch.batch["advantages"]
+    advantages = batch.batch.get("advantages", None)
     returns = batch.batch["returns"]
 
     max_response_length = batch.batch["responses"].shape[-1]
@@ -132,8 +132,9 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
     reward_max = torch.max(non_aborted_sequence_reward).detach().item()
     reward_min = torch.min(non_aborted_sequence_reward).detach().item()
 
-    valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
+    if advantages is not None:
+        valid_adv = torch.masked_select(advantages, response_mask)
 
     if use_critic:
         values = batch.batch["values"]
@@ -165,10 +166,16 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         "critic/rewards/mean": reward_mean,
         "critic/rewards/max": reward_max,
         "critic/rewards/min": reward_min,
-        # adv
-        "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
-        "critic/advantages/max": torch.max(valid_adv).detach().item(),
-        "critic/advantages/min": torch.min(valid_adv).detach().item(),
+        # adv (only if provided)
+        **(
+            {
+                "critic/advantages/mean": torch.mean(valid_adv).detach().item(),
+                "critic/advantages/max": torch.max(valid_adv).detach().item(),
+                "critic/advantages/min": torch.min(valid_adv).detach().item(),
+            }
+            if advantages is not None
+            else {}
+        ),
         # returns
         "critic/returns/mean": torch.mean(valid_returns).detach().item(),
         "critic/returns/max": torch.max(valid_returns).detach().item(),

@@ -180,6 +180,8 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
     def __init__(self, config: DictConfig, role: str, **kwargs):
         Worker.__init__(self)
         self.config = config
+        # Allow trainer to indicate critic-only mode so rollout worker can avoid loading actor.
+        self._critic_only = kwargs.get("critic_only", False)
         if repatch is not None:
             # NPU MindSpeed patch, will be refactored with MindSpeedEngine.
             repatch(self.config.actor.megatron.get("override_transformer_config", {}))
@@ -469,6 +471,12 @@ class ActorRolloutRefWorker(MegatronWorker, DistProfilerExtension):
         self.param_dtype = torch.bfloat16
         log_gpu_memory_usage("Before init actor model and optimizer", logger=logger)
         self.dtype = PrecisionType.to_dtype(self.param_dtype)
+        # In critic-only + rollout-only mode, skip building the actor model entirely.
+        if (not self._is_actor) and self._is_rollout and getattr(self, "_critic_only", False):
+            self._build_rollout(trust_remote_code=self.config.model.get("trust_remote_code", False))
+            log_gpu_memory_usage("After rollout init", logger=logger)
+            return
+
         if self._is_actor or self._is_rollout:
             # we need the model for actor and rollout
             optim_config = self.config.actor.optim if self._is_actor else None

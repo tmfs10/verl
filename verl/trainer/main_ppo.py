@@ -218,6 +218,10 @@ class TaskRunner:
         """Add reference policy worker if KL loss or KL reward is used."""
         from verl.trainer.ppo.ray_trainer import Role
 
+        # In critic-only mode, skip adding a reference policy entirely
+        if config.trainer.get("critic_only", False):
+            return
+
         if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
             self.role_worker_mapping[Role.RefPolicy] = ray.remote(ref_policy_cls)
             self.mapping[Role.RefPolicy] = "global_pool"
