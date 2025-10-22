@@ -173,4 +173,7 @@ profiler:
 
       # Stack trace depth for memory allocations
       stack_depth: ${oc.select:global_profiler.global_tool_config.torch_memory.stack_depth,32}
+
+# Whether to append a sample solution to the prompt (critic-only).
+append_solution_to_prompt: False
       

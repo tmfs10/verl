@@ -60,6 +60,7 @@ from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seql
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.trainer.ppo.one_logger_integration import OneLoggerInstrumented
+from verl.utils.model import compute_position_id_with_mask
 
 
 @dataclass
@@ -342,6 +343,104 @@ class RayPPOTrainer(OneLoggerInstrumented):
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
+
+    def _maybe_build_critic_batch_with_solution(self, batch: DataProto) -> DataProto:
+        """Optionally append a sample solution to the prompt for critic-only computation.
+
+        - Uses `config.critic.append_solution_to_prompt` to gate behavior.
+        - Expects a `solution` field in non-tensor batch (np.ndarray of strings/None).
+        - Constructs new input_ids/attention_mask/position_ids with suffix appended to the prompt only.
+        - Keeps responses/response_mask unchanged. Returns a new DataProto used only for critic compute.
+        """
+        try:
+            use_suffix = self.config.critic.get("append_solution_to_prompt", False)
+        except Exception:
+            use_suffix = False
+        if not use_suffix:
+            return batch
+
+        # solution field should be present when requested; otherwise keep original
+        solutions = batch.non_tensor_batch.get("solution", None)
+        if solutions is None:
+            return batch
+
+        # Ensure required fields exist
+        if not all(k in batch.batch for k in ["input_ids", "attention_mask", "responses", "response_mask"]):
+            return batch
+
+        input_ids = batch.batch["input_ids"]  # (B, T)
+        attention_mask = batch.batch["attention_mask"]  # (B, T)
+        responses = batch.batch["responses"]  # (B, R)
+        response_mask = batch.batch["response_mask"]  # (B, R)
+
+        B, T = input_ids.shape
+        R = responses.size(1)
+        device = input_ids.device
+
+        prompt_ids = input_ids[:, :-R]
+        prompt_mask = attention_mask[:, :-R]
+
+        # Build per-sample suffix tokens
+        suffix_token_lists: list[list[int]] = []
+        for i in range(B):
+            sol = solutions[i] if isinstance(solutions, (list, np.ndarray)) else None
+            if sol is None or (isinstance(sol, float) and np.isnan(sol)):
+                suffix_token_lists.append([])
+                continue
+            # Build suffix string
+            suffix_str = f"\n\nHere is a sample solution:\n```python\n{sol}\n```\n"
+            token_ids = self.tokenizer.encode(suffix_str, add_special_tokens=False)
+            suffix_token_lists.append(token_ids)
+
+        # Rebuild prompt with suffixes: left-pad to max_new_prompt_len
+        new_prompt_unpadded: list[torch.Tensor] = []
+        new_prompt_lens: list[int] = []
+        for i in range(B):
+            pm = prompt_mask[i]
+            plen = int(pm.sum().item())
+            unpadded = prompt_ids[i, -plen:]
+            suffix_tokens = suffix_token_lists[i]
+            if len(suffix_tokens) > 0:
+                unpadded = torch.cat([unpadded, torch.tensor(suffix_tokens, dtype=unpadded.dtype)], dim=0)
+            new_prompt_unpadded.append(unpadded)
+            new_prompt_lens.append(int(unpadded.size(0)))
+
+        max_new_prompt_len = max(new_prompt_lens) if new_prompt_lens else prompt_ids.size(1)
+        pad_token_id = int(self.tokenizer.pad_token_id)
+        new_prompt_ids = []
+        new_prompt_masks = []
+        for i in range(B):
+            unpadded = new_prompt_unpadded[i]
+            np_len = new_prompt_lens[i]
+            pad_len = max_new_prompt_len - np_len
+            if pad_len > 0:
+                pad_ids = torch.full((pad_len,), pad_token_id, dtype=unpadded.dtype)
+                padded = torch.cat([pad_ids, unpadded], dim=0)
+                pad_mask = torch.zeros((pad_len,), dtype=prompt_mask.dtype)
+                ones = torch.ones((np_len,), dtype=prompt_mask.dtype)
+                pmask = torch.cat([pad_mask, ones], dim=0)
+            else:
+                padded = unpadded
+                pmask = torch.ones((np_len,), dtype=prompt_mask.dtype)
+            new_prompt_ids.append(padded)
+            new_prompt_masks.append(pmask)
+
+        new_prompt_ids = torch.stack(new_prompt_ids, dim=0).to(device)
+        new_prompt_mask = torch.stack(new_prompt_masks, dim=0).to(device)
+
+        # Build new full sequence
+        new_input_ids = torch.cat([new_prompt_ids, responses], dim=1)
+        new_attention_mask = torch.cat([new_prompt_mask, response_mask.to(new_prompt_mask.dtype)], dim=1)
+        new_position_ids = compute_position_id_with_mask(new_attention_mask)
+
+        # Construct a critic-only batch (do not mutate original batch)
+        from copy import deepcopy
+        critic_batch = deepcopy(batch)
+        critic_batch.batch["input_ids"] = new_input_ids
+        critic_batch.batch["attention_mask"] = new_attention_mask
+        critic_batch.batch["position_ids"] = new_position_ids
+
+        return critic_batch
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -1110,10 +1209,11 @@ class RayPPOTrainer(OneLoggerInstrumented):
                                 ref_log_prob = self.actor_rollout_wg.compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
-                    # compute values
+                    # compute values (optionally with solution-suffixed prompts only for critic)
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
-                            values = self.critic_wg.compute_values(batch)
+                            critic_view = self._maybe_build_critic_batch_with_solution(batch)
+                            values = self.critic_wg.compute_values(critic_view)
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
@@ -1150,10 +1250,15 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             # reduce overhead/metrics footprint in critic-only mode
                             batch.batch.pop("advantages", None)
 
-                    # update critic
+                    # update critic (use the same critic-only view)
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
-                            critic_output = self.critic_wg.update_critic(batch)
+                            critic_view = self._maybe_build_critic_batch_with_solution(batch)
+                            # ensure values/returns exist in critic_view
+                            for key in ("values", "returns"):
+                                if key in batch.batch and key not in critic_view.batch:
+                                    critic_view.batch[key] = batch.batch[key]
+                            critic_output = self.critic_wg.update_critic(critic_view)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
