@@ -1389,6 +1389,7 @@ def compute_policy_loss_cispo(
     advantages: torch.Tensor,             # (bs, T)
     response_mask: torch.Tensor,          # (bs, T) in {0,1}
     loss_agg_mode: str = "token-mean",
+    rollout_log_probs: torch.Tensor | None = None,
     config: Optional[DictConfig | ActorConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 
@@ -1431,6 +1432,13 @@ def compute_policy_loss_cispo(
     # REINFORCE with token-wise advantages and log-probs
     # loss is negative objective
     pg_losses = - r_hat * advantages * log_prob                              # (bs, T)
+
+    if config.tis_imp_ratio_cap > 0 and rollout_log_probs is not None:
+        # Apply truncated importance sampling -> https://fengyao.notion.site/off-policy-rl
+        tis_imp_ratio = torch.exp(old_log_prob - rollout_log_probs)
+        tis_imp_ratio = torch.clamp(tis_imp_ratio, max=config.tis_imp_ratio_cap)
+        pg_losses = pg_losses * tis_imp_ratio
+
 
     # aggregate like Eq. (4): average over all valid tokens
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
