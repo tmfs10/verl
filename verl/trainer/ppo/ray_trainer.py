@@ -61,6 +61,7 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.trainer.ppo.one_logger_integration import OneLoggerInstrumented
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.torch_functional import get_response_mask
 
 
 @dataclass
@@ -333,6 +334,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        # Default to None to avoid attribute errors when actor/rollout is not created
+        self.actor_rollout_wg = None
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
@@ -441,6 +444,78 @@ class RayPPOTrainer(OneLoggerInstrumented):
         critic_batch.batch["position_ids"] = new_position_ids
 
         return critic_batch
+
+    def _build_gen_output_from_dataset_responses(self, batch: DataProto) -> DataProto:
+        """Build a generation-like DataProto using dataset-provided responses.
+
+        Expects batch.non_tensor_batch["responses"] as list[str] per sample.
+        Returns a DataProto with fields similar to rollout output: input_ids, attention_mask,
+        position_ids, responses, and response_mask.
+        """
+        use_ds_resp = self.config.data.get("use_dataset_responses", False)
+        if not use_ds_resp:
+            return batch
+
+        responses_text = batch.non_tensor_batch.get("responses", None)
+        if responses_text is None:
+            raise ValueError("use_dataset_responses=True but field 'responses' not found in dataset row.")
+
+        # tokenize responses; choose the first candidate if list provided
+        B = len(responses_text)
+        resp_token_lists = []
+        for i in range(B):
+            item = responses_text[i]
+            if item is None:
+                raise ValueError("Found None in dataset 'responses' while use_dataset_responses=True")
+            if isinstance(item, list) and len(item) > 0:
+                text = item[0]
+            elif isinstance(item, str):
+                text = item
+            else:
+                raise ValueError("Each 'responses' entry must be a non-empty list[str] or str when use_dataset_responses=True")
+            tokens = self.tokenizer.encode(text, add_special_tokens=False)
+            if len(tokens) == 0:
+                raise ValueError("Encountered empty tokenized response in dataset while use_dataset_responses=True")
+            resp_token_lists.append(tokens)
+
+        # Build padded tensor for responses
+        max_resp_len = max(len(t) for t in resp_token_lists)
+        pad_id = int(self.tokenizer.pad_token_id)
+        resp_ids = []
+        resp_masks = []
+        for tok_list in resp_token_lists:
+            t = torch.tensor(tok_list, dtype=torch.long)
+            pad_len = max_resp_len - t.size(0)
+            if pad_len > 0:
+                pad = torch.full((pad_len,), pad_id, dtype=torch.long)
+                tpad = torch.cat([t, pad], dim=0)
+                mask = torch.cat([torch.ones((t.size(0),), dtype=torch.long), torch.zeros((pad_len,), dtype=torch.long)], dim=0)
+            else:
+                tpad = t
+                mask = torch.ones((t.size(0),), dtype=torch.long)
+            resp_ids.append(tpad)
+            resp_masks.append(mask)
+
+        resp_ids = torch.stack(resp_ids, dim=0).to(batch.batch["input_ids"].device)
+        resp_masks = torch.stack(resp_masks, dim=0).to(batch.batch["input_ids"].device)
+
+        # Compose full sequence
+        input_ids = batch.batch["input_ids"]
+        attention_mask = batch.batch["attention_mask"]
+        position_ids = batch.batch.get("position_ids", compute_position_id_with_mask(attention_mask))
+
+        new_input_ids = torch.cat([input_ids, resp_ids], dim=1)
+        new_attention_mask = torch.cat([attention_mask, resp_masks], dim=1)
+        new_position_ids = compute_position_id_with_mask(new_attention_mask)
+
+        tensors = {
+            "responses": resp_ids,
+            "input_ids": new_input_ids,
+            "attention_mask": new_attention_mask,
+            "position_ids": new_position_ids,
+        }
+        meta = {"timing": {}}
+        return DataProto.from_dict(tensors=tensors, meta_info=meta)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -669,20 +744,23 @@ class RayPPOTrainer(OneLoggerInstrumented):
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # pad to be divisible by dp_size
-            size_divisor = (
-                self.actor_rollout_wg.world_size
-                if not self.async_rollout_mode
-                else self.config.actor_rollout_ref.rollout.agent.num_workers
-            )
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+            # If using dataset responses, build outputs from dataset; otherwise generate
+            if self.config.data.get("use_dataset_responses", False):
+                test_output_gen_batch = self._build_gen_output_from_dataset_responses(test_gen_batch)
             else:
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+                size_divisor = (
+                    getattr(self.actor_rollout_wg, "world_size", 1)
+                    if not self.async_rollout_mode
+                    else self.config.actor_rollout_ref.rollout.agent.num_workers
+                )
+                test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+                if not self.async_rollout_mode:
+                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                else:
+                    test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(
+                        test_gen_batch_padded
+                    )
+                test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             print("validation generation end")
 
@@ -698,6 +776,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
             if self.val_reward_fn is None:
                 raise ValueError("val_reward_fn must be provided for validation.")
             # Route through compute_reward to pass optional kwargs like actor_wg
+            # Allow reward to omit actor_wg if actor/rollout is absent
             reward_tensor, reward_extras = compute_reward(
                 test_batch, self.val_reward_fn, actor_wg=self.actor_rollout_wg
             )
@@ -778,16 +857,30 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
         self.resource_pool_to_cls = {pool: {} for pool in self.resource_pool_manager.resource_pool_dict.values()}
 
-        # create actor and rollout
+        # create actor and/or rollout as needed
         if self.hybrid_engine:
-            resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
-            actor_rollout_cls = RayClassWithInitArgs(
-                cls=self.role_worker_mapping[Role.ActorRollout],
-                config=self.config.actor_rollout_ref,
-                role=("rollout" if self.critic_only else "actor_rollout"),
-                critic_only=self.critic_only,
-            )
-            self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
+            use_ds_resp = self.config.data.get("use_dataset_responses", False)
+            # If critic-only + dataset responses, no actor/rollout is needed
+            if not (self.critic_only and use_ds_resp):
+                resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
+                # Role selection:
+                # - critic_only: rollout only
+                # - dataset responses: actor only
+                # - default: actor + rollout
+                if self.critic_only:
+                    role_name = "rollout"
+                elif use_ds_resp:
+                    role_name = "actor"
+                else:
+                    role_name = "actor_rollout"
+
+                actor_rollout_cls = RayClassWithInitArgs(
+                    cls=self.role_worker_mapping[Role.ActorRollout],
+                    config=self.config.actor_rollout_ref,
+                    role=role_name,
+                    critic_only=self.critic_only,
+                )
+                self.resource_pool_to_cls[resource_pool]["actor_rollout"] = actor_rollout_cls
         else:
             raise NotImplementedError
 
@@ -865,12 +958,13 @@ class RayPPOTrainer(OneLoggerInstrumented):
             self.rm_wg.init_model()
 
         # we should create rollout at the end so that vllm can have a better estimation of kv cache memory
-        self.actor_rollout_wg = all_wg["actor_rollout"]
-        self.actor_rollout_wg.init_model()
+        if "actor_rollout" in all_wg:
+            self.actor_rollout_wg = all_wg["actor_rollout"]
+            self.actor_rollout_wg.init_model()
 
         # create async rollout manager and request scheduler
         self.async_rollout_mode = False
-        if self.config.actor_rollout_ref.rollout.mode == "async":
+        if self.actor_rollout_wg is not None and self.config.actor_rollout_ref.rollout.mode == "async":
             from verl.experimental.agent_loop import AgentLoopManager
 
             self.async_rollout_mode = True
@@ -1024,7 +1118,11 @@ class RayPPOTrainer(OneLoggerInstrumented):
         attention_mask = batch.batch["attention_mask"]
         batch_size = attention_mask.shape[0]
         global_seqlen_lst = batch.batch["attention_mask"].view(batch_size, -1).sum(-1).tolist()  # (train_batch_size,)
-        world_size = self.actor_rollout_wg.world_size
+        world_size = getattr(self.actor_rollout_wg, "world_size", None)
+        if world_size is None:
+            # Fallback to critic world size or 1 if actor/rollout is absent
+            world_size = getattr(self, "critic_wg", None)
+            world_size = world_size.world_size if world_size is not None else 1
         global_partition_lst = get_seqlen_balanced_partitions(
             global_seqlen_lst, k_partitions=world_size, equal_size=True
         )
@@ -1111,16 +1209,22 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                if not self.config.data.get("use_dataset_responses", False):
+                    gen_batch = gen_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        if self.config.data.get("use_dataset_responses", False):
+                            gen_batch_output = self._build_gen_output_from_dataset_responses(gen_batch)
                         else:
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                            if not self.async_rollout_mode:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            else:
+                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
@@ -1132,10 +1236,17 @@ class RayPPOTrainer(OneLoggerInstrumented):
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
+                        if self.config.data.get("use_dataset_responses", False):
+                            raise ValueError(
+                                "use_dataset_responses=True not compatible with REMAX baseline generation"
+                            )
+                        else:
                             if not self.async_rollout_mode:
                                 gen_baseline_output = self.actor_rollout_wg.generate_sequences(gen_baseline_batch)
                             else:
-                                gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                                gen_baseline_output = self.async_rollout_manager.generate_sequences(
+                                    gen_baseline_batch
+                                )
                             batch = batch.union(gen_baseline_output)
                             # Compute baseline reward with optional kwargs (e.g., actor_wg)
                             reward_baseline_tensor, _ = compute_reward(

@@ -28,6 +28,11 @@ max_prompt_length: 512
 # oc.select: default val for rollout.response_length
 max_response_length: 512
 
+# If true, use the dataset-provided field `responses` as the generated outputs
+# instead of performing rollouts. Expects a non-empty list of response strings
+# per sample; errors out if missing or empty.
+use_dataset_responses: False
+
 # Batch size sampled for one training iteration of different RL algorithms.
 train_batch_size: 1024
 
