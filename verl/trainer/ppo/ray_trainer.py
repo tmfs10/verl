@@ -48,6 +48,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     process_validation_metrics,
+    compute_rmauc,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
@@ -214,12 +215,23 @@ def compute_advantage(
     # prepare response group
     if adv_estimator == AdvantageEstimator.GAE:
         # Compute advantages and returns using Generalized Advantage Estimation (GAE)
+        lam_input = lam
+        # Length-adaptive GAE: per-sequence lambda: 1 - 1/(alpha * L)
+        if config is not None and hasattr(config, "length_adaptive_gae") and config.length_adaptive_gae["enable"]:
+            alpha = float(config.length_adaptive_gae["alpha"])
+            assert alpha > 0.0, "algorithm.length_adaptive_gae.alpha must be > 0"
+            response_mask = data.batch["response_mask"]
+            resp_len = response_mask.sum(dim=-1).to(dtype=torch.float32)
+            # ensure there is at least one response token
+            assert torch.all(resp_len > 0), "Found sequence with zero valid response length when computing length-adaptive GAE"
+            lam_input = 1.0 - 1.0 / (alpha * resp_len)
+            print('MMMMM', resp_len, '\n\nXXXXXXX\n\n', lam_input)
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
             values=data.batch["values"],
             response_mask=data.batch["response_mask"],
             gamma=gamma,
-            lam=lam,
+            lam=lam_input,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -362,14 +374,18 @@ class RayPPOTrainer(OneLoggerInstrumented):
         if not use_suffix:
             return batch
 
-        # solution field should be present when requested; otherwise keep original
-        solutions = batch.non_tensor_batch.get("solution", None)
-        if solutions is None:
-            return batch
+        solution_field_name = self.config.data.get("solution_field_name", "ground_truth_answer")
+
+        # Enforce presence of solution field when requested
+        assert solution_field_name in batch.non_tensor_batch, (
+            f"append_solution_to_prompt=True requires '{solution_field_name}' in non_tensor_batch"
+        )
+        solution_arr = batch.non_tensor_batch[solution_field_name]
 
         # Ensure required fields exist
-        if not all(k in batch.batch for k in ["input_ids", "attention_mask", "responses", "response_mask"]):
-            return batch
+        required_keys = ["input_ids", "attention_mask", "responses", "response_mask"]
+        missing = [k for k in required_keys if k not in batch.batch]
+        assert len(missing) == 0, f"Missing required keys for append_solution_to_prompt: {missing}"
 
         input_ids = batch.batch["input_ids"]  # (B, T)
         attention_mask = batch.batch["attention_mask"]  # (B, T)
@@ -380,24 +396,36 @@ class RayPPOTrainer(OneLoggerInstrumented):
         R = responses.size(1)
         device = input_ids.device
 
+        # Validate solution array shape matches batch size
+        try:
+            sol_len = len(solution_arr)
+        except Exception:
+            sol_len = -1
+        assert sol_len == B, (
+            f"Length of '{solution_field_name}' ({sol_len}) must match batch size ({B}) when appending solution"
+        )
+
         prompt_ids = input_ids[:, :-R]
         prompt_mask = attention_mask[:, :-R]
 
-        # Build per-sample suffix tokens
+        # Build per-sample suffix tokens (handle repeated prompts correctly)
         suffix_token_lists: list[list[int]] = []
         for i in range(B):
-            sol = solutions[i] if isinstance(solutions, (list, np.ndarray)) else None
-            if sol is None or (isinstance(sol, float) and np.isnan(sol)):
-                suffix_token_lists.append([])
-                continue
-            # Build suffix string
-            suffix_str = f"\n\nHere is a sample solution:\n```python\n{sol}\n```\n"
+            sol_i = solution_arr[i]
+            # Enforce solution presence and non-empty string per-sample
+            assert isinstance(sol_i, str) and len(sol_i) > 0, (
+                f"append_solution_to_prompt=True but solution missing or empty at index {i} for field "
+                f"'{solution_field_name}'"
+            )
+            # Build suffix string for this sample
+            suffix_str = f"\n\nHere is a sample solution:\n```python\n{sol_i}\n```\n"
             token_ids = self.tokenizer.encode(suffix_str, add_special_tokens=False)
             suffix_token_lists.append(token_ids)
 
-        # Rebuild prompt with suffixes: left-pad to max_new_prompt_len
+        # Rebuild prompt with suffixes: enforce right-truncation to max prompt length, then left-pad to batch max
         new_prompt_unpadded: list[torch.Tensor] = []
         new_prompt_lens: list[int] = []
+        max_prompt_len_cfg = self.config.data.get("max_prompt_length", None)
         for i in range(B):
             pm = prompt_mask[i]
             plen = int(pm.sum().item())
@@ -405,6 +433,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
             suffix_tokens = suffix_token_lists[i]
             if len(suffix_tokens) > 0:
                 unpadded = torch.cat([unpadded, torch.tensor(suffix_tokens, dtype=unpadded.dtype)], dim=0)
+            # If prompt+suffix exceeds limit, truncate from the right (keep left-most tokens)
+            if max_prompt_len_cfg is not None and unpadded.size(0) > max_prompt_len_cfg:
+                unpadded = unpadded[: max_prompt_len_cfg]
             new_prompt_unpadded.append(unpadded)
             new_prompt_lens.append(int(unpadded.size(0)))
 
@@ -448,73 +479,94 @@ class RayPPOTrainer(OneLoggerInstrumented):
     def _build_gen_output_from_dataset_responses(self, batch: DataProto) -> DataProto:
         """Build a generation-like DataProto using dataset-provided responses.
 
-        Expects batch.non_tensor_batch["responses"] as list[str] per sample.
+        Expects batch.non_tensor_batch["response_strs"] to provide response text(s) per sample.
+        - If a sample provides a list[str], build one entry per string (expands the batch).
+        - If a sample provides a str, it is used directly.
         Returns a DataProto with fields similar to rollout output: input_ids, attention_mask,
-        position_ids, responses, and response_mask.
+        position_ids, and responses. The response_mask can be derived downstream.
         """
         use_ds_resp = self.config.data.get("use_dataset_responses", False)
         if not use_ds_resp:
             return batch
 
-        responses_text = batch.non_tensor_batch.get("responses", None)
+        responses_text = batch.non_tensor_batch.get("response_strs", None)
         if responses_text is None:
-            raise ValueError("use_dataset_responses=True but field 'responses' not found in dataset row.")
+            raise ValueError("use_dataset_responses=True but field 'response_strs' not found in dataset row.")
 
-        # tokenize responses; choose the first candidate if list provided
+        # Build per-sample repeat counts and flatten responses
         B = len(responses_text)
-        resp_token_lists = []
+        repeat_counts = []
+        flat_responses: list[str] = []
         for i in range(B):
             item = responses_text[i]
             if item is None:
-                raise ValueError("Found None in dataset 'responses' while use_dataset_responses=True")
-            if isinstance(item, list) and len(item) > 0:
-                text = item[0]
-            elif isinstance(item, str):
-                text = item
+                raise ValueError("Found None in dataset 'response_strs' while use_dataset_responses=True")
+            if isinstance(item, str):
+                repeat_counts.append(1)
+                flat_responses.append(item)
+            elif isinstance(item, (list, tuple, np.ndarray)):
+                if len(item) == 0:
+                    raise ValueError("Encountered empty list for 'response_strs' entry while use_dataset_responses=True")
+                repeat_counts.append(len(item))
+                for s in item:
+                    if s is None or not isinstance(s, str):
+                        raise ValueError("All elements of 'response_strs' must be str when use_dataset_responses=True")
+                    flat_responses.append(s)
             else:
-                raise ValueError("Each 'responses' entry must be a non-empty list[str] or str when use_dataset_responses=True")
+                raise ValueError(
+                    f"Each 'response_strs' entry must be a str or list[str] when use_dataset_responses=True, got {type(item)}"
+                )
+
+        # Repeat prompts per-sample to align with flattened responses
+        expanded_prompts = batch.sample_level_repeat(repeat_counts)
+
+        # Tokenize flattened responses and pad/truncate to configured response length
+        resp_ids = []
+        pad_id = int(self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else self.tokenizer.eos_token_id)
+        resp_max_len = int(self.config.actor_rollout_ref.rollout.response_length)
+        for text in flat_responses:
             tokens = self.tokenizer.encode(text, add_special_tokens=False)
             if len(tokens) == 0:
                 raise ValueError("Encountered empty tokenized response in dataset while use_dataset_responses=True")
-            resp_token_lists.append(tokens)
+            t = torch.tensor(tokens[:resp_max_len], dtype=torch.long)
+            if t.size(0) < resp_max_len:
+                pad = torch.full((resp_max_len - t.size(0),), pad_id, dtype=torch.long)
+                t = torch.cat([t, pad], dim=0)
+            resp_ids.append(t)
 
-        # Build padded tensor for responses
-        max_resp_len = max(len(t) for t in resp_token_lists)
-        pad_id = int(self.tokenizer.pad_token_id)
-        resp_ids = []
-        resp_masks = []
-        for tok_list in resp_token_lists:
-            t = torch.tensor(tok_list, dtype=torch.long)
-            pad_len = max_resp_len - t.size(0)
-            if pad_len > 0:
-                pad = torch.full((pad_len,), pad_id, dtype=torch.long)
-                tpad = torch.cat([t, pad], dim=0)
-                mask = torch.cat([torch.ones((t.size(0),), dtype=torch.long), torch.zeros((pad_len,), dtype=torch.long)], dim=0)
-            else:
-                tpad = t
-                mask = torch.ones((t.size(0),), dtype=torch.long)
-            resp_ids.append(tpad)
-            resp_masks.append(mask)
+        device = expanded_prompts.batch["input_ids"].device
+        dtype = expanded_prompts.batch["attention_mask"].dtype
+        prompts = expanded_prompts.batch["input_ids"]
+        prompt_attention = expanded_prompts.batch["attention_mask"]
+        prompt_position = expanded_prompts.batch.get(
+            "position_ids", compute_position_id_with_mask(prompt_attention)
+        )
 
-        resp_ids = torch.stack(resp_ids, dim=0).to(batch.batch["input_ids"].device)
-        resp_masks = torch.stack(resp_masks, dim=0).to(batch.batch["input_ids"].device)
+        responses = torch.stack(resp_ids, dim=0).to(device)
+        seq = torch.cat([prompts, responses], dim=-1)
 
-        # Compose full sequence
-        input_ids = batch.batch["input_ids"]
-        attention_mask = batch.batch["attention_mask"]
-        position_ids = batch.batch.get("position_ids", compute_position_id_with_mask(attention_mask))
+        resp_len = responses.size(1)
+        delta_position_id = torch.arange(1, resp_len + 1, device=device)
+        delta_position_id = delta_position_id.unsqueeze(0).expand(seq.size(0), -1)
+        if prompt_position.dim() == 3:  # mrope (e.g., qwen2vl)
+            delta_position_id = delta_position_id.view(seq.size(0), 1, -1).expand(seq.size(0), 3, -1)
+        response_position_ids = prompt_position[..., -1:] + delta_position_id
+        position_ids = torch.cat([prompt_position, response_position_ids], dim=-1)
 
-        new_input_ids = torch.cat([input_ids, resp_ids], dim=1)
-        new_attention_mask = torch.cat([attention_mask, resp_masks], dim=1)
-        new_position_ids = compute_position_id_with_mask(new_attention_mask)
+        response_attention_mask = get_response_mask(
+            response_id=responses, eos_token=self.tokenizer.eos_token_id, dtype=dtype
+        )
+        attention_mask = torch.cat([prompt_attention, response_attention_mask], dim=-1)
 
         tensors = {
-            "responses": resp_ids,
-            "input_ids": new_input_ids,
-            "attention_mask": new_attention_mask,
-            "position_ids": new_position_ids,
+            "prompts": prompts,
+            "responses": responses,
+            "input_ids": seq,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "response_mask": response_attention_mask,
         }
-        meta = {"timing": {}}
+        meta = {"timing": {}, "repeat_counts": np.asarray(repeat_counts, dtype=np.int32)}
         return DataProto.from_dict(tensors=tensors, meta_info=meta)
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -677,6 +729,10 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        # Preserve solution field (for critic prompt suffixing) in the original batch
+        solution_field_name = self.config.data.get("solution_field_name", "ground_truth_answer")
+        if solution_field_name in batch.non_tensor_batch:
+            reward_model_keys.add(solution_field_name)
 
         # pop those keys for generation
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -704,6 +760,17 @@ class RayPPOTrainer(OneLoggerInstrumented):
         sample_turns = []
         sample_uids = []
 
+        # Accumulators for validation critic diagnostics
+        val_token_mse_num_total = 0.0
+        val_token_mse_den_total = 0.0
+        val_final_mse_num_total = 0.0
+        val_final_mse_count = 0
+        val_rmauc_sum_total = 0.0
+        val_rmauc_count_total = 0
+
+        # Optional debug flag to print reward extras lengths
+        debug_reward_extras = self.config.trainer.get("debug_reward_extras", False)
+
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
@@ -712,26 +779,52 @@ class RayPPOTrainer(OneLoggerInstrumented):
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
 
-            # repeat test batch
-            test_batch = test_batch.repeat(
-                repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
-            )
+            # repeat test batch only when generating rollouts
+            if not self.config.data.get("use_dataset_responses", False):
+                test_batch = test_batch.repeat(
+                    repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
+                )
 
             # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
 
-            # Store original inputs
+            # Store original inputs (and repeat per dataset responses if used)
             input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
 
             ground_truths = [
                 item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
             ]
-            sample_gts.extend(ground_truths)
+
+            if not self.config.data.get("use_dataset_responses", False):
+                sample_inputs.extend(input_texts)
+                sample_uids.extend(test_batch.non_tensor_batch["uid"])
+                sample_gts.extend(ground_truths)
+            else:
+                resp_strs = test_batch.non_tensor_batch.get("response_strs")
+                if resp_strs is None:
+                    raise ValueError(
+                        "use_dataset_responses=True but 'response_strs' missing in test_batch.non_tensor_batch"
+                    )
+                repeat_counts = []
+                for item in resp_strs:
+                    if isinstance(item, str):
+                        repeat_counts.append(1)
+                    elif isinstance(item, (list, tuple, np.ndarray)):
+                        if len(item) == 0:
+                            raise ValueError(
+                                "Encountered empty list for 'response_strs' entry while use_dataset_responses=True"
+                            )
+                        repeat_counts.append(len(item))
+                    else:
+                        raise ValueError(f"'response_strs' must be str or list[str], got {type(item)}")
+
+                # Repeat inputs/uids/gts to align with dataset responses
+                for i, r in enumerate(repeat_counts):
+                    sample_inputs.extend([input_texts[i]] * r)
+                    sample_uids.extend([test_batch.non_tensor_batch["uid"][i]] * r)
+                    sample_gts.extend([ground_truths[i]] * r)
 
             test_gen_batch = self._get_gen_batch(test_batch)
             test_gen_batch.meta_info = {
@@ -769,6 +862,27 @@ class RayPPOTrainer(OneLoggerInstrumented):
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
 
+            # Align test_batch size with outputs when using dataset responses
+            if self.config.data.get("use_dataset_responses", False):
+                resp_strs = test_gen_batch.non_tensor_batch.get("response_strs")
+                if resp_strs is None:
+                    raise ValueError(
+                        "use_dataset_responses=True but 'response_strs' missing in test_gen_batch.non_tensor_batch"
+                    )
+                repeat_counts = []
+                for item in resp_strs:
+                    if isinstance(item, str):
+                        repeat_counts.append(1)
+                    elif isinstance(item, (list, tuple, np.ndarray)):
+                        if len(item) == 0:
+                            raise ValueError(
+                                "Encountered empty list for 'response_strs' entry while use_dataset_responses=True"
+                            )
+                        repeat_counts.append(len(item))
+                    else:
+                        raise ValueError(f"'response_strs' must be str or list[str], got {type(item)}")
+                test_batch = test_batch.sample_level_repeat(repeat_counts)
+
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
@@ -784,7 +898,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
             sample_scores.extend(scores)
 
             reward_extra_infos_dict["reward"].extend(scores)
-            print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
+            if debug_reward_extras:
+                print(f"len reward_extra_infos_dict['reward']: {len(reward_extra_infos_dict['reward'])}")
             if reward_extras:
                 for key, lst in reward_extras.items():
                     if key == "reward":
@@ -793,7 +908,65 @@ class RayPPOTrainer(OneLoggerInstrumented):
                     if isinstance(lst, torch.Tensor):
                         lst = lst.detach().cpu().tolist()
                     reward_extra_infos_dict[key].extend(lst)
-                    print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
+                    if debug_reward_extras:
+                        print(f"len reward_extra_infos_dict['{key}']: {len(reward_extra_infos_dict[key])}")
+
+            # Prepare batch for critic diagnostics: compute values and compare to accuracy
+            test_batch.batch["token_level_scores"] = reward_tensor
+            test_batch.batch["token_level_rewards"] = reward_tensor
+            if "response_mask" not in test_batch.batch:
+                test_batch.batch["response_mask"] = compute_response_mask(test_batch)
+            if self.use_critic:
+                # Skip computing critic values in validation if any element lacks solution field
+                sol_field = self.config.data.get("solution_field_name", "ground_truth_answer")
+                has_sol_field = sol_field in test_batch.non_tensor_batch
+                missing_any = False
+                if has_sol_field:
+                    sol_arr = test_batch.non_tensor_batch[sol_field]
+                    try:
+                        import numpy as _np
+
+                        sol_np = _np.asarray(sol_arr, dtype=object)
+                        # consider None as missing
+                        missing_any = _np.any(sol_np == None)  # noqa: E711
+                    except Exception:
+                        # Fallback: iterate
+                        missing_any = any(x is None for x in sol_arr)
+
+                if has_sol_field and not missing_any:
+                    critic_view = self._maybe_build_critic_batch_with_solution(test_batch)
+                    size_divisor = getattr(self.critic_wg, "world_size", 1)
+                    critic_view_padded, pad_size = pad_dataproto_to_divisor(critic_view, size_divisor)
+                    values_padded = self.critic_wg.compute_values(critic_view_padded)
+                    values = unpad_dataproto(values_padded, pad_size=pad_size)
+                    test_batch = test_batch.union(values)
+                    # Token-wise MSE vs. accuracy (mean over response tokens)
+                    if reward_extras and ("acc" in reward_extras):
+                        acc_vec = reward_extras["acc"]
+                        acc_tensor = torch.tensor(
+                            acc_vec, dtype=test_batch.batch["values"].dtype, device=test_batch.batch["values"].device
+                        )
+                        resp_mask_f = test_batch.batch["response_mask"].to(dtype=test_batch.batch["values"].dtype)
+                        acc_expanded = acc_tensor.unsqueeze(1).expand_as(test_batch.batch["values"]) 
+                        sq_err = ((test_batch.batch["values"] - acc_expanded) ** 2) * resp_mask_f
+                        val_token_mse_num_total += float(torch.sum(sq_err).detach().item())
+                        val_token_mse_den_total += float(torch.sum(resp_mask_f).detach().item())
+                        # Final-token MSE vs. acc
+                        resp_len = torch.sum(test_batch.batch["response_mask"], dim=-1).long()
+                        valid_mask = resp_len > 0
+                        if torch.any(valid_mask):
+                            last_idx = (resp_len - 1).clamp(min=0)
+                            arange = torch.arange(test_batch.batch["values"].size(0), device=test_batch.batch["values"].device)
+                            final_v = test_batch.batch["values"][arange, last_idx]
+                            diff2 = (final_v[valid_mask] - acc_tensor[valid_mask]) ** 2
+                            val_final_mse_num_total += float(torch.sum(diff2).detach().item())
+                            val_final_mse_count += int(valid_mask.sum().item())
+                        # RMAUC per batch (weighted by valid samples)
+                        rmauc_batch = compute_rmauc(
+                            values=test_batch.batch["values"], acc_vec=acc_tensor, response_mask=test_batch.batch["response_mask"]
+                        )
+                        val_rmauc_sum_total += float(rmauc_batch) * int(valid_mask.sum().item())
+                        val_rmauc_count_total += int(valid_mask.sum().item())
 
             # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
@@ -805,7 +978,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
-        if val_data_dir:
+        # When using dataset-provided generations, skip dumping validation generations to disk
+        if val_data_dir and not self.config.data.get("use_dataset_responses", False):
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
@@ -843,6 +1017,14 @@ class RayPPOTrainer(OneLoggerInstrumented):
             metric_dict["val-aux/num_turns/min"] = sample_turns.min()
             metric_dict["val-aux/num_turns/max"] = sample_turns.max()
             metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+
+        # Add critic diagnostics for validation
+        if val_token_mse_den_total > 0:
+            metric_dict["val-aux/critic/mse/token/mean"] = val_token_mse_num_total / val_token_mse_den_total
+        if val_final_mse_count > 0:
+            metric_dict["val-aux/critic/mse/final_vs_acc"] = val_final_mse_num_total / val_final_mse_count
+        if val_rmauc_count_total > 0:
+            metric_dict["val-aux/critic/rmauc"] = val_rmauc_sum_total / val_rmauc_count_total
 
         return metric_dict
 
@@ -1259,9 +1441,35 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             batch.batch["reward_baselines"] = reward_baseline_tensor
 
                             del gen_baseline_batch, gen_baseline_output
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    if not self.config.data.get("use_dataset_responses", False):
+                        # repeat to align with repeated responses in rollout
+                        batch = batch.repeat(
+                            repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                        )
+                        batch = batch.union(gen_batch_output)
+                    else:
+                        # Expand batch per-sample according to dataset-provided response counts
+                        resp_strs = gen_batch.non_tensor_batch.get("response_strs")
+                        if resp_strs is None:
+                            raise ValueError(
+                                "use_dataset_responses=True but 'response_strs' missing in gen_batch.non_tensor_batch"
+                            )
+                        repeat_counts = []
+                        for item in resp_strs:
+                            if isinstance(item, str):
+                                repeat_counts.append(1)
+                            elif isinstance(item, (list, tuple, np.ndarray)):
+                                if len(item) == 0:
+                                    raise ValueError(
+                                        "Encountered empty list for 'response_strs' entry while use_dataset_responses=True"
+                                    )
+                                repeat_counts.append(len(item))
+                            else:
+                                raise ValueError(
+                                    f"'response_strs' must be str or list[str], got {type(item)}"
+                                )
+                        batch = batch.sample_level_repeat(repeat_counts)
+                        batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1369,6 +1577,30 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             for key in ("values", "returns"):
                                 if key in batch.batch and key not in critic_view.batch:
                                     critic_view.batch[key] = batch.batch[key]
+
+                            # If using GAE for advantage estimation, allow a different lambda for critic returns
+                            try:
+                                adv_estimator = self.config.algorithm.adv_estimator
+                            except Exception:
+                                adv_estimator = None
+
+                            if adv_estimator == AdvantageEstimator.GAE:
+                                critic_lam = self.config.algorithm.get("critic_lam", self.config.algorithm.lam)
+                                # Only recompute if critic lambda differs or if returns missing
+                                if ("returns" not in critic_view.batch) or (critic_lam != self.config.algorithm.lam):
+                                    returns_values = critic_view.batch.get("values", batch.batch.get("values", None))
+                                    if returns_values is None:
+                                        raise ValueError("Values required to compute critic returns with GAE are missing.")
+                                    critic_returns_adv, critic_returns = core_algos.compute_gae_advantage_return(
+                                        token_level_rewards=batch.batch["token_level_rewards"],
+                                        values=returns_values,
+                                        response_mask=critic_view.batch["response_mask"],
+                                        gamma=self.config.algorithm.gamma,
+                                        lam=critic_lam,
+                                    )
+                                    # Overwrite returns for critic update only
+                                    critic_view.batch["returns"] = critic_returns
+
                             critic_output = self.critic_wg.update_critic(critic_view)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
@@ -1383,7 +1615,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
+                    # When using dataset-provided generations, skip dumping training generations to disk
+                    if rollout_data_dir and not self.config.data.get("use_dataset_responses", False):
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate

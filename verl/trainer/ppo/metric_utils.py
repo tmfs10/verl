@@ -26,6 +26,51 @@ from verl import DataProto
 from verl.utils.import_utils import deprecated
 
 
+def compute_rmauc(values: torch.Tensor, acc_vec: torch.Tensor, response_mask: torch.Tensor) -> float:
+    """
+    Compute Running-Mean AUC (RMAUC) of critic "goodness" over response tokens.
+
+    Definitions per sample (with n valid response tokens):
+      - e_t = (v_t - acc)^2
+      - s_t = 1 - e_t
+      - m_t = (1/t) * sum_{k=1..t} s_k
+      - RMAUC = 2/(n+1) * sum_{t=1..n} m_t  # original normalization
+
+    This function returns the mean RMAUC across samples with at least one
+    valid response token.
+
+    Args:
+        values: Tensor of shape (B, R) critic values per response token.
+        acc_vec: Tensor of shape (B,) scalar accuracy per sample.
+        response_mask: Tensor of shape (B, R) with 1 for response tokens, 0 otherwise.
+
+    Returns:
+        float: Mean RMAUC across valid samples; NaN if no valid samples.
+    """
+    if not isinstance(response_mask, torch.Tensor):
+        response_mask = torch.tensor(response_mask)
+    resp_mask_b = response_mask.bool()
+    B = values.size(0)
+    acc_expanded = acc_vec.to(values.device).unsqueeze(1).expand_as(values)
+    err = (values - acc_expanded) ** 2
+    rmauc_vals = []
+    for i in range(B):
+        mask_i = resp_mask_b[i]
+        n_i = int(mask_i.sum().item())
+        if n_i == 0:
+            continue
+        s_i = 1.0 - err[i][mask_i]
+        cumsum_i = torch.cumsum(s_i, dim=0)
+        t = torch.arange(1, n_i + 1, device=s_i.device, dtype=s_i.dtype)
+        m_i = cumsum_i / t
+        rmauc_i = (2.0 / (n_i + 1)) * torch.sum(m_i)
+        rmauc_vals.append(rmauc_i)
+
+    if len(rmauc_vals) == 0:
+        return float("nan")
+    return torch.stack(rmauc_vals).mean().detach().item()
+
+
 @deprecated("verl.utils.metric.reduce_metrics")
 def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
     """
@@ -142,6 +187,37 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
+        # Ensure accuracy is provided by reward extras
+        assert (
+            "acc" in batch.non_tensor_batch
+        ), "Expected 'acc' in non_tensor_batch from reward_extra_infos_dict"
+
+        # (1) MSE between reward 'acc' and critic's final-token value
+        acc_arr = batch.non_tensor_batch["acc"]
+        if isinstance(acc_arr, torch.Tensor):
+            acc_vec = acc_arr.float()
+        else:
+            acc_vec = torch.tensor(np.asarray(acc_arr), dtype=torch.float32)
+
+        resp_len = response_length.long()  # (B,)
+        valid_sample_mask = resp_len > 0
+        last_idx = (resp_len - 1).clamp(min=0)
+        arange = torch.arange(values.size(0), device=values.device)
+        final_v = values[arange, last_idx.to(values.device)]
+        final_v = final_v[valid_sample_mask.to(values.device)]
+        acc_used = acc_vec.to(values.device)[valid_sample_mask]
+        critic_mse_final_vs_acc = torch.mean((final_v - acc_used) ** 2).detach().item()
+
+        # (2) Token-wise MSE between critic values and scalar accuracy over response tokens
+        resp_mask_f = response_mask.to(dtype=values.dtype)
+        acc_expanded = acc_vec.to(values.device).unsqueeze(1).expand_as(values)
+        sq_err = ((values - acc_expanded) ** 2) * resp_mask_f
+        denom = torch.sum(resp_mask_f).clamp(min=1)
+        critic_mse_token_mean = (torch.sum(sq_err) / denom).detach().item()
+
+        # (3) Running-mean AUC
+        critic_rmauc = compute_rmauc(values=values, acc_vec=acc_vec.to(values.device), response_mask=response_mask)
+
     # Aborted samples and non-aborted response length statistics
     # response_length_non_aborted/*: statistics computed on non-aborted samples only
     aborted_ratio = torch.mean(aborted_mask.float()).detach().item()
@@ -188,6 +264,11 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
                 "critic/values/min": torch.min(valid_values).detach().item(),
                 # vf explained var
                 "critic/vf_explained_var": (1.0 - return_diff_var / (return_var + 1e-5)).detach().item(),
+                # additional MSE diagnostics
+                "critic/mse/final_vs_acc": critic_mse_final_vs_acc,
+                "critic/mse/token/mean": critic_mse_token_mean,
+                # running-mean AUC
+                "critic/rmauc": critic_rmauc,
             }
             if use_critic
             else {}
@@ -472,6 +553,8 @@ def process_validation_metrics(
         for uid, var2vals in uid2var2vals.items():
             for var_name, var_vals in var2vals.items():
                 if isinstance(var_vals[0], str):
+                    continue
+                if type(var_vals[0]) == type(None):
                     continue
 
                 metric = {}

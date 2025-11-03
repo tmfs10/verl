@@ -86,6 +86,8 @@ class CriticConfig(BaseConfig):
     model_config: HFModelConfig = None
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
+    # Controller-only flag; worker accepts it to avoid config instantiation errors.
+    append_solution_to_prompt: bool = False
 
     def __post_init__(self):
         """Validate critic configuration parameters."""

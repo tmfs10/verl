@@ -13,6 +13,12 @@
 # limitations under the License.
 """
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other mpain.
+
+Added options:
+data.use_dataset_responses: True or False - uses responses field
+critic_only: True or False
+critic.append_solution_to_prompt: True or False
+
 """
 
 import os
