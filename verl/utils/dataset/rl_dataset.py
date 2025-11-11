@@ -115,6 +115,8 @@ class RLHFDataset(Dataset):
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        # Optional override for the content of any 'system' role messages
+        self.system_prompt_override: Optional[str] = config.get("system_prompt", None)
 
         self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
         self.num_workers = min(self.num_workers, os.cpu_count())
@@ -266,6 +268,18 @@ class RLHFDataset(Dataset):
 
     def _build_messages(self, example: dict):
         messages: list = example.pop(self.prompt_key)
+
+        # If a system prompt override is provided via config, substitute it
+        # for the content of any message with role == "system". If not provided,
+        # leave messages unchanged.
+        if self.system_prompt_override is not None:
+            for msg in messages:
+                # Only substitute when explicitly a system role
+                if isinstance(msg, dict) and msg.get("role") == "system":
+                    # Always set to a plain string so downstream multimodal
+                    # conversion (if present) can safely split it.
+                    msg["content"] = self.system_prompt_override
+                    break
 
         if self.image_key in example or self.video_key in example:
             for message in messages:

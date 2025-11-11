@@ -143,8 +143,35 @@ class MegatronPPOCritic(BasePPOCritic):
         return values
 
     def make_minibatch_iterator(self, data: DataProto) -> Iterable[DataProto]:
-        select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns"]
+        select_keys = [
+            "input_ids",
+            "responses",
+            "attention_mask",
+            "position_ids",
+            "values",
+            "returns",
+        ]
+        if "critic_loss_weight" in data.batch.keys():
+            select_keys.append("critic_loss_weight")
         data = data.select(batch_keys=select_keys)
+        # Optionally drop samples with zero critic weight (skip-zero-advantage)
+        if "critic_loss_weight" in data.batch.keys():
+            w = data.batch["critic_loss_weight"]
+            try:
+                if w.dim() == 1:
+                    keep = w > 0
+                else:
+                    keep = (w > 0).any(dim=-1)
+                if keep.dtype != torch.bool:
+                    keep = keep.bool()
+                if keep.numel() > 0 and keep.any():
+                    data = data.select_idxs(keep)
+                else:
+                    # No samples contribute; leave empty so iterator yields nothing
+                    pass
+            except Exception:
+                # If anything goes wrong, fall back to keeping all
+                pass
         return data.make_iterator(
             mini_batch_size=self.config.ppo_mini_batch_size,
             epochs=self.config.ppo_epochs,
@@ -216,6 +243,17 @@ class MegatronPPOCritic(BasePPOCritic):
             response_length = responses.size(1)
 
             response_mask = attention_mask[:, -response_length:]
+
+            # Optional: apply per-sample/group weighting by scaling the mask
+            if "critic_loss_weight" in data:
+                w = data["critic_loss_weight"]
+                if w.dim() == 1:
+                    w = w.unsqueeze(-1).expand_as(response_mask)
+                else:
+                    assert w.shape == response_mask.shape, (
+                        f"critic_loss_weight shape {w.shape} must match response_mask {response_mask.shape}"
+                    )
+                response_mask = response_mask * w.to(response_mask.dtype)
 
             cliprange_value = self.config.cliprange_value
 

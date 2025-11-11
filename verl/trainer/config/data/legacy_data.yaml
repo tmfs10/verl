@@ -16,6 +16,10 @@ val_files: ~/data/rlhf/gsm8k/test.parquet
 # The field in the dataset where the prompt is located. Default is 'prompt'.
 prompt_key: prompt
 
+# Optional override for the content of any `role: system` message in each prompt.
+# If null, no substitution occurs and dataset-provided system messages are used as-is.
+system_prompt: null
+
 # The field used to select the reward function (if using different ones per example).
 reward_fn_key: data_source
 

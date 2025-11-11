@@ -164,6 +164,25 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
+        # Optionally drop samples with zero critic weight (skip-zero-advantage)
+        if "critic_loss_weight" in data.batch.keys():
+            w = data.batch["critic_loss_weight"]
+            try:
+                if w.dim() == 1:
+                    keep = w > 0
+                else:
+                    keep = (w > 0).any(dim=-1)
+                if keep.dtype != torch.bool:
+                    keep = keep.bool()
+                if keep.numel() > 0 and keep.any():
+                    data = data.select_idxs(keep)
+                else:
+                    # No samples contribute; keep empty batch and let downstream no-op
+                    pass
+            except Exception:
+                # If anything goes wrong, fall back to keeping all
+                pass
+
         if use_dynamic_bsz:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
             micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
@@ -194,7 +213,17 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.critic_module.train()
         metrics = {}
 
-        select_keys = ["input_ids", "responses", "response_mask", "attention_mask", "position_ids", "values", "returns"]
+        select_keys = [
+            "input_ids",
+            "responses",
+            "response_mask",
+            "attention_mask",
+            "position_ids",
+            "values",
+            "returns",
+        ]
+        if "critic_loss_weight" in data.batch.keys():
+            select_keys.append("critic_loss_weight")
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
@@ -233,6 +262,7 @@ class DataParallelPPOCritic(BasePPOCritic):
                         response_mask=response_mask,
                         cliprange_value=self.config.cliprange_value,
                         loss_agg_mode=self.config.loss_agg_mode,
+                        loss_weights=model_inputs.get("critic_loss_weight", None),
                     )
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz

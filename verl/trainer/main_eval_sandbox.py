@@ -75,8 +75,11 @@ def main(config):
         outputs = [item.pop("outputs") for item in batch]
         num_outputs = [len(output) for output in outputs]
         total_outputs = sum(num_outputs)
+
+        sol_indices = [list(range(num_outputs[i])) for i in range(len(num_outputs))]
         ground_truths = [g for i, g in enumerate(ground_truths) for _ in range(num_outputs[i])]
         extras = [e for i, e in enumerate(extras) for _ in range(num_outputs[i])]
+        sol_indices = [i for ls in sol_indices for i in ls]
         responses_str = [o for output in outputs for o in output]
     
         score_result = compute_score(
@@ -84,6 +87,7 @@ def main(config):
             solution_strs=responses_str,
             ground_truths=ground_truths,
             extra_infos=extras,
+            sol_indices=sol_indices,
             **config.reward_model.get("reward_fn_args", {}),
         )
         print(f"Computed {len(score_result)} scores")

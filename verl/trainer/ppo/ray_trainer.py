@@ -23,6 +23,7 @@ import os
 import uuid
 from collections import defaultdict
 from copy import deepcopy
+import numpy as _np
 from dataclasses import dataclass, field
 from pprint import pprint
 from typing import Optional
@@ -225,7 +226,6 @@ def compute_advantage(
             # ensure there is at least one response token
             assert torch.all(resp_len > 0), "Found sequence with zero valid response length when computing length-adaptive GAE"
             lam_input = 1.0 - 1.0 / (alpha * resp_len)
-            print('MMMMM', resp_len, '\n\nXXXXXXX\n\n', lam_input)
         advantages, returns = core_algos.compute_gae_advantage_return(
             token_level_rewards=data.batch["token_level_rewards"],
             values=data.batch["values"],
@@ -439,14 +439,13 @@ class RayPPOTrainer(OneLoggerInstrumented):
             new_prompt_unpadded.append(unpadded)
             new_prompt_lens.append(int(unpadded.size(0)))
 
-        max_new_prompt_len = max(new_prompt_lens) if new_prompt_lens else prompt_ids.size(1)
         pad_token_id = int(self.tokenizer.pad_token_id)
         new_prompt_ids = []
         new_prompt_masks = []
         for i in range(B):
             unpadded = new_prompt_unpadded[i]
             np_len = new_prompt_lens[i]
-            pad_len = max_new_prompt_len - np_len
+            pad_len = max_prompt_len_cfg - np_len
             if pad_len > 0:
                 pad_ids = torch.full((pad_len,), pad_token_id, dtype=unpadded.dtype)
                 padded = torch.cat([pad_ids, unpadded], dim=0)
@@ -486,13 +485,11 @@ class RayPPOTrainer(OneLoggerInstrumented):
         position_ids, and responses. The response_mask can be derived downstream.
         """
         use_ds_resp = self.config.data.get("use_dataset_responses", False)
+        response_strs_field = self.config.data.get("response_strs_field", "response_strs")
         if not use_ds_resp:
             return batch
 
-        responses_text = batch.non_tensor_batch.get("response_strs", None)
-        if responses_text is None:
-            raise ValueError("use_dataset_responses=True but field 'response_strs' not found in dataset row.")
-
+        responses_text = batch.non_tensor_batch[response_strs_field]
         # Build per-sample repeat counts and flatten responses
         B = len(responses_text)
         repeat_counts = []
@@ -802,11 +799,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 sample_uids.extend(test_batch.non_tensor_batch["uid"])
                 sample_gts.extend(ground_truths)
             else:
-                resp_strs = test_batch.non_tensor_batch.get("response_strs")
-                if resp_strs is None:
-                    raise ValueError(
-                        "use_dataset_responses=True but 'response_strs' missing in test_batch.non_tensor_batch"
-                    )
+                response_strs_field = self.config.data.get("response_strs_field", "response_strs")
+                resp_strs = test_batch.non_tensor_batch[response_strs_field]
                 repeat_counts = []
                 for item in resp_strs:
                     if isinstance(item, str):
@@ -864,7 +858,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
             # Align test_batch size with outputs when using dataset responses
             if self.config.data.get("use_dataset_responses", False):
-                resp_strs = test_gen_batch.non_tensor_batch.get("response_strs")
+                response_strs_field = self.config.data.get("response_strs_field", "response_strs")
+                resp_strs = test_gen_batch.non_tensor_batch[response_strs_field]
                 if resp_strs is None:
                     raise ValueError(
                         "use_dataset_responses=True but 'response_strs' missing in test_gen_batch.non_tensor_batch"
@@ -1449,11 +1444,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
                         batch = batch.union(gen_batch_output)
                     else:
                         # Expand batch per-sample according to dataset-provided response counts
-                        resp_strs = gen_batch.non_tensor_batch.get("response_strs")
-                        if resp_strs is None:
-                            raise ValueError(
-                                "use_dataset_responses=True but 'response_strs' missing in gen_batch.non_tensor_batch"
-                            )
+                        response_strs_field = self.config.data.get("response_strs_field", "response_strs")
+                        resp_strs = gen_batch.non_tensor_batch[response_strs_field]
                         repeat_counts = []
                         for item in resp_strs:
                             if isinstance(item, str):
@@ -1600,6 +1592,70 @@ class RayPPOTrainer(OneLoggerInstrumented):
                                     )
                                     # Overwrite returns for critic update only
                                     critic_view.batch["returns"] = critic_returns
+
+                            # Optional: in-group normalization for critic loss between acc==0 and acc==1
+                            try:
+                                apply_balancing = self.config.algorithm.get(
+                                    "critic_in_group_normalization", {}
+                                ).get("enable", False)
+                                apply_skip_zero = self.config.algorithm.get(
+                                    "critic_skip_zero_advantage", False
+                                )
+                                token_mean = self.config.algorithm.get("critic_group_normalization", {}).get("token_mean", False)
+                                response_length = critic_view.batch["response_mask"].sum(dim=-1)
+                                if (apply_balancing or apply_skip_zero):
+                                    assert "uid" in critic_view.non_tensor_batch, "uid field required for critic in group normalization"
+                                    # Prefer acc from non-tensor batch (reward extras)
+                                    acc_arr = critic_view.non_tensor_batch["acc"]
+                                    assert np.all((acc_arr == 0.0) | (acc_arr == 1.0)), "acc must be 0.0 or 1.0"
+                                    # Build per-sample weights so that, within each group (same uid),
+                                    # the total weight on acc==1 equals total weight on acc==0 if both exist.
+
+                                    uids = critic_view.non_tensor_batch["uid"]
+                                    # Normalize types
+                                    uids_list = [str(u) for u in list(uids)]
+
+                                    B = len(uids_list)
+                                    weights = _np.ones((B,), dtype=_np.float32)
+                                    from collections import defaultdict as _dd
+
+                                    gid2idx = _dd(list)
+                                    for i, g in enumerate(uids_list):
+                                        gid2idx[g].append(i)
+                                    for g, idxs in gid2idx.items():
+                                        if not idxs:
+                                            continue
+                                        g_acc = acc_arr[idxs]
+                                        idxs0 = idxs[g_acc == 0.0]
+                                        idxs1 = idxs[g_acc == 1.0]
+                                        n1 = len(idxs1)
+                                        n0 = len(idxs0)
+                                        if n1 > 0 and n0 > 0:
+                                            if apply_balancing:
+                                                # Set weights so sums match: sum_w(1) == sum_w(0)
+                                                # Use w_pos=1.0 and w_neg=n1/n0
+                                                if token_mean:
+                                                    n1 = response_length[idxs1].sum()
+                                                    n0 = response_length[idxs0].sum()
+                                                w_neg = n1/n0
+                                                w_pos = (n1+n0)/(2*n1)
+                                                w_neg *= w_pos
+                                                for j, ii in enumerate(idxs):
+                                                    if g_acc[j] == 0:
+                                                        weights[ii] = w_neg
+                                                    else:
+                                                        weights[ii] = w_pos
+                                        else:
+                                            # All-positive or all-negative group
+                                            if apply_skip_zero:
+                                                for ii in idxs:
+                                                    weights[ii] = 0.0
+                                    # attach as tensor to critic_view
+                                    rm = critic_view.batch["response_mask"]
+                                    w_tensor = torch.tensor(weights, dtype=rm.dtype, device=rm.device)
+                                    critic_view.batch["critic_loss_weight"] = w_tensor
+                            except Exception as _e:
+                                print(f"critic_in_group_normalization skipped due to error: {_e}")
 
                             critic_output = self.critic_wg.update_critic(critic_view)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
