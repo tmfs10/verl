@@ -359,6 +359,13 @@ class RayPPOTrainer(OneLoggerInstrumented):
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         self.ref_in_actor = config.actor_rollout_ref.model.get("lora_rank", 0) > 0
 
+        # Enforce incompatibility: probability reweighting disables rmAUC weighting
+        prob_rw_enable = self.config.algorithm.get("critic_prob_reweighting", {}).get("enable", False)
+        rmauc_enable = self.config.algorithm.get("critic_rmauc", {}).get("enable", False)
+        assert not (prob_rw_enable and rmauc_enable), (
+            "algorithm.critic_prob_reweighting.enable=True is incompatible with algorithm.critic_rmauc.enable=True."
+        )
+
         # define in-reward KL control
         # kl loss control currently not suppoorted
         if self.config.algorithm.use_kl_in_reward:
@@ -1044,19 +1051,25 @@ class RayPPOTrainer(OneLoggerInstrumented):
         # create actor and/or rollout as needed
         if self.hybrid_engine:
             use_ds_resp = self.config.data.get("use_dataset_responses", False)
-            # If critic-only + dataset responses, no actor/rollout is needed
-            if not (self.critic_only and use_ds_resp):
+            prob_rw_enable = self.config.algorithm.get("critic_prob_reweighting", {}).get("enable", False)
+            # If critic-only + dataset responses, we normally skip actor/rollout.
+            # Exception: when probability reweighting is enabled, we need the actor to compute log-probs.
+            if not (self.critic_only and use_ds_resp and not prob_rw_enable):
                 resource_pool = self.resource_pool_manager.get_resource_pool(Role.ActorRollout)
                 # Role selection:
-                # - critic_only: rollout only
-                # - dataset responses: actor only
-                # - default: actor + rollout
+                # - critic_only + dataset responses + prob_rw_enable: actor only
+                # - critic_only + dataset responses + prob_rw_disable: no actor/rollout (handled above)
+                # - critic_only + no dataset responses + prob_rw_enable: actor + rollout (need both)
+                # - critic_only + no dataset responses + prob_rw_disable: rollout only
+                # - non-critic_only + dataset responses: actor only
+                # - non-critic_only + no dataset responses: actor + rollout
                 if self.critic_only:
-                    role_name = "rollout"
-                elif use_ds_resp:
-                    role_name = "actor"
+                    if use_ds_resp:
+                        role_name = "actor"  # only to compute log-probs when prob_rw_enable, otherwise skipped
+                    else:
+                        role_name = "actor_rollout" if prob_rw_enable else "rollout"
                 else:
-                    role_name = "actor_rollout"
+                    role_name = "actor" if use_ds_resp else "actor_rollout"
 
                 actor_rollout_cls = RayClassWithInitArgs(
                     cls=self.role_worker_mapping[Role.ActorRollout],
@@ -1499,7 +1512,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             )
 
                     # recompute old_log_probs
-                    if not self.critic_only:
+                    need_prob_rw = self.config.algorithm.get("critic_prob_reweighting", {}).get("enable", False)
+                    if (not self.critic_only) or need_prob_rw:
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
                             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
@@ -1508,8 +1522,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             entropy_agg = agg_loss(
                                 loss_mat=entropys, loss_mask=response_masks, loss_agg_mode=loss_agg_mode
                             )
-                            old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
-                            metrics.update(old_log_prob_metrics)
+                            if not self.critic_only:
+                                old_log_prob_metrics = {"actor/entropy": entropy_agg.detach().item()}
+                                metrics.update(old_log_prob_metrics)
                             old_log_prob.batch.pop("entropys")
                             batch = batch.union(old_log_prob)
 
@@ -1600,6 +1615,31 @@ class RayPPOTrainer(OneLoggerInstrumented):
                                     # Overwrite returns for critic update only
                                     critic_view.batch["returns"] = critic_returns
 
+                            # Compute critic logprob reweighting first (to be applied after other weightings)
+                            prob_cfg = self.config.algorithm.get("critic_prob_reweighting", {})
+                            if prob_cfg.get("enable", False):
+                                assert "old_log_probs" in batch.batch, (
+                                    "critic_prob_reweighting requires actor log-probs; ensure actor is initialized when enabled"
+                                )
+                                old_lp = -batch.batch["old_log_probs"].to(torch.float32)
+                                resp_mask = critic_view.batch["response_mask"].to(old_lp.dtype)
+                                T = resp_mask.sum(dim=-1, keepdim=True)
+                                # Optional: cumulative mean across tokens before weighting
+                                if prob_cfg.get("cummean", False):
+                                    cum_sum = torch.cumsum(old_lp * resp_mask, dim=-1)
+                                    cum_cnt = torch.cumsum(resp_mask, dim=-1)
+                                    old_lp_used = torch.where(
+                                        cum_cnt > 0, cum_sum / cum_cnt.clamp_min(1e-6), torch.zeros_like(old_lp)
+                                    )
+                                else:
+                                    old_lp_used = old_lp
+                                S = (old_lp_used * resp_mask).sum(dim=-1, keepdim=True) + T
+                                eps = 1e-6
+                                S = torch.where(torch.abs(S) < eps, torch.full_like(S, eps), S)
+                                prob_w = ((old_lp_used + 1.0) / S) * T
+                                prob_w = prob_w * resp_mask
+                                critic_view.batch["critic_prob_weight"] = prob_w
+
                             # Optional: in-group normalization for critic loss between acc==0 and acc==1
                             try:
                                 apply_balancing = self.config.algorithm.get(
@@ -1624,32 +1664,29 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             except Exception as _e:
                                 print(f"critic_in_group_normalization skipped due to error: {_e}")
 
-                            # Optional: rmAUC per-token weighting for critic value loss
-                            rmauc_cfg = self.config.algorithm.get("critic_rmauc", {})
-                            if rmauc_cfg.get("enable", False):
-                                resp_mask = critic_view.batch["response_mask"]  # (B, T)
-                                # Weight for token t = number of valid tokens strictly after t
-                                rmauc_w = torch.flip(resp_mask.to(torch.float32), dims=[-1]).cumsum(dim=-1)
+                            # rmAUC weighting of loss is intentionally disabled; rmAUC is only used for metrics.
 
-                                if rmauc_cfg.get("length_norm", False):
-                                    # Divide by n*(n-1)/2 per sequence to avoid scale-up with rmAUC
-                                    n = resp_mask.sum(dim=-1).to(torch.float32)
-                                    denom = (n - 1.0) / 2.0 # previously sum was to n, then to n*(n-1)/2, so divide by this to bring it back to n
-                                    denom = torch.where(denom > 0, denom, torch.ones_like(denom))
-                                    rmauc_w = rmauc_w / denom.unsqueeze(-1)
-
-                                # Combine with any existing critic loss weights (broadcast if needed)
+                            # If prob reweighting is enabled, multiply it with existing critic_loss_weight now
+                            if prob_cfg.get("enable", False):
+                                resp_mask = critic_view.batch["response_mask"].to(torch.float32)
+                                T = resp_mask.sum(dim=-1, keepdim=True)
+                                prob_w = critic_view.batch.pop("critic_prob_weight")
                                 if "critic_loss_weight" in critic_view.batch:
-                                    existing = critic_view.batch["critic_loss_weight"]
-                                    if existing.dim() == 1:
-                                        existing = existing.unsqueeze(-1).expand_as(rmauc_w)
+                                    w_exist = critic_view.batch["critic_loss_weight"]
+                                    if w_exist.dim() == 1:
+                                        w_exist = w_exist.unsqueeze(-1).expand_as(prob_w)
                                     else:
                                         assert (
-                                            existing.shape == rmauc_w.shape
-                                        ), f"Existing critic_loss_weight shape {existing.shape} must match rmAUC weights {rmauc_w.shape}"
-                                    rmauc_w = rmauc_w * existing.to(rmauc_w.dtype)
-
-                                critic_view.batch["critic_loss_weight"] = rmauc_w
+                                            w_exist.shape == prob_w.shape
+                                        ), f"critic_loss_weight shape {w_exist.shape} must match prob weighting {prob_w.shape}"
+                                    final_w = prob_w * w_exist.to(prob_w.dtype)
+                                else:
+                                    final_w = prob_w
+                                # Renormalize so per-seq sum of weights equals T
+                                eps = 1e-6
+                                denom = final_w.sum(dim=-1, keepdim=True).clamp_min(eps)
+                                final_w = final_w * (T / denom)
+                                critic_view.batch["critic_loss_weight"] = final_w
 
                             critic_output = self.critic_wg.update_critic(critic_view)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
