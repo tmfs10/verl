@@ -14,8 +14,12 @@
 
 import warnings
 from enum import Enum
+from collections import defaultdict
 
 from omegaconf import DictConfig
+
+import numpy as _np
+import torch
 
 from verl.single_controller.base import Worker
 from verl.trainer.ppo.core_algos import AdvantageEstimator
@@ -63,3 +67,82 @@ def need_critic(config: DictConfig) -> bool:
             stacklevel=2,
         )
         return False
+
+
+def compute_group_loss_weights(
+    uids,
+    acc_arr,
+    response_mask: torch.Tensor,
+    *,
+    token_mean: bool = False,
+    skip_zero: bool = False,
+) -> torch.Tensor:
+    """
+    Compute per-sample loss weights to balance contributions of positives and negatives within groups.
+
+    Groups are defined by `uid`. For each group containing both positives (acc==1) and negatives (acc==0),
+    assign weights w_pos, w_neg so that total weighted contribution from positives equals that from negatives.
+
+    - If `token_mean` is True, uses total response token counts (sum of response_mask) per sequence as counts.
+    - If `skip_zero` is True, groups that are all-positive or all-negative get zero weights (dropped).
+
+    Args:
+        uids: Iterable of group identifiers of length B.
+        acc_arr: Iterable/array of 0.0/1.0 of length B.
+        response_mask: (B, T) torch tensor.
+        token_mean: Whether to balance by token counts instead of sample counts.
+        skip_zero: If True, zero weight for mono-class groups.
+
+    Returns:
+        (B,) torch tensor of weights on response_mask.device/dtype.
+    """
+    assert response_mask.dim() == 2, "response_mask must be (B, T)"
+    device = response_mask.device
+    dtype = response_mask.dtype
+
+    # Normalize inputs
+    uid_list = [str(u) for u in list(uids)]
+    acc_np = _np.asarray(acc_arr)
+    assert _np.all((acc_np == 0.0) | (acc_np == 1.0)), "acc array must be 0.0 or 1.0"
+
+    B = len(uid_list)
+    assert B == response_mask.size(0), "uids/acc length must match batch size"
+
+    weights = _np.ones((B,), dtype=_np.float32)
+
+    gid2idx: dict[str, list[int]] = defaultdict(list)
+    for i, g in enumerate(uid_list):
+        gid2idx[g].append(i)
+
+    # Precompute response lengths if needed
+    resp_lens = None
+    if token_mean:
+        resp_lens = response_mask.sum(dim=-1).detach().to(dtype=torch.float32).cpu().numpy()
+
+    for g, idxs in gid2idx.items():
+        if not idxs:
+            continue
+        g_acc = acc_np[idxs]
+        idxs0 = [ii for j, ii in enumerate(idxs) if g_acc[j] == 0.0]
+        idxs1 = [ii for j, ii in enumerate(idxs) if g_acc[j] == 1.0]
+
+        if token_mean:
+            n1 = float(_np.sum(resp_lens[idxs1])) if len(idxs1) > 0 else 0.0
+            n0 = float(_np.sum(resp_lens[idxs0])) if len(idxs0) > 0 else 0.0
+        else:
+            n1 = float(len(idxs1))
+            n0 = float(len(idxs0))
+
+        if n1 > 0 and n0 > 0:
+            # Use symmetric weighting so sums match, same approach for critic/actor
+            # Base ratios
+            w_pos = (n1 + n0) / (2.0 * max(n1, 1.0))
+            w_neg = (n1 / max(n0, 1.0)) * w_pos
+            for j, ii in enumerate(idxs):
+                weights[ii] = w_pos if g_acc[j] == 1.0 else w_neg
+        else:
+            if skip_zero:
+                for ii in idxs:
+                    weights[ii] = 0.0
+
+    return torch.tensor(weights, dtype=dtype, device=device)

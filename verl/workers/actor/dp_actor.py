@@ -371,6 +371,9 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        # Optional per-sequence actor weighting
+        if "actor_loss_weight" in data.batch.keys():
+            select_keys.append("actor_loss_weight")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         if self.config.tis_imp_ratio_cap > 0:
@@ -415,6 +418,15 @@ class DataParallelPPOActor(BasePPOActor):
                     rollout_log_probs = model_inputs["rollout_log_probs"] if self.config.tis_imp_ratio_cap > 0 else None
                     advantages = model_inputs["advantages"]
 
+                    # Apply optional sequence-level loss weights
+                    actor_w = model_inputs.get("actor_loss_weight", None)
+                    if actor_w is not None:
+                        # mask out sequences with zero weight for aggregation/metrics
+                        seq_keep = (actor_w != 0).to(response_mask.dtype).unsqueeze(-1)
+                        response_mask = response_mask * seq_keep
+                        # scale advantages token-wise per sequence
+                        advantages = advantages * actor_w.to(advantages.dtype).unsqueeze(-1)
+
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
 
@@ -452,6 +464,9 @@ class DataParallelPPOActor(BasePPOActor):
                     )
 
                     if entropy_coeff != 0:
+                        # If weighted, scale entropy before aggregation
+                        if actor_w is not None:
+                            entropy = entropy * actor_w.to(entropy.dtype).unsqueeze(-1)
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                         # compute policy loss
@@ -465,6 +480,9 @@ class DataParallelPPOActor(BasePPOActor):
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
+                        # If weighted, scale kld before aggregation
+                        if actor_w is not None:
+                            kld = kld * actor_w.to(kld.dtype).unsqueeze(-1)
                         kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef

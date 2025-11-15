@@ -1502,18 +1502,24 @@ def compute_value_loss(
     vf_losses2 = (vpredclipped - returns) ** 2
     clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
     if loss_weights is not None:
-        # Expect per-sequence weights of shape (bs,). When a weight is 0 for a
-        # sequence, drop that sequence entirely from the loss by masking out all
-        # its tokens in `response_mask`. Non-zero weights still scale the loss.
-        assert loss_weights.dim() == 1, (
-            f"loss_weights shape {loss_weights.shape} must be (bs,)"
-        )
-        # Scale losses by weights
-        clipped_vf_losses = clipped_vf_losses * loss_weights.unsqueeze(-1)
-        # Build a keep-mask: 1 for sequences with non-zero weight, else 0
-        seq_keep = (loss_weights != 0).to(response_mask.dtype).unsqueeze(-1)
-        # Mask out entire sequences with zero weight from aggregation/metrics
-        response_mask = response_mask * seq_keep
+        # Support two modes:
+        # - (B,) per-sequence weights (existing behavior)
+        # - (B, T) per-token weights (new): treated as a weighted mask
+        if loss_weights.dim() == 1:
+            # Per-sequence weights: scale loss values and optionally drop zero-weight sequences
+            clipped_vf_losses = clipped_vf_losses * loss_weights.unsqueeze(-1)
+            seq_keep = (loss_weights != 0).to(response_mask.dtype).unsqueeze(-1)
+            response_mask = response_mask * seq_keep
+        elif loss_weights.dim() == 2:
+            # Per-token weights: fold into the response_mask so aggregation uses weighted mean/sum
+            assert (
+                loss_weights.shape == response_mask.shape
+            ), f"loss_weights shape {loss_weights.shape} must match response_mask {response_mask.shape}"
+            response_mask = response_mask * loss_weights.to(response_mask.dtype)
+        else:
+            raise AssertionError(
+                f"loss_weights must be 1D or 2D; got shape {loss_weights.shape}"
+            )
     vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
     vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), response_mask)
     return vf_loss, vf_clipfrac

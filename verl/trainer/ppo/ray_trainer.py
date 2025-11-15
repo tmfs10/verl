@@ -52,7 +52,14 @@ from verl.trainer.ppo.metric_utils import (
     compute_rmauc,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
-from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
+from verl.trainer.ppo.utils import (
+    Role,
+    WorkerType,
+    need_critic,
+    need_reference_policy,
+    need_reward_model,
+    compute_group_loss_weights,
+)
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
@@ -1602,60 +1609,47 @@ class RayPPOTrainer(OneLoggerInstrumented):
                                     "critic_skip_zero_advantage", False
                                 )
                                 token_mean = self.config.algorithm.get("critic_group_normalization", {}).get("token_mean", False)
-                                response_length = critic_view.batch["response_mask"].sum(dim=-1)
                                 if (apply_balancing or apply_skip_zero):
                                     assert "uid" in critic_view.non_tensor_batch, "uid field required for critic in group normalization"
-                                    # Prefer acc from non-tensor batch (reward extras)
                                     acc_arr = critic_view.non_tensor_batch["acc"]
-                                    assert np.all((acc_arr == 0.0) | (acc_arr == 1.0)), "acc must be 0.0 or 1.0"
-                                    # Build per-sample weights so that, within each group (same uid),
-                                    # the total weight on acc==1 equals total weight on acc==0 if both exist.
-
                                     uids = critic_view.non_tensor_batch["uid"]
-                                    # Normalize types
-                                    uids_list = [str(u) for u in list(uids)]
-
-                                    B = len(uids_list)
-                                    weights = _np.ones((B,), dtype=_np.float32)
-                                    from collections import defaultdict as _dd
-
-                                    gid2idx = _dd(list)
-                                    for i, g in enumerate(uids_list):
-                                        gid2idx[g].append(i)
-                                    for g, idxs in gid2idx.items():
-                                        if not idxs:
-                                            continue
-                                        g_acc = acc_arr[idxs]
-                                        idxs0 = idxs[g_acc == 0.0]
-                                        idxs1 = idxs[g_acc == 1.0]
-                                        n1 = len(idxs1)
-                                        n0 = len(idxs0)
-                                        if n1 > 0 and n0 > 0:
-                                            if apply_balancing:
-                                                # Set weights so sums match: sum_w(1) == sum_w(0)
-                                                # Use w_pos=1.0 and w_neg=n1/n0
-                                                if token_mean:
-                                                    n1 = response_length[idxs1].sum()
-                                                    n0 = response_length[idxs0].sum()
-                                                w_neg = n1/n0
-                                                w_pos = (n1+n0)/(2*n1)
-                                                w_neg *= w_pos
-                                                for j, ii in enumerate(idxs):
-                                                    if g_acc[j] == 0:
-                                                        weights[ii] = w_neg
-                                                    else:
-                                                        weights[ii] = w_pos
-                                        else:
-                                            # All-positive or all-negative group
-                                            if apply_skip_zero:
-                                                for ii in idxs:
-                                                    weights[ii] = 0.0
-                                    # attach as tensor to critic_view
-                                    rm = critic_view.batch["response_mask"]
-                                    w_tensor = torch.tensor(weights, dtype=rm.dtype, device=rm.device)
+                                    w_tensor = compute_group_loss_weights(
+                                        uids=uids,
+                                        acc_arr=acc_arr,
+                                        response_mask=critic_view.batch["response_mask"],
+                                        token_mean=bool(token_mean),
+                                        skip_zero=bool(apply_skip_zero),
+                                    )
                                     critic_view.batch["critic_loss_weight"] = w_tensor
                             except Exception as _e:
                                 print(f"critic_in_group_normalization skipped due to error: {_e}")
+
+                            # Optional: rmAUC per-token weighting for critic value loss
+                            rmauc_cfg = self.config.algorithm.get("critic_rmauc", {})
+                            if rmauc_cfg.get("enable", False):
+                                resp_mask = critic_view.batch["response_mask"]  # (B, T)
+                                # Weight for token t = number of valid tokens strictly after t
+                                rmauc_w = torch.flip(resp_mask.to(torch.float32), dims=[-1]).cumsum(dim=-1)
+
+                                if rmauc_cfg.get("length_norm", False):
+                                    # Divide by n*(n-1)/2 per sequence to avoid scale-up with rmAUC
+                                    n = resp_mask.sum(dim=-1).to(torch.float32)
+                                    denom = (n - 1.0) / 2.0 # previously sum was to n, then to n*(n-1)/2, so divide by this to bring it back to n
+                                    denom = torch.where(denom > 0, denom, torch.ones_like(denom))
+                                    rmauc_w = rmauc_w / denom.unsqueeze(-1)
+
+                                # Combine with any existing critic loss weights (broadcast if needed)
+                                if "critic_loss_weight" in critic_view.batch:
+                                    existing = critic_view.batch["critic_loss_weight"]
+                                    if existing.dim() == 1:
+                                        existing = existing.unsqueeze(-1).expand_as(rmauc_w)
+                                    else:
+                                        assert (
+                                            existing.shape == rmauc_w.shape
+                                        ), f"Existing critic_loss_weight shape {existing.shape} must match rmAUC weights {rmauc_w.shape}"
+                                    rmauc_w = rmauc_w * existing.to(rmauc_w.dtype)
+
+                                critic_view.batch["critic_loss_weight"] = rmauc_w
 
                             critic_output = self.critic_wg.update_critic(critic_view)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
@@ -1664,6 +1658,22 @@ class RayPPOTrainer(OneLoggerInstrumented):
                     # implement critic warmup; do not update actor in critic-only mode
                     if (not self.critic_only) and self.config.trainer.critic_warmup <= self.global_steps:
                         with marked_timer("update_actor", timing_raw, color="red"):
+                            # Optional: in-group normalization for actor loss between acc==0 and acc==1
+                            try:
+                                actor_cfg = self.config.algorithm.get("actor_group_normalization", {})
+                                if actor_cfg.get("enable", False):
+                                    assert "uid" in batch.non_tensor_batch, "uid field required for actor group normalization"
+                                    assert "acc" in batch.non_tensor_batch, "acc field required for actor group normalization"
+                                    w_tensor = compute_group_loss_weights(
+                                        uids=batch.non_tensor_batch["uid"],
+                                        acc_arr=batch.non_tensor_batch["acc"],
+                                        response_mask=batch.batch["response_mask"],
+                                        token_mean=bool(actor_cfg.get("token_mean", False)),
+                                        skip_zero=bool(actor_cfg.get("skip_zero", False)),
+                                    )
+                                    batch.batch["actor_loss_weight"] = w_tensor
+                            except Exception as _e:
+                                print(f"actor_group_normalization skipped due to error: {_e}")
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
