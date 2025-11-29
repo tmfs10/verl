@@ -66,7 +66,7 @@ from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
-from verl.utils.torch_functional import masked_mean
+from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.trainer.ppo.one_logger_integration import OneLoggerInstrumented
 from verl.utils.model import compute_position_id_with_mask
@@ -239,6 +239,8 @@ def compute_advantage(
             response_mask=data.batch["response_mask"],
             gamma=gamma,
             lam=lam_input,
+            index=data.non_tensor_batch.get("uid", None),
+            config=config,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -1579,6 +1581,124 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        # Convex-average GAE with final reward using cumulative mean negative log-prob (optional)
+                        convex_cfg = self.config.algorithm.get("convex_average_with_final_reward", {})
+                        if (
+                            convex_cfg.get("enable", False)
+                            and not self.critic_only
+                            and self.config.algorithm.adv_estimator == AdvantageEstimator.GAE
+                            and ("advantages" in batch.batch)
+                            and ("old_log_probs" in batch.batch)
+                        ):
+                            # p_gt: cumulative mean negative log-prob per token
+                            old_lp = -batch.batch["old_log_probs"].to(torch.float32)
+                            resp_mask = batch.batch["response_mask"].to(dtype=old_lp.dtype)
+                            cum_sum = torch.cumsum(old_lp * resp_mask, dim=-1)
+                            cum_cnt = torch.cumsum(resp_mask, dim=-1)
+                            eps = 1e-6
+                            p_gt = torch.where(cum_cnt > 0, cum_sum / cum_cnt.clamp_min(eps), torch.zeros_like(old_lp))
+
+                            # M: mean over all such cumulative means in the batch (valid tokens only)
+                            M = masked_mean(p_gt, mask=resp_mask)
+
+                            # convex_coeff_gt = min(0.5 * M / p_gt, 1)
+                            convex_coeff = (0.5 * M) / p_gt.clamp_min(eps)
+                            convex_coeff = torch.minimum(convex_coeff, torch.ones_like(convex_coeff))
+
+                            # final reward for generation g: sum of token-level rewards over response tokens (broadcast to tokens)
+                            tok_rewards = batch.batch["token_level_rewards"].to(dtype=old_lp.dtype)
+                            final_reward_g = masked_sum(tok_rewards, mask=resp_mask, axis=-1).unsqueeze(-1)
+
+                            gae = batch.batch["advantages"].to(dtype=old_lp.dtype)
+                            mixed_adv = convex_coeff * gae + (1.0 - convex_coeff) * final_reward_g
+                            # Only replace within response mask to avoid touching non-response tokens
+                            batch.batch["advantages"] = torch.where(resp_mask > 0, mixed_adv, gae)
+
+                        # Critic-prediction-based weighting between GAE and GRPO advantages (optional)
+                        cpw_cfg = self.config.algorithm.get("critic_pred_weighting", {})
+                        if (
+                            self.use_critic
+                            and cpw_cfg.get("enable", False)
+                            and not self.critic_only
+                            and ("values" in batch.batch)
+                        ):
+                            # Prepare masks and types
+                            values = batch.batch["values"].to(torch.float32)
+                            resp_mask = batch.batch["response_mask"].to(dtype=values.dtype)
+                            eps = 1e-6
+
+                            if cpw_cfg.get("cummean", True):
+                                # Compute cumulative mean of critic predictions per token: V
+                                cum_sum_v = torch.cumsum(values * resp_mask, dim=-1)
+                                cum_cnt_v = torch.cumsum(resp_mask, dim=-1)
+                                V = torch.where(
+                                    cum_cnt_v > 0, cum_sum_v / cum_cnt_v.clamp_min(eps), torch.zeros_like(values)
+                                )
+                            else:
+                                V = values.mean(dim=-1, keepdim=True)
+                                V = V.expand_as(values)
+
+                            # Compute GRPO advantages separately
+                            grpo_adv, _ = core_algos.compute_grpo_outcome_advantage(
+                                token_level_rewards=batch.batch["token_level_rewards"],
+                                response_mask=batch.batch["response_mask"],
+                                index=batch.non_tensor_batch["uid"],
+                                norm_adv_by_std_in_grpo=self.config.algorithm.get(
+                                    "norm_adv_by_std_in_grpo", True
+                                ),
+                            )
+
+                            # Compute GAE advantages separately to avoid interference from other transforms
+                            # Handle length-adaptive GAE if enabled
+                            lam_input = self.config.algorithm.lam
+                            try:
+                                if (
+                                    hasattr(self.config.algorithm, "length_adaptive_gae")
+                                    and self.config.algorithm.length_adaptive_gae.get("enable", False)
+                                ):
+                                    alpha = float(self.config.algorithm.length_adaptive_gae.get("alpha", 1.0))
+                                    resp_len = resp_mask.sum(dim=-1).to(dtype=torch.float32)
+                                    lam_input = 1.0 - 1.0 / (alpha * resp_len)
+                            except Exception:
+                                lam_input = self.config.algorithm.lam
+
+                            gae_adv, _ = core_algos.compute_gae_advantage_return(
+                                token_level_rewards=batch.batch["token_level_rewards"],
+                                values=values,
+                                response_mask=batch.batch["response_mask"],
+                                gamma=self.config.algorithm.gamma,
+                                lam=lam_input,
+                                index=batch.non_tensor_batch.get("uid", None),
+                                config=self.config.algorithm,
+                            )
+
+                            # Fetch A (sequence-level accuracy) as a tensor
+                            A_tensor = None
+                            if "acc" in batch.non_tensor_batch:
+                                try:
+                                    import numpy as _np
+
+                                    acc_np = _np.asarray(batch.non_tensor_batch["acc"])  # shape (B,)
+                                    A_tensor = torch.tensor(acc_np, dtype=values.dtype, device=values.device)
+                                except Exception:
+                                    pass
+                            if A_tensor is None and "acc" in batch.batch:
+                                try:
+                                    A_tensor = batch.batch["acc"].to(dtype=values.dtype, device=values.device).view(-1)
+                                except Exception:
+                                    A_tensor = None
+
+                            if A_tensor is not None:
+                                A_expand = A_tensor.unsqueeze(-1).expand_as(V)
+                                V = torch.clip(V, min=0.0, max=1.0)
+                                w = torch.abs(V - A_expand)
+                                w = w * resp_mask  # ensure non-response tokens stay zero
+                                final_adv = (1.0 - w) * gae_adv.to(values.dtype) + w * grpo_adv.to(values.dtype)
+                                # Keep only response tokens mixed; preserve others
+                                batch.batch["advantages"] = torch.where(resp_mask > 0, final_adv, gae_adv)
+                            else:
+                                # If accuracy is unavailable, skip mixing silently
+                                pass
                         if self.critic_only and "advantages" in batch.batch:
                             # reduce overhead/metrics footprint in critic-only mode
                             batch.batch.pop("advantages", None)
@@ -1664,8 +1784,6 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             except Exception as _e:
                                 print(f"critic_in_group_normalization skipped due to error: {_e}")
 
-                            # rmAUC weighting of loss is intentionally disabled; rmAUC is only used for metrics.
-
                             # If prob reweighting is enabled, multiply it with existing critic_loss_weight now
                             if prob_cfg.get("enable", False):
                                 resp_mask = critic_view.batch["response_mask"].to(torch.float32)
@@ -1696,21 +1814,37 @@ class RayPPOTrainer(OneLoggerInstrumented):
                     if (not self.critic_only) and self.config.trainer.critic_warmup <= self.global_steps:
                         with marked_timer("update_actor", timing_raw, color="red"):
                             # Optional: in-group normalization for actor loss between acc==0 and acc==1
-                            try:
-                                actor_cfg = self.config.algorithm.get("actor_group_normalization", {})
-                                if actor_cfg.get("enable", False):
-                                    assert "uid" in batch.non_tensor_batch, "uid field required for actor group normalization"
-                                    assert "acc" in batch.non_tensor_batch, "acc field required for actor group normalization"
-                                    w_tensor = compute_group_loss_weights(
-                                        uids=batch.non_tensor_batch["uid"],
-                                        acc_arr=batch.non_tensor_batch["acc"],
-                                        response_mask=batch.batch["response_mask"],
-                                        token_mean=bool(actor_cfg.get("token_mean", False)),
-                                        skip_zero=bool(actor_cfg.get("skip_zero", False)),
-                                    )
-                                    batch.batch["actor_loss_weight"] = w_tensor
-                            except Exception as _e:
-                                print(f"actor_group_normalization skipped due to error: {_e}")
+                            actor_cfg = self.config.algorithm.get("actor_group_normalization", {})
+                            if actor_cfg.get("enable", False):
+                                assert "uid" in batch.non_tensor_batch, "uid field required for actor group normalization"
+                                assert "acc" in batch.non_tensor_batch, "acc field required for actor group normalization"
+                                w_tensor = compute_group_loss_weights(
+                                    uids=batch.non_tensor_batch["uid"],
+                                    acc_arr=batch.non_tensor_batch["acc"],
+                                    response_mask=batch.batch["response_mask"],
+                                    token_mean=bool(actor_cfg.get("token_mean", False)),
+                                    skip_zero=bool(actor_cfg.get("skip_zero", False)),
+                                )
+                                batch.batch["actor_loss_weight"] = w_tensor
+
+                            # Optional: SFT CE loss only for correct generations (acc==1)
+                            sft_cfg = self.config.algorithm.get("sft_objective", {})
+                            if sft_cfg.get("enable", False):
+                                acc_arr = None
+                                if "acc" in batch.non_tensor_batch:
+                                    acc_arr = batch.non_tensor_batch["acc"]
+                                elif "acc" in batch.batch:
+                                    try:
+                                        acc_arr = batch.batch["acc"].detach().cpu().numpy()
+                                    except Exception:
+                                        acc_arr = None
+                                if acc_arr is not None:
+                                    import numpy as _np
+
+                                    acc_np = _np.asarray(acc_arr)
+                                    sft_sample_mask = torch.tensor(acc_np == 1, dtype=torch.bool)
+                                    batch.batch["sft_sample_mask"] = sft_sample_mask
+
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])

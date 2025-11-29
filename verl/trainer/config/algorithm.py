@@ -85,3 +85,12 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    # Optional: convexly average token-level advantages with final generation reward
+    # Usage: algorithm.convex_average_with_final_reward.enable: true
+    convex_average_with_final_reward: dict[str, Any] = field(default_factory=dict)
+    # Optional: normalize GAE advantages per-prompt (group) instead of across batch
+    # Usage: algorithm.advantage_group_normalization.enable: true
+    advantage_group_normalization: dict[str, Any] = field(default_factory=dict)
+    # Optional: add SFT objective (cross-entropy on responses) for correct generations only (acc==1)
+    # Usage: algorithm.sft_objective.enable: true
+    sft_objective: dict[str, Any] = field(default_factory=dict)

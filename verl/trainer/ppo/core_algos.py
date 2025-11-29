@@ -216,6 +216,8 @@ def compute_gae_advantage_return(
     response_mask: torch.Tensor,
     gamma: torch.Tensor,
     lam: torch.Tensor,
+    index=None,
+    config: Optional[AlgoConfig] = None,
 ):
     """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py
 
@@ -256,7 +258,39 @@ def compute_gae_advantage_return(
         advantages = torch.stack(advantages_reversed[::-1], dim=1)
 
         returns = advantages + values
-        advantages = verl_F.masked_whiten(advantages, response_mask)
+
+        # Normalize advantages
+        do_group_norm = False
+        if config is not None:
+            try:
+                do_group_norm = bool(
+                    getattr(config, "advantage_group_normalization", {}).get("enable", False)
+                )
+            except Exception:
+                do_group_norm = False
+
+        if do_group_norm and index is not None:
+            # Per-prompt normalization: whiten advantages per group (uid), only over response tokens.
+            # Flatten and select valid positions
+            B, T = advantages.shape
+            g = as_torch_index(index, device=advantages.device)
+            g_expand = g.view(B, 1).expand(B, T)
+            adv_flat = advantages.reshape(-1)
+            mask_flat = response_mask.reshape(-1).to(dtype=torch.bool)
+            g_flat = g_expand.reshape(-1)
+
+            adv_valid = adv_flat[mask_flat]
+            g_valid = g_flat[mask_flat]
+
+            mean_g, std_g, _ = group_mean_std(adv_valid, g_valid, eps=1e-6, device=advantages.device)
+            adv_valid_norm = (adv_valid - mean_g[g_valid]) / (std_g[g_valid] + 1e-6)
+
+            adv_out = advantages.reshape(-1)
+            adv_out[mask_flat] = adv_valid_norm
+            advantages = adv_out.view(B, T)
+        else:
+            # Default: across-batch normalization with masking
+            advantages = verl_F.masked_whiten(advantages, response_mask)
     return advantages, returns
 
 

@@ -371,6 +371,9 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        # Optional SFT mask for adding CE only on correct generations
+        if "sft_sample_mask" in data.batch.keys():
+            select_keys.append("sft_sample_mask")
         # Optional per-sequence actor weighting
         if "actor_loss_weight" in data.batch.keys():
             select_keys.append("actor_loss_weight")
@@ -488,6 +491,17 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+
+                    # Optional SFT objective (CE on responses) for correct generations only
+                    if "sft_sample_mask" in model_inputs:
+                        sft_mask_seq = model_inputs["sft_sample_mask"].to(dtype=torch.bool, device=log_prob.device)
+                        sft_token_mask = response_mask & sft_mask_seq.unsqueeze(-1)
+                        ce_mat = log_prob
+                        if actor_w is not None:
+                            ce_mat = ce_mat * actor_w.to(ce_mat.dtype).unsqueeze(-1)
+                        sft_ce_loss = -agg_loss(loss_mat=ce_mat, loss_mask=sft_token_mask, loss_agg_mode=loss_agg_mode)
+                        policy_loss = policy_loss + sft_ce_loss
+                        micro_batch_metrics["actor/sft_ce_loss"] = sft_ce_loss.detach().item() * loss_scale_factor
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
