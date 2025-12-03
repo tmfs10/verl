@@ -45,6 +45,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         self.critic_module = critic_module
         self.critic_optimizer = critic_optimizer
         self.use_remove_padding = self.config.model.get("use_remove_padding", False)
+        self.rmauc_state = {"vf_ema": None, "rmauc_ema": None}
         print(f"Critic use_remove_padding={self.use_remove_padding}")
 
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
@@ -212,6 +213,8 @@ class DataParallelPPOCritic(BasePPOCritic):
         # make sure we are in training mode
         self.critic_module.train()
         metrics = {}
+        diff_cfg = data.meta_info.get("critic_diff_penalty", {}) or {}
+        diff_coeff = float(diff_cfg.get("coeff", 0.0) or 0.0)
 
         select_keys = [
             "input_ids",
@@ -222,6 +225,12 @@ class DataParallelPPOCritic(BasePPOCritic):
             "values",
             "returns",
         ]
+        use_rmauc_loss = data.meta_info.get("use_rmauc_loss", False)
+        rmauc_cfg = data.meta_info.get("rmauc_cfg", {}) or {}
+        rmauc_normalize = bool(rmauc_cfg.get("normalize", False))
+        rmauc_beta = float(rmauc_cfg.get("ema_beta", 0.9))
+        if use_rmauc_loss:
+            select_keys.append("acc")
         if "critic_loss_weight" in data.batch.keys():
             select_keys.append("critic_loss_weight")
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
@@ -264,13 +273,41 @@ class DataParallelPPOCritic(BasePPOCritic):
                         loss_agg_mode=self.config.loss_agg_mode,
                         loss_weights=model_inputs.get("critic_loss_weight", None),
                     )
+                    rmauc_loss = None
+                    rmauc_scale = 1.0
+                    if use_rmauc_loss:
+                        acc_tensor = model_inputs.get("acc", None)
+                        assert acc_tensor is not None, "critic_rmauc enabled but 'acc' missing in batch"
+                        acc_tensor = acc_tensor.to(vpreds.device, vpreds.dtype).view(-1)
+                        rmauc_loss = core_algos.compute_rmauc_loss(
+                            values=vpreds, acc=acc_tensor, response_mask=response_mask
+                        )
+                        if rmauc_normalize:
+                            rmauc_loss_norm, self.rmauc_state, rmauc_scale = core_algos.normalize_rmauc_loss(
+                                rmauc_loss=rmauc_loss, vf_loss=vf_loss, state=self.rmauc_state, beta=rmauc_beta
+                            )
+                        else:
+                            rmauc_loss_norm = rmauc_loss
+                            rmauc_scale = 1.0
+                        base_loss = 2.0 - rmauc_loss_norm
+                    else:
+                        base_loss = vf_loss
+
+                    diff_loss, num_pairs = None, 0
+                    if diff_coeff > 0:
+                        diff_loss, num_pairs, _ = core_algos.compute_critic_diff_penalty(
+                            vpreds=vpreds, response_mask=response_mask
+                        )
+                        total_loss = (1.0 - diff_coeff) * base_loss + diff_coeff * diff_loss
+                    else:
+                        total_loss = base_loss
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
-                        loss = vf_loss * loss_scale_factor
+                        loss = total_loss * loss_scale_factor
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
-                        loss = vf_loss * loss_scale_factor
+                        loss = total_loss * loss_scale_factor
 
                     loss.backward()
 
@@ -281,6 +318,23 @@ class DataParallelPPOCritic(BasePPOCritic):
                             "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
                         }
                     )
+                    if use_rmauc_loss:
+                        micro_batch_metrics.update(
+                            {
+                                "critic/rmauc": rmauc_loss.detach().item(),
+                                "critic/rmauc_scale": rmauc_scale,
+                            }
+                        )
+                    elif diff_coeff > 0:
+                        micro_batch_metrics.update(
+                            {
+                                "critic/value_diff_mse": diff_loss.detach().item(),
+                                "critic/value_diff_penalty": (diff_coeff * diff_loss * loss_scale_factor)
+                                .detach()
+                                .item(),
+                                "critic/value_diff_pairs": num_pairs,
+                            }
+                        )
 
                     append_to_dict(metrics, micro_batch_metrics)
 

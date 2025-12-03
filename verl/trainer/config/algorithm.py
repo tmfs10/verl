@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig"]
+__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "CriticDiffPenaltyConfig"]
 
 
 @dataclass
@@ -54,6 +54,13 @@ class FilterGroupsConfig(BaseConfig):
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+
+
+@dataclass
+class CriticDiffPenaltyConfig(BaseConfig):
+    """Configuration for the critic successive-difference penalty."""
+
+    coeff: float = 0.0
 
 
 @dataclass
@@ -94,3 +101,8 @@ class AlgoConfig(BaseConfig):
     # Optional: add SFT objective (cross-entropy on responses) for correct generations only (acc==1)
     # Usage: algorithm.sft_objective.enable: true
     sft_objective: dict[str, Any] = field(default_factory=dict)
+    # Optional: encourage smooth critic predictions by penalizing successive value differences
+    # Usage: algorithm.critic_diff_penalty.coeff: 0.0
+    critic_diff_penalty: CriticDiffPenaltyConfig = field(default_factory=CriticDiffPenaltyConfig)
+    # Optional: use rmauc as critic loss (overrides diff penalty when enabled)
+    critic_rmauc: dict[str, Any] = field(default_factory=dict)

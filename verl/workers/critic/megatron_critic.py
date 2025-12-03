@@ -63,6 +63,7 @@ class MegatronPPOCritic(BasePPOCritic):
         self.critic_module = critic_module
         self.critic_optimizer = critic_optimizer
         self.critic_optimizer_config = critic_optimizer_config
+        self.rmauc_state = {"vf_ema": None, "rmauc_ema": None}
 
         # we create a separate nametuple for optimizer step so that global args won't affect it.
         self.optimizer_step_args = OmegaConf.create(
@@ -151,6 +152,8 @@ class MegatronPPOCritic(BasePPOCritic):
             "values",
             "returns",
         ]
+        if data.meta_info.get("use_rmauc_loss", False):
+            select_keys.append("acc")
         if "critic_loss_weight" in data.batch.keys():
             select_keys.append("critic_loss_weight")
         data = data.select(batch_keys=select_keys)
@@ -217,7 +220,7 @@ class MegatronPPOCritic(BasePPOCritic):
                     f"{microbatch_group_size_per_vp_stage} for megatron backend"
                 )
             else:
-                micro_batches, indices = rearrange_micro_batches(batch=mini_batch.batch, max_token_len=max_token_len)
+            micro_batches, indices = rearrange_micro_batches(batch=mini_batch.batch, max_token_len=max_token_len)
             total_seqlen = max_token_len
         else:
             assert micro_batch_size is not None, (
@@ -227,6 +230,12 @@ class MegatronPPOCritic(BasePPOCritic):
             seq_len = micro_batches[0]["input_ids"].shape[1]
             total_seqlen = micro_batch_size * seq_len
         n_micro_batch = len(micro_batches)
+        diff_cfg = data.meta_info.get("critic_diff_penalty", {}) or {}
+        diff_coeff = float(diff_cfg.get("coeff", 0.0) or 0.0)
+        use_rmauc_loss = data.meta_info.get("use_rmauc_loss", False)
+        rmauc_cfg = data.meta_info.get("rmauc_cfg", {}) or {}
+        rmauc_normalize = bool(rmauc_cfg.get("normalize", False))
+        rmauc_beta = float(rmauc_cfg.get("ema_beta", 0.9))
 
         forward_backward_func = get_forward_backward_func()
 
@@ -241,6 +250,7 @@ class MegatronPPOCritic(BasePPOCritic):
             values = data["values"]
             returns = data["returns"]
             response_length = responses.size(1)
+            acc_tensor = data.get("acc", None)
 
             response_mask = attention_mask[:, -response_length:]
 
@@ -268,14 +278,49 @@ class MegatronPPOCritic(BasePPOCritic):
                 cliprange_value=cliprange_value,
                 loss_agg_mode=self.config.loss_agg_mode,
             )
+            rmauc_loss = None
+            rmauc_scale = 1.0
+            if use_rmauc_loss:
+                assert acc_tensor is not None, "critic_rmauc enabled but 'acc' missing in batch"
+                acc_tensor = acc_tensor.to(vpreds.device, vpreds.dtype).view(-1)
+                rmauc_loss = core_algos.compute_rmauc_loss(values=vpreds, acc=acc_tensor, response_mask=response_mask)
+                if rmauc_normalize:
+                    rmauc_loss_norm, self.rmauc_state, rmauc_scale = core_algos.normalize_rmauc_loss(
+                        rmauc_loss=rmauc_loss, vf_loss=vf_loss, state=self.rmauc_state, beta=rmauc_beta
+                    )
+                else:
+                    rmauc_loss_norm = rmauc_loss
+                    rmauc_scale = 1.0
+                base_loss = 2.0 - rmauc_loss_norm
+            else:
+                base_loss = vf_loss
+
+            diff_loss, num_pairs = None, 0
+            if diff_coeff > 0:
+                diff_loss, num_pairs, _ = core_algos.compute_critic_diff_penalty(
+                    vpreds=vpreds, response_mask=response_mask
+                )
+                total_loss = (1.0 - diff_coeff) * base_loss + diff_coeff * diff_loss
+            else:
+                total_loss = base_loss
 
             stats = {
                 "critic/vf_loss": vf_loss.detach().item(),
                 "critic/vf_clipfrac": vf_clipfrac.detach().item(),
                 "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
             }
+            if use_rmauc_loss:
+                stats.update({"critic/rmauc": rmauc_loss.detach().item(), "critic/rmauc_scale": rmauc_scale})
+            elif diff_coeff > 0:
+                stats.update(
+                    {
+                        "critic/value_diff_mse": diff_loss.detach().item(),
+                        "critic/value_diff_penalty": (diff_coeff * diff_loss).detach().item(),
+                        "critic/value_diff_pairs": num_pairs,
+                    }
+                )
 
-            return vf_loss, stats
+            return total_loss, stats
 
         def forward_step(batch_iter, model):
             batch = next(batch_iter)

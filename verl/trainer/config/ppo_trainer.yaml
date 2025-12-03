@@ -113,6 +113,27 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Coefficient for critic diff penalty on successive value deltas (0 disables it)
+  critic_diff_penalty:
+
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.CriticDiffPenaltyConfig
+
+    # Scale for penalty term added to the critic loss
+    coeff: 0.0
+
+  # Use rmauc-based critic loss; takes precedence over diff penalty when enabled
+  critic_rmauc:
+
+    # Enable rmauc loss
+    enable: False
+
+    # Normalize rmauc loss to VF loss scale using EMA ratio
+    normalize: False
+
+    # EMA decay for normalization
+    ema_beta: 0.9
+
 # config for the trainer
 trainer:
 

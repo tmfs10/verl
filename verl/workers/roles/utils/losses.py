@@ -16,11 +16,21 @@
 import torch
 from tensordict import TensorDict
 
-from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
+from verl.trainer.ppo.core_algos import (
+    agg_loss,
+    compute_critic_diff_penalty,
+    compute_rmauc_loss,
+    compute_value_loss,
+    get_policy_loss_fn,
+    kl_penalty,
+    normalize_rmauc_loss,
+)
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
 from verl.utils.torch_functional import masked_mean
 from verl.workers.config import ActorConfig, CriticConfig
+
+_rmauc_state = {"vf_ema": None, "rmauc_ema": None}
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
@@ -110,6 +120,9 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
     values = data["values"]
     returns = data["returns"]
     response_mask = data["response_mask"].to(bool)
+    penalty_cfg = tu.get_non_tensor_data(data=data, key="critic_diff_penalty", default={})
+    use_rmauc_loss = tu.get_non_tensor_data(data=data, key="use_rmauc_loss", default=False)
+    rmauc_cfg = tu.get_non_tensor_data(data=data, key="rmauc_cfg", default={})
 
     vf_loss, vf_clipfrac = compute_value_loss(
         vpreds=vpreds,
@@ -119,6 +132,31 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
         cliprange_value=config.cliprange_value,
         loss_agg_mode=config.loss_agg_mode,
     )
+    coeff = float(penalty_cfg.get("coeff", 0.0) or 0.0)
+    if use_rmauc_loss:
+        acc = data["acc"]
+        acc = acc.to(vpreds.device, vpreds.dtype).view(-1)
+        rmauc = compute_rmauc_loss(values=vpreds, acc=acc, response_mask=response_mask)
+        if rmauc_cfg.get("normalize", False):
+            global _rmauc_state
+            rmauc_norm, _rmauc_state, rmauc_scale = normalize_rmauc_loss(
+                rmauc_loss=rmauc, vf_loss=vf_loss, state=_rmauc_state, beta=float(rmauc_cfg.get("ema_beta", 0.9))
+            )
+        else:
+            rmauc_norm = rmauc
+            rmauc_scale = 1.0
+        base_loss = 2.0 - rmauc_norm
+    else:
+        rmauc = None
+        rmauc_scale = 1.0
+        base_loss = vf_loss
+
+    diff_loss, num_pairs = None, 0
+    if coeff > 0:
+        diff_loss, num_pairs, _ = compute_critic_diff_penalty(vpreds=vpreds, response_mask=response_mask)
+        total_loss = (1.0 - coeff) * base_loss + coeff * diff_loss
+    else:
+        total_loss = base_loss
 
     metrics = {}
 
@@ -129,5 +167,15 @@ def value_loss(config: CriticConfig, model_output, data: TensorDict, dp_group=No
             "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
         }
     )
+    if use_rmauc_loss and rmauc is not None:
+        metrics.update({"critic/rmauc": rmauc.detach().item(), "critic/rmauc_scale": rmauc_scale})
+    if coeff > 0 and diff_loss is not None:
+        metrics.update(
+            {
+                "critic/value_diff_mse": diff_loss.detach().item(),
+                "critic/value_diff_penalty": (coeff * diff_loss).detach().item(),
+                "critic/value_diff_pairs": num_pairs,
+            }
+        )
 
-    return vf_loss, metrics
+    return total_loss, metrics

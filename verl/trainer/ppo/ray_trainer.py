@@ -349,6 +349,16 @@ class RayPPOTrainer(OneLoggerInstrumented):
         self.use_reference_policy = need_reference_policy(self.role_worker_mapping)
         self.use_rm = need_reward_model(self.role_worker_mapping)
         self.use_critic = need_critic(self.config)
+        self.critic_diff_penalty_cfg = (
+            OmegaConf.to_container(self.config.algorithm.get("critic_diff_penalty", {}), resolve=True) or {}
+        )
+        rmauc_cfg = self.config.algorithm.get("critic_rmauc", {}) or {}
+        self.rmauc_cfg = OmegaConf.to_container(rmauc_cfg, resolve=True) or {}
+        self.rmauc_enable = bool(self.rmauc_cfg.get("enable", False))
+        if self.rmauc_enable:
+            print("RMAUC enabled")
+        if float(self.critic_diff_penalty_cfg.get("coeff", 0.0) or 0.0) > 0:
+            print("DIFF_PENALTY enabled")
         self.ray_worker_group_cls = ray_worker_group_cls
         self.device_name = device_name if device_name else self.config.trainer.device
         self.validation_generations_logger = ValidationGenerationsLogger(
@@ -1706,6 +1716,19 @@ class RayPPOTrainer(OneLoggerInstrumented):
                     # update critic (use the same critic-only view)
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
+                            batch.meta_info["critic_diff_penalty"] = self.critic_diff_penalty_cfg
+                            batch.meta_info["use_rmauc_loss"] = self.rmauc_enable
+                            batch.meta_info["rmauc_cfg"] = self.rmauc_cfg
+                            if self.rmauc_enable:
+                                acc_tensor = None
+                                if "acc" in batch.batch:
+                                    acc_tensor = batch.batch["acc"]
+                                elif "acc" in batch.non_tensor_batch:
+                                    acc_np = np.asarray(batch.non_tensor_batch["acc"])
+                                    acc_tensor = torch.tensor(acc_np, dtype=torch.float32)
+                                if acc_tensor is None:
+                                    raise ValueError("critic_rmauc enabled but 'acc' not found in batch")
+                                batch.batch["acc"] = acc_tensor
                             critic_view = self._maybe_build_critic_batch_with_solution(batch)
                             # ensure values/returns exist in critic_view
                             for key in ("values", "returns"):

@@ -460,6 +460,13 @@ algorithm:
   pf_ppo:
     reweight_method: pow
     weight_pow: 2.0
+  critic_diff_penalty:
+    _target_: verl.trainer.config.CriticDiffPenaltyConfig
+    coeff: 0.0
+  critic_rmauc:
+    enable: false
+    normalize: false
+    ema_beta: 0.9
 trainer:
   balance_batch: true
   total_epochs: 30

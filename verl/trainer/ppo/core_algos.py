@@ -1559,6 +1559,111 @@ def compute_value_loss(
     return vf_loss, vf_clipfrac
 
 
+def compute_critic_diff_penalty(
+    vpreds: torch.Tensor, response_mask: torch.Tensor
+) -> tuple[torch.Tensor, int, torch.Tensor]:
+    """
+    Compute mean squared successive differences across all valid pairs in the batch.
+
+    Args:
+        vpreds: Predicted values, shape (batch, response_length).
+        response_mask: Mask over response tokens, same shape as vpreds.
+
+    Returns:
+        diff_loss: Mean squared diff across all valid successive pairs (zero if no valid pairs).
+        num_pairs: Total valid successive token pairs.
+        per_seq_mean: Per-sequence mean squared diffs (useful for debugging/metrics).
+    """
+    if response_mask is not None and response_mask.shape != vpreds.shape:
+        raise ValueError(f"response_mask shape {response_mask.shape} must match vpreds {vpreds.shape}")
+
+    mask = torch.ones_like(vpreds, dtype=torch.bool) if response_mask is None else response_mask.to(torch.bool)
+    if vpreds.size(-1) < 2:
+        zero = vpreds.new_zeros(())
+        return zero, 0, vpreds.new_zeros(vpreds.size(0))
+
+    value_diffs = vpreds[:, 1:] - vpreds[:, :-1]
+    valid_pairs = mask[:, 1:] & mask[:, :-1]
+    sq = value_diffs.pow(2)
+
+    sum_per_seq = (sq * valid_pairs).sum(dim=-1)
+    count_per_seq = valid_pairs.sum(dim=-1)
+
+    per_seq_mean = torch.where(
+        count_per_seq > 0, sum_per_seq / count_per_seq.clamp_min(1e-8), torch.zeros_like(sum_per_seq)
+    )
+
+    num_pairs_tensor = valid_pairs.sum()
+    num_pairs = int(num_pairs_tensor.item())
+    if num_pairs == 0:
+        zero = vpreds.new_zeros(())
+        return zero, 0, per_seq_mean
+
+    diff_loss = (sq * valid_pairs).sum() / num_pairs_tensor.clamp_min(1e-8)
+    return diff_loss, num_pairs, per_seq_mean
+
+
+def compute_rmauc_loss(values: torch.Tensor, acc: torch.Tensor, response_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Differentiable RMAUC computation.
+
+    Args:
+        values: (B, R) predicted values.
+        acc: (B,) accuracy targets.
+        response_mask: (B, R) boolean/float mask for response tokens.
+
+    Returns:
+        Scalar tensor: mean RMAUC across valid samples (0 if no valid samples).
+    """
+    mask = response_mask.to(dtype=values.dtype)
+    acc_expanded = acc.to(values.device, values.dtype).unsqueeze(1).expand_as(values)
+    err = (values - acc_expanded) ** 2
+    s = (1.0 - err) * mask
+
+    cumsum_s = torch.cumsum(s, dim=-1)
+    cumsum_cnt = torch.cumsum(mask, dim=-1).clamp_min(1e-8)
+    m_t = torch.where(mask > 0, cumsum_s / cumsum_cnt, torch.zeros_like(s))
+
+    lengths = mask.sum(dim=-1)
+    rmauc_seq = torch.where(
+        lengths > 0, (2.0 / (lengths + 1.0)) * (m_t * mask).sum(dim=-1), torch.zeros_like(lengths)
+    )
+    valid = lengths > 0
+    if valid.any():
+        return rmauc_seq[valid].mean()
+    return values.new_tensor(0.0)
+
+
+def normalize_rmauc_loss(rmauc_loss: torch.Tensor, vf_loss: torch.Tensor, state: dict, beta: float = 0.9) -> tuple[torch.Tensor, dict, float]:
+    """
+    Normalize rmauc loss to the scale of vf_loss using EMA ratio.
+    Args:
+        rmauc_loss: Scalar rmauc loss tensor.
+        vf_loss: Scalar vf loss tensor.
+        state: Dict holding running averages.
+        beta: EMA decay.
+    Returns:
+        normalized_loss, updated_state, scale
+    """
+    eps = 1e-8
+    vf_val = vf_loss.detach()
+    rmauc_val = rmauc_loss.detach()
+    vf_ema = state.get("vf_ema", None)
+    rmauc_ema = state.get("rmauc_ema", None)
+    if vf_ema is None:
+        vf_ema = vf_val
+    else:
+        vf_ema = beta * vf_ema + (1 - beta) * vf_val
+    if rmauc_ema is None:
+        rmauc_ema = rmauc_val
+    else:
+        rmauc_ema = beta * rmauc_ema + (1 - beta) * rmauc_val
+    state["vf_ema"] = vf_ema
+    state["rmauc_ema"] = rmauc_ema
+    scale = (vf_ema + eps) / (rmauc_ema + eps)
+    return rmauc_loss * scale, state, scale.item()
+
+
 def kl_penalty(logprob: torch.FloatTensor, ref_logprob: torch.FloatTensor, kl_penalty) -> torch.FloatTensor:
     """Compute KL divergence given logprob and ref_logprob. Optionally using straight through to bind k2 on other
     kl penalty compute method for unbiased KL gradient estimation.

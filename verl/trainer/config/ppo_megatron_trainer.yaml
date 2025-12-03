@@ -72,6 +72,15 @@ algorithm:
   pf_ppo:
     reweight_method: pow # ["pow", "max_min", "max_random"]
     weight_pow: 2.0
+  critic_diff_penalty:
+    # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+    _target_: verl.trainer.config.CriticDiffPenaltyConfig
+    coeff: 0.0
+
+  critic_rmauc:
+    enable: False
+    normalize: False
+    ema_beta: 0.9
 
 trainer:
   balance_batch: True

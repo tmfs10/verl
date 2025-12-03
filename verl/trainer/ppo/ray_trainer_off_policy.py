@@ -367,6 +367,19 @@ class RayTrainerOffPolicy(RayTrainer):
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
+                            batch.meta_info["critic_diff_penalty"] = self.critic_diff_penalty_cfg
+                            batch.meta_info["use_rmauc_loss"] = self.rmauc_enable
+                            batch.meta_info["rmauc_cfg"] = self.rmauc_cfg
+                            if self.rmauc_enable:
+                                acc_tensor = None
+                                if "acc" in batch.batch:
+                                    acc_tensor = batch.batch["acc"]
+                                elif "acc" in batch.non_tensor_batch:
+                                    acc_np = np.asarray(batch.non_tensor_batch["acc"])
+                                    acc_tensor = torch.tensor(acc_np, dtype=torch.float32)
+                                if acc_tensor is None:
+                                    raise ValueError("critic_rmauc enabled but 'acc' not found in batch")
+                                batch.batch["acc"] = acc_tensor
                             critic_output = self.critic_wg.update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
