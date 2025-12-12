@@ -26,9 +26,10 @@ class MaskedSolutionChatDataset(Dataset):
 
     Config keys:
     - prompt_key: field name containing chat messages (default: "prompt").
-    - solution_key: field name containing the solution string (default: "solution").
-    - mask_fraction: fraction in [0,1] of lines to mask (default: 0.3).
-    - mask_seed: optional seed to make masking deterministic per item.
+    - solution_key / solution_field_name: field name containing the ground-truth solution string (default: "solution").
+    - line_mask_field_name: field name to emit the per-line mask (default: "solution_line_mask").
+    - min_masked_fraction / max_masked_fraction: range of line-mask fractions (default: both 0.3).
+    - mask_seed: optional seed to make masking deterministic per item (still randomized within the range).
     - max_prompt_length: token budget after chat template (default: 1024).
     - truncation: one of {"error","left","right","middle"} (default: "error").
     - filter_overlong_prompts: whether to pre-filter by length (default: True).
@@ -54,13 +55,19 @@ class MaskedSolutionChatDataset(Dataset):
 
         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
         self.prompt_key = config.get("prompt_key", "prompt")
-        self.solution_key = config.get("solution_key", "solution")
+        # Allow solution_field_name alias for clarity with reward manager
+        self.solution_key = config.get("solution_key", config.get("solution_field_name", "solution"))
+        self.line_mask_field_name = config.get("line_mask_field_name", "solution_line_mask")
         self.max_prompt_length = config.get("max_prompt_length", 1024)
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
 
-        self.mask_fraction = float(config.get("mask_fraction", 0.3))
+        # Allow legacy mask_fraction for back-compat; otherwise use min/max range.
+        default_mask = float(config.get("mask_fraction", 0.3))
+        self.min_masked_fraction = float(config.get("min_masked_fraction", default_mask))
+        self.max_masked_fraction = float(config.get("max_masked_fraction", self.min_masked_fraction))
+        print('DDD', self.min_masked_fraction, self.max_masked_fraction)
         self.mask_seed = config.get("mask_seed", None)
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
@@ -137,11 +144,7 @@ class MaskedSolutionChatDataset(Dataset):
     def _mask_solution(self, solution: str, item_idx: Optional[int] = None) -> tuple[str, list[int]]:
         # Split with explicit "\n" to match reconstruction
         lines = solution.split("\n")
-        if self.mask_fraction <= 0:
-            return solution, [0] * len(lines)
-        if self.mask_fraction >= 1:
-            return "\n".join("# <masked out>" for _ in lines), [1] * len(lines)
-
+        # Choose a per-sample fraction in [min,max]
         rng = random.Random()
         if self.mask_seed is not None:
             try:
@@ -152,10 +155,17 @@ class MaskedSolutionChatDataset(Dataset):
                 base = (base + int(item_idx)) & 0xFFFFFFFF
             rng.seed(base)
 
+        frac = rng.uniform(self.min_masked_fraction, self.max_masked_fraction)
+
+        if frac <= 0:
+            return solution, [0] * len(lines)
+        if frac >= 1:
+            return "\n".join("# <masked out>" for _ in lines), [1] * len(lines)
+
         masked_lines: list[str] = []
         mask_line_flags: list[int] = []
         for line in lines:
-            if rng.random() < self.mask_fraction:
+            if rng.random() < frac:
                 masked_lines.append("# <masked out>")
                 mask_line_flags.append(1)
             else:
@@ -238,6 +248,6 @@ class MaskedSolutionChatDataset(Dataset):
         # Expose solution and masking metadata to downstream reward computation
         out[self.solution_key] = solution_text
         out["masked_solution"] = masked_solution
-        out["solution_line_mask"] = mask_lines  # list[int] aligned to solution.split("\n")
+        out[self.line_mask_field_name] = mask_lines  # list[int] aligned to solution.split("\n")
 
         return out

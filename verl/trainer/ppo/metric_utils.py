@@ -16,6 +16,7 @@ Metrics related to the PPO trainer.
 """
 
 from collections import defaultdict
+import numbers
 from functools import partial
 from typing import Any, Callable
 
@@ -464,15 +465,32 @@ def process_validation_metrics(
     for data_source, uid2var2vals in data_src2uid2var2vals.items():
         for uid, var2vals in uid2var2vals.items():
             for var_name, var_vals in var2vals.items():
-                if isinstance(var_vals[0], str):
+                # Filter to numeric entries; drop None/strings before aggregation
+                vals_obj = list(np.asarray(var_vals, dtype=object))
+                numeric_idxs = []
+                numeric_vals = []
+                for idx, val in enumerate(vals_obj):
+                    if val is None or isinstance(val, (str, np.str_, bytes, np.bytes_)):
+                        continue
+                    if isinstance(val, (numbers.Number, np.generic, bool)):
+                        numeric_idxs.append(idx)
+                        numeric_vals.append(val)
+                        continue
+                    try:
+                        numeric_idxs.append(idx)
+                        numeric_vals.append(float(val))
+                    except Exception:
+                        continue
+
+                if not numeric_vals:
                     continue
 
                 metric = {}
-                n_resps = len(var_vals)
-                metric[f"mean@{n_resps}"] = np.mean(var_vals)
+                n_resps = len(numeric_vals)
+                metric[f"mean@{n_resps}"] = np.mean(numeric_vals)
 
                 if n_resps > 1:
-                    metric[f"std@{n_resps}"] = np.std(var_vals)
+                    metric[f"std@{n_resps}"] = np.std(numeric_vals)
 
                     ns = []
                     n = 2
@@ -483,21 +501,29 @@ def process_validation_metrics(
 
                     for n in ns:
                         [(bon_mean, bon_std), (won_mean, won_std)] = bootstrap_metric(
-                            data=var_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
+                            data=numeric_vals, subset_size=n, reduce_fns=[np.max, np.min], seed=seed
                         )
                         metric[f"best@{n}/mean"], metric[f"best@{n}/std"] = bon_mean, bon_std
                         metric[f"worst@{n}/mean"], metric[f"worst@{n}/std"] = won_mean, won_std
-                        if var2vals.get("pred", None) is not None:
-                            vote_data = [
-                                {"val": val, "pred": pred} for val, pred in zip(var_vals, var2vals["pred"], strict=True)
-                            ]
-                            [(maj_n_mean, maj_n_std)] = bootstrap_metric(
-                                data=vote_data,
-                                subset_size=n,
-                                reduce_fns=[partial(calc_maj_val, vote_key="pred", val_key="val")],
-                                seed=seed,
-                            )
-                            metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = maj_n_mean, maj_n_std
+                        preds = var2vals.get("pred", None)
+                        if preds is not None:
+                            try:
+                                preds_filtered = [preds[i] for i in numeric_idxs]
+                            except Exception:
+                                preds_filtered = None
+
+                            if preds_filtered is not None and len(preds_filtered) == len(numeric_vals):
+                                vote_data = [
+                                    {"val": val, "pred": pred}
+                                    for val, pred in zip(numeric_vals, preds_filtered, strict=True)
+                                ]
+                                [(maj_n_mean, maj_n_std)] = bootstrap_metric(
+                                    data=vote_data,
+                                    subset_size=n,
+                                    reduce_fns=[partial(calc_maj_val, vote_key="pred", val_key="val")],
+                                    seed=seed,
+                                )
+                                metric[f"maj@{n}/mean"], metric[f"maj@{n}/std"] = maj_n_mean, maj_n_std
 
                 data_src2uid2var2metric[data_source][uid][var_name] = metric
 

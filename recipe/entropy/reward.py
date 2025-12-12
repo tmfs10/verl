@@ -66,13 +66,30 @@ def load_reward_manager(config, tokenizer, num_examine, **reward_kwargs):
         else:
             final_compute_score = _default_compute_score
 
+    reward_kwargs_by_manager = dict(reward_kwargs)
+    if reward_manager_name == "conditional_masked_hybrid":
+        logprob_kwargs = reward_kwargs_by_manager.pop("logprob", {})
+        reward_kwargs_by_manager = {**reward_kwargs_by_manager, **logprob_kwargs}
+        if "solution_field_name" not in reward_kwargs_by_manager:
+            try:
+                solution_field_from_data = config.data.get("solution_field_name", None)
+            except Exception:
+                solution_field_from_data = None
+            if solution_field_from_data is None:
+                try:
+                    solution_field_from_data = config.data.get("solution_key", None)
+                except Exception:
+                    solution_field_from_data = None
+            if solution_field_from_data is not None:
+                reward_kwargs_by_manager["solution_field_name"] = solution_field_from_data
+
     # Instantiate and return the reward manager with the specified parameters
     return reward_manager_cls(
         tokenizer=tokenizer,
         num_examine=num_examine,
         compute_score=final_compute_score,
         reward_fn_key=config.data.reward_fn_key,
-        **reward_kwargs,
+        **reward_kwargs_by_manager,
     )
 
 

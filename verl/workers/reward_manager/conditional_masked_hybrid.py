@@ -4,7 +4,7 @@ Hybrid conditional reward manager with masked-solution log-prob and optional bat
 Computes:
 - mean log P(masked-out tokens in solution | prompt, process_response_for_logprob(prompt, generated_response))
 - optionally also computes external scores via `compute_score` (same interface as batch.py)
-- combines the two via a user-provided `combine_results` to produce final per-sample scores
+- combines the two via a user-provided `combine_with_vr` to produce final per-sample scores
 
 Emits a reward tensor aligned to the generated responses: the scalar final score is placed
 on the last valid generated token, matching the expected training shape.
@@ -32,13 +32,13 @@ ResultCombiner = Callable[[list[dict | float], list[float]], list[dict]]
 @register("conditional_masked_hybrid")
 class ConditionalMaskedHybridRewardManager(AbstractRewardManager):
     """
-    Reward = combine_results(batch_scores, mean_logP_masked(solution | prompt, processed_response)).
+    Reward = batch_scores + mean_logP_masked(solution | prompt, processed_response).
 
     - `process_response_for_logprob`: function(prompt_str, generated_response_str) -> new_generated_response_str
     - Masked tokens are identified from dataset metadata: per-line mask for the solution;
       we expand it to token-level by tokenizing each line (with newlines preserved).
     - `compute_score`: optional external scoring function (same signature as in BatchRewardManager).
-    - `combine_results`: function(list_of_batch_scores, list_of_masked_logP_mean) -> list_of_final_results(dicts).
+    - `combine_with_vr`: bool, whether to combine the batch scores and the masked log-prob means.
       If not provided, defaults to adding the two (final_score = score + masked_mean) and attaching
       `masked_cond_logprob` for traceability.
     """
@@ -50,12 +50,11 @@ class ConditionalMaskedHybridRewardManager(AbstractRewardManager):
         compute_score: RawRewardFn | None = None,
         reward_fn_key: str = "data_source",
         process_response_for_logprob: Optional[Callable[[str, str], str]] = None,
-        combine_results: Optional[ResultCombiner] = None,
+        combine_with_vr: bool = False,
         solution_field_name: str = "solution",
         line_mask_field_name: str = "solution_line_mask",
         reduction: str = "mean",  # only "mean" used for masked tokens aggregation
-        max_gt_len: Optional[int] = None,
-        max_response_len: Optional[int] = None,
+        normalize_logprob: bool = False,
         **reward_kwargs,
     ) -> None:
         self.tokenizer = tokenizer
@@ -63,14 +62,19 @@ class ConditionalMaskedHybridRewardManager(AbstractRewardManager):
         self.compute_score = compute_score
         self.reward_fn_key = reward_fn_key
         self.process_response_for_logprob = process_response_for_logprob
-        self.combine_results = combine_results
+        self.combine_with_vr = combine_with_vr
         self.solution_field_name = solution_field_name
         self.line_mask_field_name = line_mask_field_name
         assert reduction in ("mean",), "Only 'mean' aggregation is supported for masked tokens"
         self.reduction = reduction
-        self.max_gt_len = max_gt_len
-        self.max_response_len = max_response_len
+        self.normalize_logprob = normalize_logprob
         self.reward_kwargs = reward_kwargs
+
+        print(
+            f"Logprob args: "
+            f"normalize_logprob={self.normalize_logprob}, combine_with_vr={self.combine_with_vr}, "
+            f"num_examine={self.num_examine}, solution_key={self.solution_field_name}"
+        )
 
     def _to_py_list(self, arr_like):
         if isinstance(arr_like, (list, tuple)):
@@ -102,49 +106,43 @@ class ConditionalMaskedHybridRewardManager(AbstractRewardManager):
         processed_resp_strs: list[str],
         solution_strs: list[str],
         line_masks: list[list[int]],
+        max_response_len: Optional[int],
     ):
         """Compose new_response = processed_response + "\n" + solution with constraints, then split.
 
         Rules:
         - Ensure processed_response ends with "</think>" (assert).
         - Insert exactly one newline between processed_response and solution.
-        - If total tokens of new_response exceed max_response_len, left-truncate to the last K tokens.
-        - After truncation, insert a leading newline on the left, then re-trim to K if needed.
-        - Split the kept new_response tokens into ctx_ext_tokens (prefix) and kept solution tokens (suffix).
-        - Return per-sample tensors for ctx_ext_ids, gt_ids (kept solution), and masked_token_mask for gt.
+        - If total tokens of new_response exceed max_response_len, mark overflow; caller will skip logprob and assign the lowest score for that prompt group.
+        - Otherwise split the new_response tokens into ctx_ext_tokens (prefix) and kept solution tokens (suffix).
+        - Return per-sample tensors for ctx_ext_ids, gt_ids (kept solution), masked_token_mask for gt, and overflow flags.
         """
         tokenizer = self.tokenizer
         pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
         newline_tokens = tokenizer("\n", return_tensors="pt", add_special_tokens=False)["input_ids"].view(-1)
-        K = self.max_response_len  # may be None
 
         ctx_ext_list: list[torch.Tensor] = []
         gt_ids_list: list[torch.Tensor] = []
         masked_token_mask_list: list[torch.Tensor] = []
+        overflow_list: list[bool] = []
 
         for proc_str, sol_str, lm in zip(processed_resp_strs, solution_strs, line_masks, strict=True):
-            # 1) assert processed_resp endswith </think>
-            assert proc_str.endswith("</think>"), "process_response_for_logprob must end with '</think>'"
+            # 1) if processed_resp does not end with </think>, mark overflow; logprob will be ignored later
+            missing_think = not proc_str.endswith("</think>")
 
             # 2) tokenize parts
             proc_ids = tokenizer(proc_str, return_tensors="pt", add_special_tokens=False)["input_ids"].view(-1)
             sol_ids_full = tokenizer(sol_str, return_tensors="pt", add_special_tokens=False)["input_ids"].view(-1)
 
             # 3) build new_response tokens with exactly one newline between
-            joined = torch.cat([proc_ids, newline_tokens, sol_ids_full], dim=0)
+            new_resp_tokens = torch.cat([proc_ids, newline_tokens, sol_ids_full], dim=0)
 
-            # 4) If truncation needed: reserve space for the inserted-left newline and do NOT retrim afterward.
-            if K is not None and joined.size(0) > K:
-                n = newline_tokens.size(0)
-                # Inserted newline consumes min(n, K) slots; keep the last (K - min(n, K)) tokens from joined
-                insert = newline_tokens if n <= K else newline_tokens[-K:]
-                keep = max(0, K - insert.size(0))
-                tail = joined[-keep:] if keep > 0 else joined[:0]
-                new_resp_tokens = torch.cat([insert, tail], dim=0)
-            else:
-                # No truncation needed; just insert the left newline
-                new_resp_tokens = torch.cat([newline_tokens, joined], dim=0)
+            overflow_flag = missing_think or (max_response_len is not None and new_resp_tokens.size(0) > max_response_len)
+
+            if overflow_flag and max_response_len is not None and new_resp_tokens.size(0) > max_response_len:
+                # Truncate to fit shape; reward will still be sentinel later.
+                new_resp_tokens = new_resp_tokens[-max_response_len:]
 
             # 6) compute how many solution tokens are kept (suffix overlap)
             L_sol = sol_ids_full.size(0)
@@ -157,11 +155,21 @@ class ConditionalMaskedHybridRewardManager(AbstractRewardManager):
             _, sol_token_mask_full = self._tokenize_solution_with_line_mask(sol_str, lm)
             kept_mask = sol_token_mask_full[-kept_sol_len:] if kept_sol_len > 0 else torch.empty((0,), dtype=torch.long)
 
+            # If overflow, ensure tensors are non-empty with zero mask
+            if overflow_flag:
+                if kept_ctx_ext_ids.numel() == 0:
+                    kept_ctx_ext_ids = torch.zeros((1,), dtype=torch.long)
+                if kept_sol_ids.numel() == 0:
+                    kept_sol_ids = torch.zeros((1,), dtype=torch.long)
+                if kept_mask.numel() == 0:
+                    kept_mask = torch.zeros((1,), dtype=torch.long)
+
             ctx_ext_list.append(kept_ctx_ext_ids)
             gt_ids_list.append(kept_sol_ids)
             masked_token_mask_list.append(kept_mask)
+            overflow_list.append(overflow_flag)
 
-        return ctx_ext_list, gt_ids_list, masked_token_mask_list
+        return ctx_ext_list, gt_ids_list, masked_token_mask_list, overflow_list
 
     def _tokenize_solution_with_line_mask(self, solution_text: str, line_mask: list[int]):
         """Tokenize solution with line-level mask expanded to token-level.
@@ -306,6 +314,35 @@ class ConditionalMaskedHybridRewardManager(AbstractRewardManager):
         tokenizer = self.tokenizer
         pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
 
+        # Validation: skip logprob computation, use only external/verification score
+        if data.meta_info.get("validate", False):
+            base_scores = self._compute_batch_scores(data)
+            masked_means = [0.0 for _ in range(len(base_scores))]
+            final_results = base_scores
+
+            reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+            reward_extra_info = defaultdict(list)
+            prompt_len = data.batch["prompts"].shape[-1]
+            valid_response_lengths = data.batch["attention_mask"][:, prompt_len:].sum(dim=-1)
+
+            rewards = []
+            for i in range(len(data)):
+                length = int(valid_response_lengths[i].item())
+                res = final_results[i]
+                if isinstance(res, dict):
+                    reward_val = res.get("score", 0.0)
+                    reward = float(0.0 if reward_val is None else reward_val)
+                    for k, v in res.items():
+                        reward_extra_info[k].append(0.0 if v is None else v)
+                else:
+                    reward = float(0.0 if res is None else res)
+                rewards.append(reward)
+                if length > 0:
+                    reward_tensor[i, length - 1] = reward
+
+            data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=device)
+            return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info} if return_dict else reward_tensor
+
         # 1) Decode strings and optionally process response for conditional log-prob context
         prompt_strs, gen_resp_strs, valid_response_lengths = self._decode_prompts_and_responses(data)
         if self.process_response_for_logprob is not None:
@@ -323,7 +360,7 @@ class ConditionalMaskedHybridRewardManager(AbstractRewardManager):
         line_masks_arr = data.non_tensor_batch.get(self.line_mask_field_name, None)
         if line_masks_arr is None:
             raise KeyError(
-                f"'{self.line_mask_field_name}' not found in non_tensor_batch; ensure dataset provides line masks."
+                f"'{self.line_mask_field_name}' not found in non_tensor_batch; ensure the dataset provides line masks."
             )
         # Each entry should be a list[int]; if it's an array/tuple, coerce to list
         line_masks = []
@@ -339,93 +376,162 @@ class ConditionalMaskedHybridRewardManager(AbstractRewardManager):
                     line_masks.append([0])
 
         # 3) Compose new_response with truncation and split into ctx-ext and kept solution
-        ctx_ext_list, gt_ids_list, masked_token_mask_list = self._compose_new_response_and_split(
+        max_resp_len = data.batch["responses"].shape[-1]
+        ctx_ext_list, gt_ids_list, masked_token_mask_list, overflow_list = self._compose_new_response_and_split(
             processed_resp_strs=proc_resp_strs,
             solution_strs=solutions,
             line_masks=line_masks,
+            max_response_len=max_resp_len,
         )
 
-        # 4) Pad ctx-ext to a common length and combine with prompts
+        data_sources = self._to_py_list(data.non_tensor_batch[self.reward_fn_key])
+        valid_indices = list(range(len(data)))  # include all; overflow handled later
+
+        # 4) Build combined response (ctx-ext + GT) and pad once, bounded by max_response_len
         prompt_ids = data.batch["prompts"]  # [B, P]
         prompt_attn = data.batch["attention_mask"][:, : prompt_ids.shape[-1]]
         pad_id = pad_token_id
-        max_ext_len = max((t.size(0) for t in ctx_ext_list), default=0)
-        ctx_ids_list = []
-        ctx_attn_list = []
-        for i in range(len(data)):
-            ext = ctx_ext_list[i]
-            ids_i = torch.cat([prompt_ids[i], ext.to(prompt_ids.device)], dim=-1)
-            attn_i = torch.cat([
-                prompt_attn[i],
-                torch.ones(ext.size(0), dtype=prompt_attn.dtype, device=prompt_attn.device),
-            ])
-            # pad right to max P+max_ext_len
-            target_len = prompt_ids.shape[-1] + max_ext_len
-            ids_i = pad_sequence_to_length(ids_i.unsqueeze(0), target_len, pad_id, left_pad=False)[0]
-            attn_i = pad_sequence_to_length(attn_i.unsqueeze(0), target_len, 0, left_pad=False)[0]
-            ctx_ids_list.append(ids_i)
-            ctx_attn_list.append(attn_i)
-        ctx_ids = torch.stack(ctx_ids_list, dim=0)
-        ctx_attn = torch.stack(ctx_attn_list, dim=0)
 
-        # 5) Pad GT (kept solution tokens) to a common length and build EOS mask
-        if self.max_gt_len is None:
-            max_gt_len = max((t.size(0) for t in gt_ids_list), default=1)
-        else:
-            max_gt_len = self.max_gt_len
-        gt_ids_batched = []
+        ctx_lens = [t.numel() for t in ctx_ext_list]
+        gt_lens = [t.numel() for t in gt_ids_list]
+        max_gt_len = max(gt_lens, default=1)
+        max_ctx_plus_gt = max((c + g for c, g in zip(ctx_lens, gt_lens, strict=True)), default=0)
+        # Safety: cap at the response budget (already enforced in _compose, but double-checked)
+        max_ctx_plus_gt = min(max_ctx_plus_gt, max_resp_len)
+        max_ctx_plus_gt = max(1, max_ctx_plus_gt)
+
+        resp_ids_list = []
+        resp_attn_list = []
         masked_token_mask_batched = []
-        for ids, m in zip(gt_ids_list, masked_token_mask_list, strict=True):
-            ids = ids.unsqueeze(0)
-            attn = torch.ones_like(ids)
-            ids_pad, _ = postprocess_data(
-                input_ids=ids,
-                attention_mask=attn,
-                max_length=max_gt_len,
-                pad_token_id=pad_token_id,
-                left_pad=False,
-                truncation="right",
-            )
-            # pad mask to max_gt_len
-            m_pad = pad_sequence_to_length(m.unsqueeze(0), max_gt_len, 0, left_pad=False)[0] if m.numel() > 0 else torch.zeros((max_gt_len,), dtype=torch.long)
-            gt_ids_batched.append(ids_pad[0])
-            masked_token_mask_batched.append(m_pad)
-        gt_ids = torch.stack(gt_ids_batched, dim=0).to(device)
-        masked_token_mask = torch.stack(masked_token_mask_batched, dim=0).to(device)
-        gt_resp_mask_eos = get_response_mask(response_id=gt_ids, eos_token=tokenizer.eos_token_id, dtype=ctx_attn.dtype)
+        gt_resp_mask_eos_list = []
 
-        # 6) Concatenate for model input
-        input_ids = torch.cat([ctx_ids, gt_ids], dim=-1)
-        attention_mask = torch.cat([ctx_attn, gt_resp_mask_eos], dim=-1)
+        for i in valid_indices:
+            ctx = ctx_ext_list[i].to(device)
+            gt = gt_ids_list[i].to(device)
+            ctx_len = ctx.numel()
+            gt_len = gt.numel()
+
+            # Response tokens = ctx extension followed by kept GT tokens
+            resp_ids = torch.cat([ctx, gt], dim=-1)
+            resp_ids = pad_sequence_to_length(resp_ids.unsqueeze(0), max_ctx_plus_gt, pad_id, left_pad=False)[0]
+            resp_ids_list.append(resp_ids)
+
+            # Build attention over response tokens (ctx ones, GT until eos, zero for pad)
+            resp_attn = torch.zeros((max_ctx_plus_gt,), dtype=prompt_attn.dtype, device=device)
+            if ctx_len > 0:
+                resp_attn[:ctx_len] = 1
+            gt_mask_local = torch.zeros((max_ctx_plus_gt,), dtype=prompt_attn.dtype, device=device)
+            if gt_len > 0:
+                gt_eos_mask = get_response_mask(
+                    response_id=gt.unsqueeze(0), eos_token=tokenizer.eos_token_id, dtype=prompt_attn.dtype
+                )[0]
+                gt_mask_local[ctx_len : ctx_len + gt_len] = gt_eos_mask
+                resp_attn[ctx_len : ctx_len + gt_len] = gt_eos_mask
+            resp_attn_list.append(resp_attn)
+            gt_resp_mask_eos_list.append(gt_mask_local)
+
+            # Masked-token mask aligned to the GT segment positions
+            m = masked_token_mask_list[i]
+            mask_vec = torch.zeros((max_ctx_plus_gt,), dtype=torch.long, device=device)
+            if m.numel() > 0:
+                mask_vec[ctx_len : ctx_len + m.numel()] = m.to(device)
+            masked_token_mask_batched.append(mask_vec)
+
+        responses = torch.stack(resp_ids_list, dim=0)
+        masked_token_mask = torch.stack(masked_token_mask_batched, dim=0).to(device)
+        gt_resp_mask_eos = torch.stack(gt_resp_mask_eos_list, dim=0)
+
+        # 6) Concatenate prompts with padded responses for model input
+        input_ids = torch.cat([prompt_ids, responses], dim=-1)
+        attention_mask = torch.cat([prompt_attn, torch.stack(resp_attn_list, dim=0)], dim=-1)
         position_ids = (attention_mask.cumsum(dim=-1) - 1).clamp_min(0)
 
         # 6) Compute token-level log-probs for GT under actor
         gt_batch = DataProto.from_dict(
             tensors={
-                "prompts": ctx_ids,  # not used by log_prob but kept for consistency
-                "responses": gt_ids,
+                "prompts": prompt_ids,  # not used by log_prob but kept for consistency
+                "responses": responses,
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
                 "position_ids": position_ids,
             }
         )
+        seq_len_total = input_ids.shape[-1]
+        existing_max_token_len = gt_batch.meta_info.get("max_token_len", None)
+        if existing_max_token_len is None or existing_max_token_len < seq_len_total:
+            gt_batch.meta_info["max_token_len"] = seq_len_total
+
+        # Truncate sequences to actor's max_token_len if set
+        max_token_len = None
+        try:
+            max_token_len = actor_wg.config.actor.ppo_infer_max_token_len_per_gpu
+        except Exception:
+            max_token_len = None
+
+        if max_token_len is not None and gt_batch.batch["input_ids"].shape[-1] > max_token_len:
+            gt_batch.batch["input_ids"] = gt_batch.batch["input_ids"][:, -max_token_len:]
+            gt_batch.batch["attention_mask"] = gt_batch.batch["attention_mask"][:, -max_token_len:]
+            gt_batch.batch["position_ids"] = gt_batch.batch["position_ids"][:, -max_token_len:]
+            seq_len_total = max_token_len
+
         logprob_out = actor_wg.compute_log_prob(gt_batch)
-        gt_log_probs = logprob_out.batch["old_log_probs"]  # [B, gt_len]
+        gt_log_probs_full = logprob_out.batch["old_log_probs"]  # [B, gt_len]
 
         # 7) Aggregate mean log-prob over masked tokens (and valid gt mask)
-        masked = masked_token_mask.to(gt_log_probs.dtype) * gt_resp_mask_eos.to(gt_log_probs.dtype)
-        token_sums = (gt_log_probs * masked).sum(dim=-1)
+        masked = masked_token_mask.to(gt_log_probs_full.dtype) * gt_resp_mask_eos.to(gt_log_probs_full.dtype)
+        token_sums = (gt_log_probs_full * masked).sum(dim=-1)
         counts = masked.sum(dim=-1).clamp_min(1.0)
-        masked_means = (token_sums / counts).detach().cpu().tolist()
+        masked_means_tensor_valid = token_sums / counts
+
+        masked_means_full = [v for v in masked_means_tensor_valid]
+
+        # Collect per-sample masked means with overflow handling
+        data_sources = self._to_py_list(data.non_tensor_batch[self.reward_fn_key])
+
+        # Precompute group and global minima from valid samples
+        group_to_vals: dict[str, list[torch.Tensor]] = defaultdict(list)
+        for idx, val in enumerate(masked_means_full):
+            group_to_vals[str(data_sources[idx])].append(val)
+        global_min = torch.min(masked_means_tensor_valid) if len(masked_means_tensor_valid) > 0 else None
+
+        # For overflowed samples: use group min if available; else global min; else 0.
+        zero_tensor = torch.tensor(0.0, device=device, dtype=gt_log_probs_full.dtype if 'gt_log_probs_full' in locals() else torch.float32)
+        for idx, ov in enumerate(overflow_list):
+            if not ov:
+                continue
+            group = str(data_sources[idx])
+            if group_to_vals.get(group):
+                fill_val = min(group_to_vals[group])
+            elif global_min is not None:
+                fill_val = global_min
+            else:
+                fill_val = zero_tensor
+            masked_means_full[idx] = fill_val
+
+        # Optional min-max normalization to [0,1] per group
+        if self.normalize_logprob:
+            for group in set(map(str, data_sources)):
+                indices = [i for i, g in enumerate(data_sources) if str(g) == group]
+                vals = torch.stack([masked_means_full[i] for i in indices])
+                vmin = vals.min()
+                vmax = vals.max()
+                if torch.isclose(vmin, vmax):
+                    scaled = torch.zeros_like(vals)
+                else:
+                    scaled = (vals - vmin) / (vmax - vmin)
+                for dst, sval in zip(indices, scaled, strict=True):
+                    masked_means_full[dst] = sval
+
+        masked_means = [v.detach().cpu().item() for v in masked_means_full]
 
         # 8) Optional external batch scores
         base_scores = self._compute_batch_scores(data)
 
         # 9) Combine
-        if self.combine_results is not None:
-            final_results = self.combine_results(base_scores, masked_means)
-        else:
+        if self.combine_with_vr:
             final_results = self._default_combine(base_scores, masked_means)
+        else:
+            final_results = base_scores
 
         # 10) Build reward tensor aligned to original generated responses
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)

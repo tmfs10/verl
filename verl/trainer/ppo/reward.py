@@ -209,6 +209,25 @@ def load_reward_manager(
     if process_response_for_logprob_fn is None:
         process_response_for_logprob_fn = default_process_response_for_logprob
 
+    # Extract reward-manager-specific kwargs, allowing a nested logprob block for the conditional masked hybrid.
+    reward_kwargs_by_manager = dict(reward_kwargs)
+    if reward_manager_name == "conditional_masked_hybrid":
+        logprob_kwargs = reward_kwargs_by_manager.pop("logprob", {})
+        reward_kwargs_by_manager = {**reward_kwargs_by_manager, **logprob_kwargs}
+        # Always align to the dataset's solution key (or alias) rather than a separate override
+        solution_field_from_data = None
+        try:
+            solution_field_from_data = config.data.get("solution_key", None)
+        except Exception:
+            solution_field_from_data = None
+        if solution_field_from_data is None:
+            try:
+                solution_field_from_data = config.data.get("solution_field_name", None)
+            except Exception:
+                solution_field_from_data = None
+        assert solution_field_from_data is not None, "config.data.solution_key (or solution_field_name) must be set"
+        reward_kwargs_by_manager["solution_field_name"] = solution_field_from_data
+
     # Build init kwargs and filter by reward manager signature for safety
     init_kwargs = dict(
         tokenizer=tokenizer,
@@ -217,7 +236,7 @@ def load_reward_manager(
         reward_fn_key=config.data.reward_fn_key,
         combine_results=combine_results_fn,
         process_response_for_logprob=process_response_for_logprob_fn,
-        **reward_kwargs,
+        **reward_kwargs_by_manager,
     )
 
     # Filter to accepted kwargs of the class __init__
@@ -245,15 +264,13 @@ def compute_reward(
 
     filtered_kwargs = _select_kwargs_for_callable(call_target, kwargs)
 
-    try:
-        reward_result = reward_fn(data, return_dict=True, **filtered_kwargs)
+    reward_result = reward_fn(data, return_dict=True, **filtered_kwargs)
+    if isinstance(reward_result, dict):
         reward_tensor = reward_result["reward_tensor"]
         reward_extra_infos_dict = reward_result.get("reward_extra_info", {})
-    except Exception as e:
-        print(f"Error in reward_fn: {e}")
-        # Fallback to legacy call without return_dict
-        fallback_kwargs = _select_kwargs_for_callable(call_target, {})
-        reward_tensor = reward_fn(data, **fallback_kwargs)
+    else:
+        # Backward-compat: allow direct tensor return, but do not swallow errors silently.
+        reward_tensor = reward_result
         reward_extra_infos_dict = {}
 
     return reward_tensor, reward_extra_infos_dict

@@ -332,6 +332,7 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
     from torch.utils.data import Dataset
 
     from verl.utils.dataset.rl_dataset import RLHFDataset
+    from verl.utils.dataset.masked_solution_dataset import MaskedSolutionChatDataset
 
     # Check if a custom dataset class is specified in the data configuration
     # and if the path to the custom class is provided
@@ -351,17 +352,34 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
         dataset_cls = DynamicGenDataset
         print("Using DynamicGenDataset for data generation.")
     else:
-        # Use the default RLHFDataset class if no custom class is specified
-        dataset_cls = RLHFDataset
+        # If reward manager requires line masks for masked logprob, default to the masked solution dataset.
+        reward_manager_name = data_config.get("reward_manager", None) or getattr(data_config, "reward_manager", None)
+        # reward_manager is under reward_model, not data. Access via OmegaConf if present.
+        try:
+            reward_manager_name = data_config._parent.reward_model.get("reward_manager", reward_manager_name)
+        except Exception:
+            pass
+        if reward_manager_name == "conditional_masked_hybrid":
+            dataset_cls = MaskedSolutionChatDataset
+        else:
+            # Use the default RLHFDataset class if no custom class is specified
+            dataset_cls = RLHFDataset
     print(f"Using dataset class: {dataset_cls.__name__}")
 
     # Instantiate the dataset using the determined dataset class
-    dataset = dataset_cls(
-        data_files=data_paths,
-        tokenizer=tokenizer,
-        processor=processor,
-        config=data_config,
-    )
+    if dataset_cls is MaskedSolutionChatDataset:
+        dataset = dataset_cls(
+            data_files=data_paths,
+            tokenizer=tokenizer,
+            config=data_config,
+        )
+    else:
+        dataset = dataset_cls(
+            data_files=data_paths,
+            tokenizer=tokenizer,
+            processor=processor,
+            config=data_config,
+        )
 
     return dataset
 
