@@ -50,7 +50,7 @@ def main(config):
             dataset.append(data)
     print(f"Processing {len(dataset)} items. Starting from line {max_line_number+1}")
 
-    unit_tests_to_use = config.reward_model['reward_fn_args']['code']['unit_tests_to_use']
+    unit_tests_to_use = config.reward_model['reward_kwargs']['code']['unit_tests_to_use']
     print('Unit tests to use: ', unit_tests_to_use, type(unit_tests_to_use))
 
     batch_size = config.data.batch_size
@@ -84,7 +84,7 @@ def main(config):
             solution_strs=responses_str,
             ground_truths=ground_truths,
             extra_infos=extras,
-            **config.reward_model.get("reward_fn_args", {}),
+            **config.reward_model.get("reward_kwargs", {}),
         )
         print(f"Computed {len(score_result)} scores")
 
