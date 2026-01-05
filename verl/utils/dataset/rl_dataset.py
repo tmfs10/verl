@@ -72,6 +72,92 @@ def collate_fn(data_list: list[dict]) -> dict:
     return {**tensors, **non_tensors}
 
 
+def collate_fn_pad_to_batch_max(data_list: list[dict], pad_token_id: int) -> dict:
+    """
+    Collate a batch with dynamic padding. Prompts are left-padded so responses align at the end.
+    Responses are right-padded, and masks are padded accordingly.
+    """
+    if pad_token_id is None:
+        raise ValueError("pad_token_id must be provided for padding")
+
+    prompt_ids_list = []
+    response_ids_list = []
+    response_mask_list = []
+    non_tensors = defaultdict(list)
+
+    for data in data_list:
+        for key, val in data.items():
+            if not isinstance(val, torch.Tensor):
+                non_tensors[key].append(val)
+
+        input_ids = data["input_ids"]
+        responses = data["responses"]
+        response_mask = data["response_mask"]
+
+        prompt_len = input_ids.size(0) - responses.size(0)
+        prompt_ids = input_ids[:prompt_len]
+
+        prompt_ids_list.append(prompt_ids)
+        response_ids_list.append(responses)
+        response_mask_list.append(response_mask)
+
+    max_prompt_len = max(t.size(0) for t in prompt_ids_list) if prompt_ids_list else 0
+    max_response_len = max(t.size(0) for t in response_ids_list) if response_ids_list else 0
+
+    padded_input_ids = []
+    padded_attention_mask = []
+    padded_responses = []
+    padded_response_mask = []
+
+    for prompt_ids, response_ids, response_mask in zip(
+        prompt_ids_list, response_ids_list, response_mask_list, strict=True
+    ):
+        prompt_len = prompt_ids.size(0)
+        response_len = response_ids.size(0)
+
+        if max_prompt_len > prompt_len:
+            pad_len = max_prompt_len - prompt_len
+            prompt_pad = torch.full((pad_len,), pad_token_id, dtype=prompt_ids.dtype)
+            prompt_mask = torch.zeros((pad_len,), dtype=response_mask.dtype)
+            prompt_ids = torch.cat((prompt_pad, prompt_ids), dim=0)
+            prompt_attention_mask = torch.cat((prompt_mask, torch.ones((prompt_len,), dtype=response_mask.dtype)), dim=0)
+        else:
+            prompt_attention_mask = torch.ones((prompt_len,), dtype=response_mask.dtype)
+
+        if max_response_len > response_len:
+            pad_len = max_response_len - response_len
+            response_pad = torch.full((pad_len,), pad_token_id, dtype=response_ids.dtype)
+            response_ids = torch.cat((response_ids, response_pad), dim=0)
+            response_mask = torch.cat((response_mask, torch.zeros((pad_len,), dtype=response_mask.dtype)), dim=0)
+
+        input_ids = torch.cat((prompt_ids, response_ids), dim=0)
+        attention_mask = torch.cat((prompt_attention_mask, response_mask), dim=0)
+
+        padded_input_ids.append(input_ids)
+        padded_attention_mask.append(attention_mask)
+        padded_responses.append(response_ids)
+        padded_response_mask.append(response_mask)
+
+    input_ids = torch.stack(padded_input_ids, dim=0)
+    attention_mask = torch.stack(padded_attention_mask, dim=0)
+    position_ids = compute_position_id_with_mask(attention_mask)
+    responses = torch.stack(padded_responses, dim=0)
+    response_mask = torch.stack(padded_response_mask, dim=0)
+
+    batched = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "position_ids": position_ids,
+        "responses": responses,
+        "response_mask": response_mask,
+    }
+
+    for key, val in non_tensors.items():
+        non_tensors[key] = np.fromiter(val, dtype=object, count=len(val))
+
+    return {**batched, **non_tensors}
+
+
 class RLHFDataset(Dataset):
     """
     Load and preprocess RLHF data from Parquet files.
@@ -441,3 +527,181 @@ class RLHFDataset(Dataset):
             return state
 
         return self.__dict__.copy()
+
+
+class RLHFPromptResponseDataset(RLHFDataset):
+    """
+    RLHF dataset that reads prompt/response as plain strings and skips multimodal fields.
+
+    - Reads prompt_key and response_key (string fields).
+    - Adds idx if missing (line number per file) BEFORE filtering.
+    - Filters overlong prompts (same as RLHFDataset).
+    - Filters samples where tokenized prompt+response exceeds config.data.max_length.
+    - Returns idx with each item.
+    """
+
+    def __init__(
+        self,
+        data_files: str | list[str],
+        tokenizer: PreTrainedTokenizer,
+        config: DictConfig,
+        processor: Optional[ProcessorMixin] = None,
+    ):
+        if not isinstance(data_files, list | ListConfig):
+            data_files = [data_files]
+
+        self.data_files = copy.deepcopy(data_files)
+        self.original_data_files = copy.deepcopy(data_files)  # use for resume
+        self.tokenizer = tokenizer
+        # Skip multimodal processing for this dataset
+        self.processor = None
+        self.config = config
+
+        self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
+        self.prompt_key = config.get("prompt_key", "prompt")
+        self.response_key = config.get("response_key", "response")
+
+        self.max_prompt_length = config.get("max_prompt_length", 1024)
+        self.max_response_length = config.get("max_response_length", 1024)
+        self.max_length = config.get("max_length", None)
+        if self.max_length is None:
+            self.max_length = self.max_prompt_length + self.max_response_length
+
+        self.return_raw_chat = config.get("return_raw_chat", False)
+        self.return_full_prompt = config.get("return_full_prompt", False)
+        self.truncation = config.get("truncation", "error")
+        self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
+        self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+
+        self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
+        self.num_workers = min(self.num_workers, os.cpu_count())
+        self.use_shm = config.get("use_shm", False)
+
+        self._download()
+        self._read_files_and_tokenize()
+
+    def _build_prompt_text(self, prompt: str) -> str:
+        if self.apply_chat_template_kwargs.get("chat_template") is None:
+            assert hasattr(self.tokenizer, "chat_template"), (
+                "chat_template should be provided in apply_chat_template_kwargs or tokenizer config"
+            )
+        messages = [{"role": "user", "content": prompt}]
+        return self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False, **self.apply_chat_template_kwargs
+        )
+
+    def _read_files_and_tokenize(self):
+        datasets_list = []
+
+        for path in self.data_files:
+            if path.endswith(".parquet"):
+                ds = datasets.load_dataset("parquet", data_files=path, split="train")
+            elif path.endswith(".jsonl"):
+                ds = datasets.load_dataset("json", data_files=path, split="train")
+            else:
+                continue
+
+            # Add idx if missing (use line number per file), before filtering.
+            def _ensure_idx(ex, idx):
+                if ex.get("idx", None) is None:
+                    ex["idx"] = idx
+                return ex
+
+            ds = ds.map(
+                _ensure_idx,
+                with_indices=True,
+                num_proc=self.num_workers,
+                desc="Stamping idx with file line number",
+            )
+
+            datasets_list.append(ds)
+
+        self.dataframe: datasets.Dataset = datasets.concatenate_datasets(datasets_list)
+        print(f"dataset len: {len(self.dataframe)}")
+
+        self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
+        self.dataframe = self.maybe_filter_out_long_total_length(self.dataframe)
+
+    def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset = None):
+        if self.filter_overlong_prompts:
+            tokenizer = self.tokenizer
+            prompt_key = self.prompt_key
+
+            def doc2len(doc) -> int:
+                prompt = doc[prompt_key]
+                prompt_text = self._build_prompt_text(prompt)
+                return len(tokenizer(prompt_text, add_special_tokens=False)["input_ids"])
+
+            dataframe = dataframe.filter(
+                lambda doc: doc2len(doc) <= self.max_prompt_length,
+                num_proc=self.num_workers,
+                desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+            )
+
+            print(f"filter dataset len: {len(dataframe)}")
+        return dataframe
+
+    def maybe_filter_out_long_total_length(self, dataframe: datasets.Dataset = None):
+        tokenizer = self.tokenizer
+        prompt_key = self.prompt_key
+        response_key = self.response_key
+        max_length = self.max_length
+
+        def doc2len(doc) -> int:
+            prompt = doc[prompt_key]
+            response = doc[response_key]
+            prompt_text = self._build_prompt_text(prompt)
+            eos = self.tokenizer.eos_token or ""
+            response_text = f"{response}{eos}"
+            prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+            response_ids = tokenizer(response_text, add_special_tokens=False)["input_ids"]
+            return len(prompt_ids) + len(response_ids)
+
+        dataframe = dataframe.filter(
+            lambda doc: doc2len(doc) <= max_length,
+            num_proc=self.num_workers,
+            desc=f"Filtering prompts+responses longer than {max_length} tokens",
+        )
+        print(f"filter total-length dataset len: {len(dataframe)}")
+        return dataframe
+
+    def __getitem__(self, item):
+        row_dict: dict = self.dataframe[item]
+
+        prompt = row_dict[self.prompt_key]
+        response = row_dict[self.response_key]
+        idx = row_dict.get("idx", item)
+
+        # apply chat template to prompt
+        prompt_text = self._build_prompt_text(prompt)
+        eos = self.tokenizer.eos_token or ""
+        response_text = f"{response}{eos}"
+
+        prompt_ids_output = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
+        prompt_ids = prompt_ids_output["input_ids"]
+        prompt_attention_mask = prompt_ids_output["attention_mask"]
+
+        response_ids_output = self.tokenizer(response_text, return_tensors="pt", add_special_tokens=False)
+        response_ids = response_ids_output["input_ids"]
+        response_attention_mask = response_ids_output["attention_mask"]
+
+        # No per-sample padding/truncation; collate will pad to batch max.
+        input_ids = torch.cat((prompt_ids, response_ids), dim=-1)[0]
+        attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)[0]
+        position_ids = compute_position_id_with_mask(attention_mask)
+
+        row = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "position_ids": position_ids,
+            "responses": response_ids[0],
+            "response_mask": response_attention_mask[0],
+            "idx": idx,
+        }
+
+        if self.return_raw_chat:
+            row["raw_prompt"] = prompt
+        if self.return_full_prompt:
+            row["full_prompts"] = prompt_text
+
+        return row

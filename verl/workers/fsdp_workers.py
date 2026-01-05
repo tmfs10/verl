@@ -245,6 +245,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.actor.ppo_micro_batch_size_per_gpu = self.config.actor.ppo_micro_batch_size
 
             if self.config.actor.ppo_micro_batch_size_per_gpu is not None:
+                print('FSDP', self.config.actor.ppo_mini_batch_size, self.config.actor.ppo_micro_batch_size_per_gpu)
                 assert self.config.actor.ppo_mini_batch_size % self.config.actor.ppo_micro_batch_size_per_gpu == 0, (
                     f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be divisible by "
                     f"ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu}"

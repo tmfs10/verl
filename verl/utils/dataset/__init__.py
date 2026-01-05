@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .rl_dataset import RLHFDataset
+from .rl_dataset import RLHFDataset, RLHFPromptResponseDataset, collate_fn_pad_to_batch_max
 from .rm_dataset import RMDataset
 from .sft_dataset import SFTDataset
 
-__all__ = ["RLHFDataset", "RMDataset", "SFTDataset"]
+__all__ = ["RLHFDataset", "RLHFPromptResponseDataset", "collate_fn_pad_to_batch_max", "RMDataset", "SFTDataset"]
