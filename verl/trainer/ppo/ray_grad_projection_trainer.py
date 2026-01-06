@@ -24,14 +24,17 @@ from verl.trainer.ppo.utils import Role
 
 class RayGradProjectionTrainer(RayPPOTrainer):
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler):
-        from verl.trainer.main_ppo import create_rl_sampler
         from verl.utils.dataset.rl_dataset import collate_fn as default_collate_fn
+        from torch.utils.data import SequentialSampler
 
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
 
         if train_sampler is None:
-            train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
+            train_sampler = SequentialSampler(self.train_dataset)
+        elif not isinstance(train_sampler, SequentialSampler):
+            print("Warning: overriding non-sequential sampler with SequentialSampler for stable indices.")
+            train_sampler = SequentialSampler(self.train_dataset)
         if collate_fn is None:
             collate_fn = default_collate_fn
 
@@ -126,14 +129,42 @@ class RayGradProjectionTrainer(RayPPOTrainer):
         self.actor_wg.init_model()
 
     def fit(self):
+        import os
+        import re
+        import torch
+
+        from verl.utils.fs import local_mkdir_safe
+
         rademacher_k = self.config.trainer.get("rademacher_k", None)
         if rademacher_k is None:
             raise ValueError("trainer.rademacher_k must be set for gradient projection")
+        rademacher_flush_every = self.config.trainer.get("rademacher_flush_every", 0) or 0
+        if rademacher_flush_every < 0:
+            raise ValueError("trainer.rademacher_flush_every must be >= 0")
+
+        output_dir = self.config.trainer.default_local_dir
+        if not os.path.isabs(output_dir):
+            output_dir = os.path.join(os.getcwd(), output_dir)
+        local_mkdir_safe(output_dir)
+        max_saved_idx = -1
+        existing_partial_paths = []
+        for filename in os.listdir(output_dir):
+            match = re.match(r"grads_(\d+)\.pt$", filename)
+            if match:
+                max_saved_idx = max(max_saved_idx, int(match.group(1)))
+                existing_partial_paths.append(os.path.join(output_dir, filename))
+        resume_from_idx = max_saved_idx + 1
 
         self.global_steps = 0
         total_items = len(self.train_dataset)
-        processed = 0
+        processed = resume_from_idx
         self.projections = []
+        all_projections = []
+
+        if existing_partial_paths:
+            existing_partial_paths.sort(key=lambda path: int(re.search(r"grads_(\d+)\.pt$", path).group(1)))
+            for path in existing_partial_paths:
+                all_projections.extend(torch.load(path, map_location="cpu"))
 
         for batch_dict in self.train_dataloader:
             if not hasattr(self, "_actor_dp_size"):
@@ -164,6 +195,45 @@ class RayGradProjectionTrainer(RayPPOTrainer):
             projection = output.batch["projection"][:original_len].cpu()
             idxs = batch.non_tensor_batch["idx"][:original_len]
 
-            self.projections.append((idxs, projection))
+            if hasattr(idxs, "tolist"):
+                idxs = idxs.tolist()
+            else:
+                idxs = list(idxs)
+
+            start_pos = 0
+            if resume_from_idx > 0:
+                while start_pos < len(idxs) and idxs[start_pos] < resume_from_idx:
+                    start_pos += 1
+                if start_pos >= len(idxs):
+                    print(f"Processed {processed}/{total_items}")
+                    continue
+
+            if start_pos > 0:
+                idxs = idxs[start_pos:]
+                projection = projection[start_pos:]
+
+            for idx, proj in zip(idxs, projection):
+                if hasattr(idx, "item"):
+                    idx = int(idx.item())
+                else:
+                    idx = int(idx)
+                proj = proj.cpu()
+                self.projections.append((idx, proj))
+                all_projections.append((idx, proj))
             processed += len(idxs)
             print(f"Processed {processed}/{total_items}")
+
+            if rademacher_flush_every > 0 and len(self.projections) >= rademacher_flush_every:
+                last_idx = self.projections[-1][0]
+                torch.save(self.projections, os.path.join(output_dir, f"grads_{last_idx}.pt"))
+                self.projections = []
+
+        if rademacher_flush_every > 0 and self.projections:
+            last_idx = self.projections[-1][0]
+            torch.save(self.projections, os.path.join(output_dir, f"grads_{last_idx}.pt"))
+            self.projections = []
+
+        torch.save(all_projections, os.path.join(output_dir, "grads.pt"))
+        for filename in os.listdir(output_dir):
+            if re.match(r"grads_(\d+)\.pt$", filename):
+                os.remove(os.path.join(output_dir, filename))

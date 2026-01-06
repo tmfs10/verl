@@ -137,6 +137,9 @@ trainer:
   # Number of Rademacher projection dimensions
   rademacher_k: 1024
 
+  # Flush projections to disk every N elements (0 = save only at end)
+  rademacher_flush_every: 0
+
   # Project name for experiment tracking (e.g., wandb)
   project_name: verl_examples
 
