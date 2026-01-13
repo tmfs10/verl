@@ -141,6 +141,12 @@ class RayGradProjectionTrainer(RayPPOTrainer):
         rademacher_flush_every = self.config.trainer.get("rademacher_flush_every", 0) or 0
         if rademacher_flush_every < 0:
             raise ValueError("trainer.rademacher_flush_every must be >= 0")
+        rank = int(self.config.trainer.get("rank", 0))
+        world_size = int(self.config.trainer.get("world_size", 1))
+        if world_size <= 0:
+            raise ValueError("trainer.world_size must be >= 1")
+        if rank < 0 or rank >= world_size:
+            raise ValueError("trainer.rank must be in [0, trainer.world_size)")
 
         output_dir = self.config.trainer.default_local_dir
         if not os.path.isabs(output_dir):
@@ -164,7 +170,13 @@ class RayGradProjectionTrainer(RayPPOTrainer):
         if existing_partial_paths:
             existing_partial_paths.sort(key=lambda path: int(re.search(r"grads_(\d+)\.pt$", path).group(1)))
             for path in existing_partial_paths:
-                all_projections.extend(torch.load(path, map_location="cpu"))
+                loaded = torch.load(path, map_location="cpu")
+                for entry in loaded:
+                    if isinstance(entry, (list, tuple)) and len(entry) == 2:
+                        idx, proj = entry
+                        all_projections.append((idx, proj, None))
+                    else:
+                        all_projections.append(entry)
 
         for batch_dict in self.train_dataloader:
             if not hasattr(self, "_actor_dp_size"):
@@ -193,6 +205,7 @@ class RayGradProjectionTrainer(RayPPOTrainer):
 
             output = self.actor_wg.update_actor(batch)
             projection = output.batch["projection"][:original_len].cpu()
+            projection_normalized = output.batch["projection_normalized"][:original_len].cpu()
             idxs = batch.non_tensor_batch["idx"][:original_len]
 
             if hasattr(idxs, "tolist"):
@@ -200,26 +213,33 @@ class RayGradProjectionTrainer(RayPPOTrainer):
             else:
                 idxs = list(idxs)
 
-            start_pos = 0
-            if resume_from_idx > 0:
-                while start_pos < len(idxs) and idxs[start_pos] < resume_from_idx:
-                    start_pos += 1
-                if start_pos >= len(idxs):
-                    print(f"Processed {processed}/{total_items}")
+            keep_positions = []
+            for pos, idx in enumerate(idxs):
+                if idx < resume_from_idx:
                     continue
+                if (idx % world_size) != rank:
+                    continue
+                keep_positions.append(pos)
 
-            if start_pos > 0:
-                idxs = idxs[start_pos:]
-                projection = projection[start_pos:]
+            if not keep_positions:
+                print(f"Processed {processed}/{total_items}")
+                continue
 
-            for idx, proj in zip(idxs, projection):
+            if len(keep_positions) != len(idxs):
+                keep_idx = torch.tensor(keep_positions, dtype=torch.long)
+                idxs = [idxs[i] for i in keep_positions]
+                projection = projection.index_select(0, keep_idx)
+                projection_normalized = projection_normalized.index_select(0, keep_idx)
+
+            for idx, proj, proj_norm in zip(idxs, projection, projection_normalized):
                 if hasattr(idx, "item"):
                     idx = int(idx.item())
                 else:
                     idx = int(idx)
                 proj = proj.cpu()
-                self.projections.append((idx, proj))
-                all_projections.append((idx, proj))
+                proj_norm = proj_norm.cpu()
+                self.projections.append((idx, proj, proj_norm))
+                all_projections.append((idx, proj, proj_norm))
             processed += len(idxs)
             print(f"Processed {processed}/{total_items}")
 

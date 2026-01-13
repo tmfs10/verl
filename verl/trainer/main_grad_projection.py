@@ -101,13 +101,14 @@ class TaskRunner:
         )
 
         from verl.utils import hf_tokenizer
-        from verl.utils.dataset.rl_dataset import RLHFPromptResponseDataset, collate_fn_pad_to_batch_max
+        from verl.utils.dataset.raw_prompt_response_dataset import RawPromptResponseDataset
+        from verl.utils.dataset.rl_dataset import collate_fn_pad_to_batch_max
         from verl.trainer.main_ppo import create_rl_sampler
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
 
-        train_dataset = RLHFPromptResponseDataset(
+        train_dataset = RawPromptResponseDataset(
             data_files=config.data.train_files,
             tokenizer=tokenizer,
             processor=None,

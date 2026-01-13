@@ -111,6 +111,16 @@ def _project_rademacher(params, k: int, seed: int, chunk_size: int, scale: bool 
     return proj_cpu
 
 
+def _grad_l2_norm(params) -> float:
+    total_sq = 0.0
+    for p in params:
+        grad = p.grad
+        if grad is None:
+            continue
+        total_sq += grad.detach().float().pow(2).sum().item()
+    return total_sq**0.5
+
+
 class FSDPGradProjectionWorker(ActorRolloutRefWorker):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     def update_actor(self, data: DataProto):
@@ -169,8 +179,18 @@ class FSDPGradProjectionWorker(ActorRolloutRefWorker):
                 chunk_size=chunk_size,
                 scale=True,
             )
+            grad_norm = _grad_l2_norm(self.actor_module_fsdp.parameters())
+            if grad_norm > 0.0:
+                proj_normalized = proj / grad_norm
+            else:
+                proj_normalized = torch.zeros_like(proj)
 
-            output = DataProto.from_dict(tensors={"projection": proj.unsqueeze(0)})
+            output = DataProto.from_dict(
+                tensors={
+                    "projection": proj.unsqueeze(0),
+                    "projection_normalized": proj_normalized.unsqueeze(0),
+                }
+            )
             output = output.to("cpu")
 
         if self._is_offload_param:
