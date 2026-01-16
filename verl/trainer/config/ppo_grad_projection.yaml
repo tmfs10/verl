@@ -113,6 +113,12 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+# Rank for sharding the grad-projection dataset
+rank: 0
+
+# World size for sharding the grad-projection dataset
+world_size: 1
+
 # config for the data
 data:
 
@@ -203,10 +209,6 @@ trainer:
 
   # Default local directory for saving checkpoints
   default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
-
-  # Rank/world size for sharding the grad-projection dataset
-  rank: 0
-  world_size: 1
 
   # Maximum number of actor checkpoints to keep
   max_actor_ckpt_to_keep: null

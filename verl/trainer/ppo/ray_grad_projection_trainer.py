@@ -37,6 +37,7 @@ class RayGradProjectionTrainer(RayPPOTrainer):
             train_sampler = SequentialSampler(self.train_dataset)
         if collate_fn is None:
             collate_fn = default_collate_fn
+        self._collate_fn = collate_fn
 
         num_workers = self.config.data["dataloader_num_workers"]
 
@@ -131,6 +132,7 @@ class RayGradProjectionTrainer(RayPPOTrainer):
     def fit(self):
         import os
         import re
+        import time
         import torch
 
         from verl.utils.fs import local_mkdir_safe
@@ -141,12 +143,12 @@ class RayGradProjectionTrainer(RayPPOTrainer):
         rademacher_flush_every = self.config.trainer.get("rademacher_flush_every", 0) or 0
         if rademacher_flush_every < 0:
             raise ValueError("trainer.rademacher_flush_every must be >= 0")
-        rank = int(self.config.trainer.get("rank", 0))
-        world_size = int(self.config.trainer.get("world_size", 1))
+        rank = self.config.rank
+        world_size = self.config.world_size
         if world_size <= 0:
-            raise ValueError("trainer.world_size must be >= 1")
+            raise ValueError("config.world_size must be >= 1")
         if rank < 0 or rank >= world_size:
-            raise ValueError("trainer.rank must be in [0, trainer.world_size)")
+            raise ValueError("config.rank must be in [0, config.world_size)")
 
         output_dir = self.config.trainer.default_local_dir
         if not os.path.isabs(output_dir):
@@ -178,16 +180,91 @@ class RayGradProjectionTrainer(RayPPOTrainer):
                     else:
                         all_projections.append(entry)
 
-        for batch_dict in self.train_dataloader:
-            if not hasattr(self, "_actor_dp_size"):
-                dp_rank_mapping = self.actor_wg._query_dispatch_info("actor")
-                self._actor_dp_size = max(dp_rank_mapping) + 1
+        if not hasattr(self, "_actor_dp_size"):
+            dp_rank_mapping = self.actor_wg._query_dispatch_info("actor")
+            self._actor_dp_size = max(dp_rank_mapping) + 1
+        target_batch_size = self._actor_dp_size
 
+        pending_samples = []
+
+        for batch_dict in self.train_dataloader:
             batch_size = batch_dict["input_ids"].shape[0]
-            assert batch_size <= self._actor_dp_size, (
-                f"Batch size must be <= dp_size ({self._actor_dp_size}), got {batch_size}"
-            )
-            batch = DataProto.from_single_dict(batch_dict)
+            for i in range(batch_size):
+                sample = {}
+                for key, val in batch_dict.items():
+                    if isinstance(val, torch.Tensor):
+                        sample[key] = val[i]
+                    else:
+                        sample[key] = val[i]
+
+                idx = sample.get("idx", i)
+                if hasattr(idx, "item"):
+                    idx = int(idx.item())
+                else:
+                    idx = int(idx)
+                sample["idx"] = idx
+
+                if idx < resume_from_idx:
+                    continue
+                if (idx % world_size) != rank:
+                    continue
+                pending_samples.append(sample)
+
+            while len(pending_samples) >= target_batch_size:
+                batch_start = time.perf_counter()
+                chunk = pending_samples[:target_batch_size]
+                pending_samples = pending_samples[target_batch_size:]
+
+                batch_dict_filtered = self._collate_fn(chunk)
+                batch = DataProto.from_single_dict(batch_dict_filtered)
+                original_len = len(batch)
+                if original_len % self._actor_dp_size != 0:
+                    padding_size = self._actor_dp_size - (original_len % self._actor_dp_size)
+                    batch.padding(padding_size=padding_size, padding_candidate="last")
+                batch.meta_info.update(
+                    {
+                        "temperature": self.config.actor_rollout_ref.rollout.get("temperature", 1.0),
+                        "use_dynamic_bsz": False,
+                        "micro_batch_size": 1,
+                        "rademacher_k": rademacher_k,
+                        "rademacher_seed": self.config.trainer.get("rademacher_seed", 0),
+                        "rademacher_chunk_size": self.config.trainer.get("rademacher_chunk_size", 1_000_000),
+                    }
+                )
+
+                output = self.actor_wg.update_actor(batch)
+                projection = output.batch["projection"][:original_len].cpu()
+                projection_normalized = output.batch["projection_normalized"][:original_len].cpu()
+                idxs = batch.non_tensor_batch["idx"][:original_len]
+
+                if hasattr(idxs, "tolist"):
+                    idxs = idxs.tolist()
+                else:
+                    idxs = list(idxs)
+
+                for idx, proj, proj_norm in zip(idxs, projection, projection_normalized):
+                    if hasattr(idx, "item"):
+                        idx = int(idx.item())
+                    else:
+                        idx = int(idx)
+                    proj = proj.cpu()
+                    proj_norm = proj_norm.cpu()
+                    self.projections.append((idx, proj, proj_norm))
+                    all_projections.append((idx, proj, proj_norm))
+                processed += len(idxs)
+                print(f"Processed {processed}/{total_items}")
+
+                if rademacher_flush_every > 0 and len(self.projections) >= rademacher_flush_every:
+                    last_idx = self.projections[-1][0]
+                    torch.save(self.projections, os.path.join(output_dir, f"grads_{last_idx}.pt"))
+                    self.projections = []
+                batch_elapsed = time.perf_counter() - batch_start
+                print(f"Batch time: {batch_elapsed:.3f}s")
+
+        if pending_samples:
+            batch_start = time.perf_counter()
+            batch_dict_filtered = self._collate_fn(pending_samples)
+            batch = DataProto.from_single_dict(batch_dict_filtered)
             original_len = len(batch)
             if original_len % self._actor_dp_size != 0:
                 padding_size = self._actor_dp_size - (original_len % self._actor_dp_size)
@@ -213,24 +290,6 @@ class RayGradProjectionTrainer(RayPPOTrainer):
             else:
                 idxs = list(idxs)
 
-            keep_positions = []
-            for pos, idx in enumerate(idxs):
-                if idx < resume_from_idx:
-                    continue
-                if (idx % world_size) != rank:
-                    continue
-                keep_positions.append(pos)
-
-            if not keep_positions:
-                print(f"Processed {processed}/{total_items}")
-                continue
-
-            if len(keep_positions) != len(idxs):
-                keep_idx = torch.tensor(keep_positions, dtype=torch.long)
-                idxs = [idxs[i] for i in keep_positions]
-                projection = projection.index_select(0, keep_idx)
-                projection_normalized = projection_normalized.index_select(0, keep_idx)
-
             for idx, proj, proj_norm in zip(idxs, projection, projection_normalized):
                 if hasattr(idx, "item"):
                     idx = int(idx.item())
@@ -247,6 +306,8 @@ class RayGradProjectionTrainer(RayPPOTrainer):
                 last_idx = self.projections[-1][0]
                 torch.save(self.projections, os.path.join(output_dir, f"grads_{last_idx}.pt"))
                 self.projections = []
+            batch_elapsed = time.perf_counter() - batch_start
+            print(f"Batch time: {batch_elapsed:.3f}s")
 
         if rademacher_flush_every > 0 and self.projections:
             last_idx = self.projections[-1][0]
