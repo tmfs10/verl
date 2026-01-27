@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import warnings
-
 import torch
 
 from verl import DataProto
@@ -29,106 +27,96 @@ from verl.utils.seqlen_balancing import prepare_dynamic_batch
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
 
-def _int_to_signed_int64(x: int) -> int:
-    mask64 = (1 << 64) - 1
-    signbit = 1 << 63
-    x = x & mask64
-    if x >= signbit:
-        x -= (1 << 64)
-    return int(x)
-
-
-_MIX64_MULT1 = _int_to_signed_int64(0xBF58476D1CE4E5B9)
-_MIX64_MULT2 = _int_to_signed_int64(0x94D049BB133111EB)
-_SEED_XOR = _int_to_signed_int64(0x9E3779B97F4A7C15)
-_J_CONST = _int_to_signed_int64(0xD1342543DE82EF95)
-
-
-def _mix64(x: torch.Tensor) -> torch.Tensor:
-    x = (x ^ (x >> 30)) * _MIX64_MULT1
-    x = (x ^ (x >> 27)) * _MIX64_MULT2
-    x = x ^ (x >> 31)
+def _mix32(x: torch.Tensor) -> torch.Tensor:
+    x = x ^ (x >> 16)
+    x = x * torch.tensor(_to_signed_int32(0x7FEB352D), dtype=torch.int32, device=x.device)
+    x = x ^ (x >> 15)
+    x = x * torch.tensor(_to_signed_int32(0x846CA68B), dtype=torch.int32, device=x.device)
+    x = x ^ (x >> 16)
     return x
 
 
-def _project_rademacher(params, k: int, seed: int, chunk_size: int, scale: bool = True) -> torch.Tensor:
-    """Dense Rademacher projection (full ±1 matrix) computed in a streaming, low-memory way."""
-    proj_cpu = torch.zeros(k, dtype=torch.float32, device="cpu")
+def _to_signed_int32(x: int) -> int:
+    x = x & 0xFFFFFFFF
+    if x >= 0x80000000:
+        x -= 0x100000000
+    return int(x)
+
+
+def _project_countsketch(
+    params,
+    k: int,
+    seed: int,
+    chunk_size: int,
+    t: int = 2,
+    scale: bool = True,
+) -> torch.Tensor:
+    """CountSketch projection (sparse JL): y[b(i)] += s(i) * x[i], with t hashes per coordinate."""
+    if k & (k - 1) != 0:
+        raise ValueError("For best performance, k must be a power of two (e.g., 1024).")
+    if t < 1 or t > 4:
+        raise ValueError("In practice t in {1,2,4} is recommended for pure PyTorch performance.")
+
+    proj_by_device: dict[torch.device, torch.Tensor] = {}
+    base_by_device: dict[torch.device, torch.Tensor] = {}
+
+    seed32 = torch.tensor(_to_signed_int32(seed), dtype=torch.int32)
+    j_cpu = torch.tensor(
+        [
+            _to_signed_int32(0x9E3779B1),
+            _to_signed_int32(0x85EBCA6B),
+            _to_signed_int32(0xC2B2AE35),
+            _to_signed_int32(0x27D4EB2F),
+        ],
+        dtype=torch.int32,
+        device="cpu",
+    )
+
     offset = 0
 
-    seed_mix = _int_to_signed_int64(seed) ^ _SEED_XOR
+    with torch.no_grad():
+        for p in params:
+            grad = p.grad
+            n = p.numel()
+            if grad is None:
+                offset += n
+                continue
 
-    proj_device = None
-    device = None
-    dtype = None
-    warned = False
-
-    for p in params:
-        grad = p.grad
-        n = p.numel()
-        if grad is None:
-            offset += n
-            continue
-
-        g_flat = grad.detach().reshape(-1)
-        if proj_device is None or g_flat.device != device or g_flat.dtype != dtype:
-            if proj_device is not None:
-                proj_cpu += proj_device.detach().cpu().to(torch.float32)
+            g_flat = grad.detach().reshape(-1)
             device = g_flat.device
-            dtype = g_flat.dtype
-            proj_device = torch.zeros(k, device=device, dtype=dtype)
 
-        for start in range(0, n, chunk_size):
-            end = min(n, start + chunk_size)
-            m = end - start
-            g_chunk = g_flat[start:end]
+            if device not in proj_by_device:
+                proj_by_device[device] = torch.zeros(k, device=device, dtype=torch.float32)
+                base_by_device[device] = torch.arange(chunk_size, device=device, dtype=torch.int32)
 
-            idx = torch.arange(m, device=device, dtype=torch.int64) + (offset + start)
-            idx ^= seed_mix
+            proj_device = proj_by_device[device]
+            base = base_by_device[device]
+            j = j_cpu.to(device=device)
 
-            if not warned:
-                sign_bytes = int(k) * int(m) * int(g_chunk.element_size())
-                if g_chunk.is_cuda:
-                    try:
-                        dev_index = g_chunk.device.index
-                        if dev_index is None:
-                            dev_index = torch.cuda.current_device()
-                        total_mem = torch.cuda.get_device_properties(dev_index).total_memory
-                        if sign_bytes > 0.5 * total_mem:
-                            warnings.warn(
-                                f"Rademacher sign tensor is ~{sign_bytes / (1024**3):.2f} GiB "
-                                f"(k={k}, chunk_size={chunk_size}). Consider reducing k or chunk_size."
-                            )
-                            warned = True
-                    except Exception:
-                        if sign_bytes > 2 * 1024**3:
-                            warnings.warn(
-                                f"Rademacher sign tensor is ~{sign_bytes / (1024**3):.2f} GiB "
-                                f"(k={k}, chunk_size={chunk_size}). Consider reducing k or chunk_size."
-                            )
-                            warned = True
-                else:
-                    if sign_bytes > 2 * 1024**3:
-                        warnings.warn(
-                            f"Rademacher sign tensor is ~{sign_bytes / (1024**3):.2f} GiB "
-                            f"(k={k}, chunk_size={chunk_size}). Consider reducing k or chunk_size."
-                        )
-                        warned = True
+            for start in range(0, n, chunk_size):
+                end = min(n, start + chunk_size)
+                m = end - start
+                g_chunk = g_flat[start:end].to(torch.float32)
 
-            idx_row = idx.unsqueeze(0)
-            j = torch.arange(k, device=device, dtype=torch.int64).unsqueeze(1)
-            x = idx_row ^ (j * _J_CONST)
-            x = _mix64(x)
-            sign = torch.where((x & 1) == 0, 1.0, -1.0).to(dtype)
-            proj_device += (sign * g_chunk).sum(dim=1)
+                off32 = torch.tensor(_to_signed_int32(offset + start), dtype=torch.int32, device=device)
+                idx = base[:m] + off32
+                idx = idx ^ seed32
 
-        offset += n
+                for r in range(t):
+                    h = _mix32(idx ^ j[r])
+                    k_mask = torch.tensor(_to_signed_int32(k - 1), dtype=torch.int32, device=device)
+                    bucket = (h & k_mask).to(torch.int64)
+                    sign = (1.0 - 2.0 * ((h >> 31) & 1).to(torch.float32))
+                    proj_device.index_add_(0, bucket, sign * g_chunk)
 
-    if proj_device is not None:
-        proj_cpu += proj_device.detach().cpu().to(torch.float32)
+            offset += n
+
+    proj_cpu = torch.zeros(k, dtype=torch.float32, device="cpu")
+    for proj in proj_by_device.values():
+        proj_cpu += proj.detach().cpu()
 
     if scale:
-        proj_cpu /= k**0.5
+        proj_cpu /= (k**0.5) * (t**0.5)
     return proj_cpu
 
 
@@ -193,11 +181,13 @@ class FSDPGradProjectionWorker(ActorRolloutRefWorker):
                 raise ValueError("rademacher_k must be provided in DataProto.meta_info")
             seed = int(data.meta_info.get("rademacher_seed", 0))
             chunk_size = int(data.meta_info.get("rademacher_chunk_size", 1_000_000))
-            proj = _project_rademacher(
+            t = int(data.meta_info.get("countsketch_t", 2))
+            proj = _project_countsketch(
                 params=self.actor_module_fsdp.parameters(),
                 k=int(k),
                 seed=seed,
                 chunk_size=chunk_size,
+                t=t,
                 scale=True,
             )
             grad_norm = _grad_l2_norm(self.actor_module_fsdp.parameters())
@@ -206,11 +196,12 @@ class FSDPGradProjectionWorker(ActorRolloutRefWorker):
                 for p in self.actor_module_fsdp.parameters():
                     if p.grad is not None:
                         p.grad.detach().mul_(inv_norm)
-                proj_normalized = _project_rademacher(
+                proj_normalized = _project_countsketch(
                     params=self.actor_module_fsdp.parameters(),
                     k=int(k),
                     seed=seed,
                     chunk_size=chunk_size,
+                    t=t,
                     scale=True,
                 )
             else:
