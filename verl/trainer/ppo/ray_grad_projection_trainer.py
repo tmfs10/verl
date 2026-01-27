@@ -232,6 +232,7 @@ class RayGradProjectionTrainer(RayPPOTrainer):
                     }
                 )
 
+                print(f"Computing...")
                 output = self.actor_wg.update_actor(batch)
                 projection = output.batch["projection"][:original_len].cpu()
                 projection_normalized = output.batch["projection_normalized"][:original_len].cpu()

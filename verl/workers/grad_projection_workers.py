@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
+
 import torch
 
 from verl import DataProto
@@ -59,6 +61,7 @@ def _project_rademacher(params, k: int, seed: int, chunk_size: int, scale: bool 
     proj_device = None
     device = None
     dtype = None
+    warned = False
 
     for p in params:
         grad = p.grad
@@ -83,23 +86,41 @@ def _project_rademacher(params, k: int, seed: int, chunk_size: int, scale: bool 
             idx = torch.arange(m, device=device, dtype=torch.int64) + (offset + start)
             idx ^= seed_mix
 
-            bytes_per_grad = g_chunk.element_size()
-            per_elem_bytes = 8 + bytes_per_grad
-            target_bytes = 64 * 1024 * 1024
-            block_k = int(target_bytes // (per_elem_bytes * m))
-            if block_k < 1:
-                block_k = 1
-            if block_k > k:
-                block_k = k
+            if not warned:
+                sign_bytes = int(k) * int(m) * int(g_chunk.element_size())
+                if g_chunk.is_cuda:
+                    try:
+                        dev_index = g_chunk.device.index
+                        if dev_index is None:
+                            dev_index = torch.cuda.current_device()
+                        total_mem = torch.cuda.get_device_properties(dev_index).total_memory
+                        if sign_bytes > 0.5 * total_mem:
+                            warnings.warn(
+                                f"Rademacher sign tensor is ~{sign_bytes / (1024**3):.2f} GiB "
+                                f"(k={k}, chunk_size={chunk_size}). Consider reducing k or chunk_size."
+                            )
+                            warned = True
+                    except Exception:
+                        if sign_bytes > 2 * 1024**3:
+                            warnings.warn(
+                                f"Rademacher sign tensor is ~{sign_bytes / (1024**3):.2f} GiB "
+                                f"(k={k}, chunk_size={chunk_size}). Consider reducing k or chunk_size."
+                            )
+                            warned = True
+                else:
+                    if sign_bytes > 2 * 1024**3:
+                        warnings.warn(
+                            f"Rademacher sign tensor is ~{sign_bytes / (1024**3):.2f} GiB "
+                            f"(k={k}, chunk_size={chunk_size}). Consider reducing k or chunk_size."
+                        )
+                        warned = True
 
             idx_row = idx.unsqueeze(0)
-            for j0 in range(0, k, block_k):
-                j1 = min(k, j0 + block_k)
-                j = torch.arange(j0, j1, device=device, dtype=torch.int64).unsqueeze(1)
-                x = idx_row ^ (j * _J_CONST)
-                x = _mix64(x)
-                sign = torch.where((x & 1) == 0, 1.0, -1.0).to(dtype)
-                proj_device[j0:j1] += (sign * g_chunk).sum(dim=1)
+            j = torch.arange(k, device=device, dtype=torch.int64).unsqueeze(1)
+            x = idx_row ^ (j * _J_CONST)
+            x = _mix64(x)
+            sign = torch.where((x & 1) == 0, 1.0, -1.0).to(dtype)
+            proj_device += (sign * g_chunk).sum(dim=1)
 
         offset += n
 
@@ -181,7 +202,17 @@ class FSDPGradProjectionWorker(ActorRolloutRefWorker):
             )
             grad_norm = _grad_l2_norm(self.actor_module_fsdp.parameters())
             if grad_norm > 0.0:
-                proj_normalized = proj / grad_norm
+                inv_norm = 1.0 / grad_norm
+                for p in self.actor_module_fsdp.parameters():
+                    if p.grad is not None:
+                        p.grad.detach().mul_(inv_norm)
+                proj_normalized = _project_rademacher(
+                    params=self.actor_module_fsdp.parameters(),
+                    k=int(k),
+                    seed=seed,
+                    chunk_size=chunk_size,
+                    scale=True,
+                )
             else:
                 proj_normalized = torch.zeros_like(proj)
 
