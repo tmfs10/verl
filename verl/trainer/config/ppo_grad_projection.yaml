@@ -143,6 +143,9 @@ trainer:
   # Number of Rademacher projection dimensions
   rademacher_k: 1024
 
+  # Whether to use CountSketch (sparse JL) for gradient projection; if False uses dense JL via Trak fast_jl
+  rademacher_countsketch: false
+
   # Flush projections to disk every N elements (0 = save only at end)
   rademacher_flush_every: 0
 

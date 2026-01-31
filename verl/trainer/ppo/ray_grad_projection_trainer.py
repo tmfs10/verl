@@ -229,6 +229,7 @@ class RayGradProjectionTrainer(RayPPOTrainer):
                         "rademacher_k": rademacher_k,
                         "rademacher_seed": self.config.trainer.get("rademacher_seed", 0),
                         "rademacher_chunk_size": self.config.trainer.get("rademacher_chunk_size", 1_000_000),
+                        "rademacher_countsketch": self.config.trainer.get("rademacher_countsketch", False),
                         "countsketch_t": self.config.trainer.get("countsketch_t", 2),
                     }
                 )
@@ -279,7 +280,8 @@ class RayGradProjectionTrainer(RayPPOTrainer):
                     "rademacher_k": rademacher_k,
                     "rademacher_seed": self.config.trainer.get("rademacher_seed", 0),
                     "rademacher_chunk_size": self.config.trainer.get("rademacher_chunk_size", 1_000_000),
-                        "countsketch_t": self.config.trainer.get("countsketch_t", 2),
+                    "rademacher_countsketch": self.config.trainer.get("rademacher_countsketch", False),
+                    "countsketch_t": self.config.trainer.get("countsketch_t", 2),
                 }
             )
 

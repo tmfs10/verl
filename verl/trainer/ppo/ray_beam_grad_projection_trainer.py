@@ -286,6 +286,8 @@ class RayBeamGradProjectionTrainer(RayPPOTrainer):
                 "rademacher_k": self.rademacher_k,
                 "rademacher_seed": self.rademacher_seed,
                 "rademacher_chunk_size": self.rademacher_chunk_size,
+                "rademacher_countsketch": self.config.trainer.get("rademacher_countsketch", False),
+                "countsketch_t": self.config.trainer.get("countsketch_t", 2),
             }
         )
 

@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+import sys
+
 import torch
 
 from verl import DataProto
@@ -120,6 +123,105 @@ def _project_countsketch(
     return proj_cpu
 
 
+def _load_trak_cuda_projector():
+    try:
+        from trak.projectors import CudaProjector, ProjectionType
+    except ModuleNotFoundError as exc:
+        trak_root = Path("/trak")
+        fast_jl_root = trak_root / "fast_jl"
+        if not trak_root.exists():
+            raise ModuleNotFoundError(
+                f"Trak repo not found at {trak_root}."
+            ) from exc
+        sys.path.append(str(trak_root))
+        if fast_jl_root.exists():
+            sys.path.append(str(fast_jl_root))
+        from trak.projectors import CudaProjector, ProjectionType  # noqa: PLC0415
+    return CudaProjector, ProjectionType
+
+
+def _project_dense_jl_fast(
+    params,
+    k: int,
+    seed: int,
+    chunk_size: int,
+    scale: bool = True,
+) -> torch.Tensor:
+    params = list(params)
+    if chunk_size <= 0:
+        raise ValueError("rademacher_chunk_size must be > 0 for dense JL projection")
+
+    first_grad = None
+    for p in params:
+        grad = p.grad
+        if grad is not None:
+            first_grad = grad
+            break
+
+    if first_grad is None:
+        return torch.zeros(k, dtype=torch.float32, device="cpu")
+
+    device = first_grad.device
+    if device.type != "cuda":
+        raise ValueError("Dense JL projection via Trak CudaProjector requires CUDA gradients")
+
+    CudaProjector, ProjectionType = _load_trak_cuda_projector()
+
+    proj_dtype = first_grad.dtype
+    if proj_dtype not in (torch.float16, torch.float32):
+        proj_dtype = torch.float32
+
+    projector = CudaProjector(
+        grad_dim=chunk_size,
+        proj_dim=k,
+        seed=seed,
+        proj_type=ProjectionType.rademacher,
+        device=device,
+        max_batch_size=32,
+    )
+
+    proj_device = torch.zeros(k, device=device, dtype=torch.float32)
+    chunk_buf = torch.zeros((1, chunk_size), device=device, dtype=proj_dtype)
+    filled = 0
+    chunk_idx = 0
+
+    with torch.no_grad():
+        for p in params:
+            grad = p.grad
+            if grad is None:
+                continue
+            if grad.device != device:
+                raise ValueError("Dense JL projection expects all gradients on the same CUDA device")
+
+            g_flat = grad.detach().reshape(-1)
+            if g_flat.dtype != proj_dtype:
+                g_flat = g_flat.to(proj_dtype)
+
+            offset = 0
+            while offset < g_flat.numel():
+                remaining = chunk_size - filled
+                take = min(remaining, g_flat.numel() - offset)
+                chunk_buf[0, filled : filled + take].copy_(g_flat[offset : offset + take])
+                filled += take
+                offset += take
+
+                if filled == chunk_size:
+                    proj_device.add_(projector.project(chunk_buf, model_id=chunk_idx).squeeze(0))
+                    chunk_idx += 1
+                    filled = 0
+                    chunk_buf.zero_()
+
+        if filled > 0:
+            if filled < chunk_size:
+                chunk_buf[0, filled:].zero_()
+            proj_device.add_(projector.project(chunk_buf, model_id=chunk_idx).squeeze(0))
+
+    proj_cpu = proj_device.detach().cpu()
+    if scale:
+        proj_cpu /= k**0.5
+    return proj_cpu
+
+
 def _grad_l2_norm(params) -> float:
     total_sq = 0.0
     for p in params:
@@ -181,22 +283,10 @@ class FSDPGradProjectionWorker(ActorRolloutRefWorker):
                 raise ValueError("rademacher_k must be provided in DataProto.meta_info")
             seed = int(data.meta_info.get("rademacher_seed", 0))
             chunk_size = int(data.meta_info.get("rademacher_chunk_size", 1_000_000))
-            t = int(data.meta_info.get("countsketch_t", 2))
-            proj = _project_countsketch(
-                params=self.actor_module_fsdp.parameters(),
-                k=int(k),
-                seed=seed,
-                chunk_size=chunk_size,
-                t=t,
-                scale=True,
-            )
-            grad_norm = _grad_l2_norm(self.actor_module_fsdp.parameters())
-            if grad_norm > 0.0:
-                inv_norm = 1.0 / grad_norm
-                for p in self.actor_module_fsdp.parameters():
-                    if p.grad is not None:
-                        p.grad.detach().mul_(inv_norm)
-                proj_normalized = _project_countsketch(
+            use_countsketch = bool(data.meta_info.get("rademacher_countsketch", False))
+            if use_countsketch:
+                t = int(data.meta_info.get("countsketch_t", 2))
+                proj = _project_countsketch(
                     params=self.actor_module_fsdp.parameters(),
                     k=int(k),
                     seed=seed,
@@ -204,6 +294,37 @@ class FSDPGradProjectionWorker(ActorRolloutRefWorker):
                     t=t,
                     scale=True,
                 )
+            else:
+                proj = _project_dense_jl_fast(
+                    params=self.actor_module_fsdp.parameters(),
+                    k=int(k),
+                    seed=seed,
+                    chunk_size=chunk_size,
+                    scale=True,
+                )
+            grad_norm = _grad_l2_norm(self.actor_module_fsdp.parameters())
+            if grad_norm > 0.0:
+                inv_norm = 1.0 / grad_norm
+                for p in self.actor_module_fsdp.parameters():
+                    if p.grad is not None:
+                        p.grad.detach().mul_(inv_norm)
+                if use_countsketch:
+                    proj_normalized = _project_countsketch(
+                        params=self.actor_module_fsdp.parameters(),
+                        k=int(k),
+                        seed=seed,
+                        chunk_size=chunk_size,
+                        t=t,
+                        scale=True,
+                    )
+                else:
+                    proj_normalized = _project_dense_jl_fast(
+                        params=self.actor_module_fsdp.parameters(),
+                        k=int(k),
+                        seed=seed,
+                        chunk_size=chunk_size,
+                        scale=True,
+                    )
             else:
                 proj_normalized = torch.zeros_like(proj)
 
