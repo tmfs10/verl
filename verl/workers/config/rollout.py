@@ -226,8 +226,6 @@ class RolloutConfig(BaseConfig):
     layered_summon: bool = False
 
     layer_name_map: dict = field(default_factory=dict)
-
-<<<<<<< HEAD
     sglang_engine_mode: str = "local"
 
     limit_images: Optional[int] = None
