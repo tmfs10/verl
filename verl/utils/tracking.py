@@ -83,6 +83,7 @@ class Tracking:
                 wandb_id = config.get("wandb_id", None)
             if wandb_id is None and config is not None and config.get("trainer", None) is not None:
                 wandb_id = config["trainer"].get("wandb_id", None)
+            assert wandb_id is not None, "wandb_id is required"
             wandb.init(
                 project=project_name,
                 name=experiment_name,
