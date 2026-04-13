@@ -135,11 +135,11 @@ trainer:
   # Number of generations to log during validation
   log_val_generations: 0
 
-  # Directory for logging rollout data; no dump if null
-  rollout_data_dir: null
+  # Directory for logging rollout data
+  rollout_data_dir: ${trainer.default_local_dir}/rollout_data
 
-  # Directory for logging validation data; no dump if null
-  validation_data_dir: null
+  # Directory for logging validation data
+  validation_data_dir: ${trainer.default_local_dir}/validation_data
 
   # Number of nodes used in the training
   nnodes: 1
@@ -149,6 +149,13 @@ trainer:
 
   # Save frequency (by iteration) for model checkpoints
   save_freq: -1
+
+  # Optional timeout deadline in DD:HH:MM:SS from trainer start. If unset, SLURM jobs will
+  # automatically use SLURM_JOB_END_TIME when available.
+  checkpoint_must_save_by: null
+
+  # Estimated checkpoint save duration in seconds for deadline-based checkpoint triggering.
+  checkpoint_save_duration: 60
 
   # ESI refers to the elastic server instance used during training, similar to the training plan. For example,
   # if you purchase 10 hours of computing power, the ESI will automatically shut down after 10 hours of training.

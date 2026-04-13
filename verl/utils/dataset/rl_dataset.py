@@ -15,15 +15,17 @@
 # limitations under the License.
 
 import copy
+import hashlib
 import logging
 import os
 import json
+import math
 import pandas as pd
 import re
 import traceback
 from collections import defaultdict
 from io import BytesIO
-from typing import Optional
+from typing import Optional, Any
 
 import datasets
 import numpy as np
@@ -123,6 +125,28 @@ class RLHFDataset(Dataset):
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        self.solution_key = config.get("solution_key", "ground_truth_answer")
+        self.dynamic_masked_solution = bool(config.get("dynamic_masked_solution", True))
+        self.min_masked_fraction = config.get("min_masked_fraction", None)
+        self.max_masked_fraction = config.get("max_masked_fraction", None)
+        self.mask_seed = config.get("mask_seed", None)
+        self.masked_solution_token = config.get("masked_solution_token", "<|fim_middle|>")
+        self.masked_solution_placeholders = tuple(
+            config.get("masked_solution_placeholders", ["{solution}", "{masked_solution}"])
+        )
+        self.masked_solution_selection_mode = config.get("masked_solution_selection_mode", "random_fraction")
+        if self.masked_solution_selection_mode not in {"random_fraction", "reward_focus_tail"}:
+            raise ValueError(
+                f"masked_solution_selection_mode must be one of "
+                f"['random_fraction', 'reward_focus_tail'], got {self.masked_solution_selection_mode!r}"
+            )
+        self.masked_solution_focus_tail_percent = config.get("masked_solution_focus_tail_percent", None)
+        masked_solution_focus_min_tokens = config.get("masked_solution_focus_min_tokens", 1)
+        self.masked_solution_focus_min_tokens = (
+            1 if masked_solution_focus_min_tokens is None else int(masked_solution_focus_min_tokens)
+        )
+        self._masked_solution_positions_cache: dict[str, tuple[int, ...]] = {}
+        self.masked_solution_token_id = self._resolve_masked_solution_token_id(self.masked_solution_token)
 
         self.tool_config_path = config.get("tool_config_path", None)
         self.tool_schemas = None
@@ -253,7 +277,9 @@ class RLHFDataset(Dataset):
 
                 def doc2len(doc) -> int:
                     try:
-                        messages = self._build_messages(doc)
+                        prepared_doc = dict(doc)
+                        prepared_doc[prompt_key] = self._prepare_prompt_messages(doc)
+                        messages = self._build_messages(prepared_doc)
                         # pass tool schemas if available so the processor can format prompts
                         apply_kwargs = dict(**self.apply_chat_template_kwargs)
                         if self.tool_schemas is not None:
@@ -310,7 +336,7 @@ class RLHFDataset(Dataset):
                         apply_kwargs.pop("return_tensors", None)
 
                         tokenized_prompt = tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True, tokenize=True, **apply_kwargs
+                            self._prepare_prompt_messages(doc), add_generation_prompt=True, tokenize=True, **apply_kwargs
                         )
                         return len(normalize_token_ids(tokenized_prompt))
                     except Exception:
@@ -405,10 +431,370 @@ class RLHFDataset(Dataset):
         assert video_offset == len(videos), f"video_offset {video_offset} != len(videos) {len(videos)}"
         return messages
 
+    def _sample_mask_seed(self, example: dict, item: Optional[int] = None) -> Optional[int]:
+        if self.mask_seed is None:
+            return None
+
+        extra_info = example.get("extra_info", {})
+        if isinstance(extra_info, str):
+            try:
+                extra_info = json.loads(extra_info)
+            except Exception:
+                extra_info = {}
+        elif not isinstance(extra_info, dict):
+            extra_info = {}
+
+        sample_key = extra_info.get("line_number", extra_info.get("index", item))
+        seed_material = f"{self.mask_seed}:{sample_key}"
+        digest = hashlib.sha256(seed_material.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], byteorder="big", signed=False)
+
+    def _resolve_masked_solution_token_id(self, token_text: str) -> int:
+        token_ids = self.tokenizer.encode(token_text, add_special_tokens=False)
+        if len(token_ids) != 1:
+            raise ValueError(
+                f"masked_solution_token {token_text!r} must map to exactly one tokenizer token, got ids {token_ids}"
+            )
+        token_id = int(token_ids[0])
+        resolved_token = self.tokenizer.convert_ids_to_tokens([token_id])[0]
+        if resolved_token != token_text:
+            raise ValueError(
+                f"masked_solution_token {token_text!r} does not round-trip to a single tokenizer token. "
+                f"Resolved token is {resolved_token!r} for id {token_id}."
+            )
+        return token_id
+
+    def _mask_cache_key(self, example: dict, item: Optional[int] = None) -> str:
+        extra_info = example.get("extra_info", {})
+        if isinstance(extra_info, str):
+            try:
+                extra_info = json.loads(extra_info)
+            except Exception:
+                extra_info = {}
+        elif not isinstance(extra_info, dict):
+            extra_info = {}
+
+        sample_key = extra_info.get("line_number", extra_info.get("index", item))
+        return str(sample_key)
+
+    def _has_masked_solution_placeholders(self, example: dict) -> bool:
+        messages = example.get(self.prompt_key, [])
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            if any(placeholder in content for placeholder in self.masked_solution_placeholders):
+                return True
+        return False
+
+    @staticmethod
+    def _masked_solution_sentinel(item: Optional[int] = None) -> str:
+        return f"<<VERL_MASKED_SOLUTION_{item if item is not None else 'sample'}>>"
+
+    def _build_prompt_template_with_sentinel(
+        self,
+        example: dict,
+        *,
+        item: Optional[int] = None,
+    ) -> tuple[str, str, int]:
+        solution_text = example.get(self.solution_key, None)
+        if not isinstance(solution_text, str) or not solution_text:
+            raise ValueError(f"Expected non-empty {self.solution_key!r} to build masked-solution prompt.")
+
+        messages = copy.deepcopy(example[self.prompt_key])
+        sentinel = self._masked_solution_sentinel(item)
+
+        placeholder_hits = 0
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            if sentinel in content or sentinel in solution_text:
+                raise ValueError(f"Sentinel collision detected for prompt masking: {sentinel!r}")
+            for placeholder in self.masked_solution_placeholders:
+                count = content.count(placeholder)
+                if count:
+                    content = content.replace(placeholder, sentinel)
+                    placeholder_hits += count
+            message["content"] = content
+
+        if placeholder_hits == 0:
+            raise ValueError("No masked-solution placeholders found in prompt template.")
+
+        apply_kwargs = dict(**self.apply_chat_template_kwargs)
+        if self.tool_schemas is not None:
+            apply_kwargs["tools"] = self.tool_schemas
+        apply_kwargs.pop("tokenize", None)
+        apply_kwargs.pop("return_dict", None)
+        apply_kwargs.pop("return_tensors", None)
+
+        prompt_template = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,
+            **apply_kwargs,
+        )
+        return prompt_template, solution_text, placeholder_hits
+
+    def _get_masked_solution_positions(self, example: dict, item: Optional[int] = None) -> set[int]:
+        solution_text = example.get(self.solution_key, None)
+        if (
+            not isinstance(solution_text, str)
+            or not solution_text
+            or not self.dynamic_masked_solution
+            or not self.masked_solution_placeholders
+            or not self._has_masked_solution_placeholders(example)
+        ):
+            return set()
+
+        if self.masked_solution_selection_mode == "reward_focus_tail":
+            provided_positions = example.get("masked_solution_focus_token_indices", None)
+            if provided_positions is None:
+                return set()
+            return {int(pos) for pos in provided_positions}
+
+        cache_key = self._mask_cache_key(example, item)
+        if cache_key in self._masked_solution_positions_cache:
+            return set(self._masked_solution_positions_cache[cache_key])
+
+        solution_token_ids = self.tokenizer.encode(solution_text, add_special_tokens=False)
+        if not solution_token_ids:
+            self._masked_solution_positions_cache[cache_key] = tuple()
+            return set()
+
+        positions = self._sample_masked_token_positions(
+            len(solution_token_ids),
+            seed=self._sample_mask_seed(example, item),
+        )
+
+        normalized_positions = tuple(sorted(int(pos) for pos in positions))
+        self._masked_solution_positions_cache[cache_key] = normalized_positions
+        return set(normalized_positions)
+
+    def _build_masked_solution_text(self, solution_text: str, *, seed: Optional[int]) -> str:
+        if not self.dynamic_masked_solution or not isinstance(solution_text, str) or not solution_text:
+            return solution_text
+        if self.masked_solution_selection_mode == "reward_focus_tail":
+            raise ValueError("_build_masked_solution_text requires example-aware mask positions in reward_focus_tail mode.")
+        if self.min_masked_fraction is None or self.max_masked_fraction is None:
+            return solution_text
+
+        solution_token_ids = self.tokenizer.encode(solution_text, add_special_tokens=False)
+        if not solution_token_ids:
+            return solution_text
+
+        low = float(self.min_masked_fraction)
+        high = float(self.max_masked_fraction)
+        if high < low:
+            low, high = high, low
+        low = min(max(low, 0.0), 1.0)
+        high = min(max(high, 0.0), 1.0)
+
+        rng = np.random.default_rng(seed)
+        mask_fraction = float(rng.uniform(low, high))
+        if mask_fraction <= 0.0:
+            return solution_text
+
+        token_count = len(solution_token_ids)
+        mask_count = min(token_count, max(1, int(math.ceil(token_count * mask_fraction))))
+        masked_positions = set(rng.choice(token_count, size=mask_count, replace=False).tolist())
+        masked_token_ids = [
+            self.masked_solution_token_id if idx in masked_positions else token_id
+            for idx, token_id in enumerate(solution_token_ids)
+        ]
+        return self.tokenizer.decode(
+            masked_token_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+
+    def _sample_masked_token_positions(
+        self,
+        num_solution_tokens: int,
+        *,
+        seed: Optional[int],
+    ) -> set[int]:
+        if num_solution_tokens <= 0:
+            return set()
+
+        if self.min_masked_fraction is None or self.max_masked_fraction is None:
+            return set()
+
+        low = float(self.min_masked_fraction)
+        high = float(self.max_masked_fraction)
+        if high < low:
+            low, high = high, low
+        low = min(max(low, 0.0), 1.0)
+        high = min(max(high, 0.0), 1.0)
+
+        rng = np.random.default_rng(seed)
+        mask_fraction = float(rng.uniform(low, high))
+        if mask_fraction <= 0.0:
+            return set()
+
+        mask_count = min(num_solution_tokens, max(1, int(math.ceil(num_solution_tokens * mask_fraction))))
+        return set(rng.choice(num_solution_tokens, size=mask_count, replace=False).tolist())
+
+    def _build_prompt_ids_override(
+        self,
+        example: dict,
+        item: Optional[int] = None,
+        *,
+        masked_positions: Optional[set[int]] = None,
+    ) -> Optional[list[int]]:
+        if (
+            self.processor is not None
+            or not self.dynamic_masked_solution
+            or not self.masked_solution_placeholders
+            or not self._has_masked_solution_placeholders(example)
+        ):
+            return None
+
+        solution_text = example.get(self.solution_key, None)
+        if not isinstance(solution_text, str) or not solution_text:
+            return None
+        prompt_template, _, placeholder_hits = self._build_prompt_template_with_sentinel(example, item=item)
+        sentinel = self._masked_solution_sentinel(item)
+        template_parts = prompt_template.split(sentinel)
+        if len(template_parts) != placeholder_hits + 1:
+            raise ValueError(
+                f"Expected {placeholder_hits} masked-solution placeholder(s), found {len(template_parts) - 1} in prompt template."
+            )
+
+        full_prompt_parts: list[str] = []
+        solution_spans: list[tuple[int, int]] = []
+        cursor = 0
+        for part_idx, part in enumerate(template_parts):
+            full_prompt_parts.append(part)
+            cursor += len(part)
+            if part_idx < len(template_parts) - 1:
+                start = cursor
+                end = start + len(solution_text)
+                solution_spans.append((start, end))
+                full_prompt_parts.append(solution_text)
+                cursor = end
+        full_prompt_text = "".join(full_prompt_parts)
+
+        if not getattr(self.tokenizer, "is_fast", False):
+            raise ValueError("Dynamic token-level masked-solution prompts require a fast tokenizer with offsets.")
+
+        tokenized = self.tokenizer(
+            full_prompt_text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        prompt_ids = normalize_token_ids(tokenized["input_ids"])
+        offset_mapping = tokenized["offset_mapping"]
+
+        solution_token_positions_by_span: list[list[int]] = []
+        for span_start, span_end in solution_spans:
+            span_positions: list[int] = []
+            for token_idx, (start, end) in enumerate(offset_mapping):
+                if start == end:
+                    continue
+                if start < span_end and end > span_start:
+                    span_positions.append(token_idx)
+            solution_token_positions_by_span.append(span_positions)
+
+        if not solution_token_positions_by_span or not all(solution_token_positions_by_span):
+            raise ValueError("Failed to locate any solution tokens inside the chat-templated prompt.")
+
+        masked_positions_within_solution = (
+            set(masked_positions) if masked_positions is not None else self._get_masked_solution_positions(example, item=item)
+        )
+        if not masked_positions_within_solution:
+            return prompt_ids
+
+        prompt_ids = list(prompt_ids)
+        for span_positions in solution_token_positions_by_span:
+            if max(masked_positions_within_solution) >= len(span_positions):
+                raise ValueError(
+                    "Masked solution positions exceed the tokenized solution span length in the chat-templated prompt."
+                )
+            for rel_idx in masked_positions_within_solution:
+                prompt_ids[span_positions[rel_idx]] = self.masked_solution_token_id
+        return prompt_ids
+
+    def _prepare_prompt_messages(
+        self,
+        example: dict,
+        item: Optional[int] = None,
+        *,
+        masked_positions: Optional[set[int]] = None,
+    ):
+        messages = copy.deepcopy(example[self.prompt_key])
+        if (
+            not self.dynamic_masked_solution
+            or not self.masked_solution_placeholders
+            or not self._has_masked_solution_placeholders(example)
+        ):
+            return messages
+
+        solution_text = example.get(self.solution_key, None)
+        if not isinstance(solution_text, str) or not solution_text:
+            return messages
+
+        solution_token_ids = self.tokenizer.encode(solution_text, add_special_tokens=False)
+        masked_positions = (
+            set(masked_positions) if masked_positions is not None else self._get_masked_solution_positions(example, item=item)
+        )
+        if masked_positions:
+            masked_token_ids = [
+                self.masked_solution_token_id if idx in masked_positions else token_id
+                for idx, token_id in enumerate(solution_token_ids)
+            ]
+            masked_solution = self.tokenizer.decode(
+                masked_token_ids,
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False,
+            )
+        else:
+            if self.masked_solution_selection_mode == "reward_focus_tail":
+                # In reward_focus_tail mode, prompt masking is injected later by the trainer after it
+                # computes focus positions from the live actor. Dataset-time prompt-length filtering
+                # still needs a concrete prompt, so use the unmasked solution text here.
+                masked_solution = solution_text
+            else:
+                masked_solution = self._build_masked_solution_text(
+                    solution_text, seed=self._sample_mask_seed(example, item)
+                )
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            for placeholder in self.masked_solution_placeholders:
+                content = content.replace(placeholder, masked_solution)
+            message["content"] = content
+        return messages
+
+    def materialize_masked_solution_prompt(
+        self,
+        example: dict,
+        *,
+        masked_positions: set[int],
+        item: Optional[int] = None,
+    ) -> tuple[list[dict], Optional[list[int]]]:
+        normalized_positions = {int(pos) for pos in masked_positions}
+        prepared_messages = self._prepare_prompt_messages(example, item=item, masked_positions=normalized_positions)
+        prompt_ids_override = self._build_prompt_ids_override(
+            example,
+            item=item,
+            masked_positions=normalized_positions,
+        )
+        return prepared_messages, prompt_ids_override
+
     def __getitem__(self, item):
         """For rollout, apply_chat_template has been moved to AgentLoop, so we only return raw_prompt here."""
         row_dict: dict = self.dataframe[item]
-        row_dict["raw_prompt"] = self._build_messages(row_dict)
+        if self.masked_solution_selection_mode == "reward_focus_tail":
+            row_dict["raw_prompt"] = self._build_messages(row_dict)
+        else:
+            masked_solution_positions = self._get_masked_solution_positions(row_dict, item=item)
+            prompt_ids_override = self._build_prompt_ids_override(row_dict, item=item)
+            row_dict[self.prompt_key] = self._prepare_prompt_messages(row_dict, item=item)
+            row_dict["raw_prompt"] = self._build_messages(row_dict)
+            if prompt_ids_override is not None:
+                row_dict["prompt_ids_override"] = prompt_ids_override
 
         # TODO(wuxibin): We still need a dummy tensor to make sure DataProto.batch is not empty.
         # Remove this after deprecate DataProto by TensorDict.
@@ -426,6 +812,8 @@ class RLHFDataset(Dataset):
         row_dict["index"] = index
         row_dict["tools_kwargs"] = tools_kwargs
         row_dict["interaction_kwargs"] = interaction_kwargs
+        if self.apply_chat_template_kwargs:
+            row_dict["chat_template_kwargs"] = copy.deepcopy(dict(self.apply_chat_template_kwargs))
         return row_dict
 
     @classmethod

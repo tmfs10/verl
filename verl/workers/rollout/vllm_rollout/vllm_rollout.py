@@ -106,6 +106,19 @@ class ServerAdapter(BaseRollout):
                 ">= 25.3.rc1 and CANN toolkit version >= 8.3.RC1)"
             )
 
+    def _server_actor_name_candidates(self) -> list[str]:
+        base_names = [
+            f"vllm_server_{self.replica_rank}_{self.node_rank}",
+            f"vllm_server_reward_{self.replica_rank}_{self.node_rank}",
+        ]
+        candidates: list[str] = []
+        max_retry_suffix = 2
+        for base_name in base_names:
+            candidates.append(base_name)
+            for retry_idx in range(max_retry_suffix, 0, -1):
+                candidates.append(f"{base_name}_retry{retry_idx}")
+        return candidates
+
     async def _execute_method(
         self,
         method: str,
@@ -131,7 +144,19 @@ class ServerAdapter(BaseRollout):
 
         # Lazy init http server adapter because http server is launched after hybrid engine.
         if self.server_handle is None:
-            self.server_handle = ray.get_actor(f"vllm_server_{self.replica_rank}_{self.node_rank}")
+            lookup_errors: list[str] = []
+            for actor_name in self._server_actor_name_candidates():
+                try:
+                    self.server_handle = ray.get_actor(actor_name)
+                    logger.info("Attached vLLM server handle via named actor lookup: %s", actor_name)
+                    break
+                except ValueError as exc:
+                    lookup_errors.append(f"{actor_name}: {exc}")
+            if self.server_handle is None:
+                raise ValueError(
+                    "Failed to attach vLLM server handle. Tried named actors: "
+                    + "; ".join(lookup_errors)
+                )
 
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future

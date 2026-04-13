@@ -182,6 +182,9 @@ class ActorConfig(BaseConfig):
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
     use_fused_kernels: bool = False
+    opsd_teacher_model: str = "actor"
+    opsd_teacher_ema_rate: float = 0.05
+    opsd_teacher_ema_cpu_offload: bool = True
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     engine: BaseConfig = field(default_factory=BaseConfig)
     rollout_n: int = MISSING  # must be override by sampling config
@@ -219,6 +222,17 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+
+        valid_opsd_teacher_models = {"actor", "ema", "fixed"}
+        if self.opsd_teacher_model not in valid_opsd_teacher_models:
+            raise ValueError(
+                f"Invalid opsd_teacher_model: {self.opsd_teacher_model}. "
+                f"Must be one of {sorted(valid_opsd_teacher_models)}"
+            )
+        if not 0.0 <= self.opsd_teacher_ema_rate <= 1.0:
+            raise ValueError(
+                f"opsd_teacher_ema_rate must be in [0, 1], got {self.opsd_teacher_ema_rate}"
+            )
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

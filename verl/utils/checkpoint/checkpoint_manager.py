@@ -15,6 +15,7 @@
 import os
 import random
 import shutil
+import time
 
 import numpy as np
 import torch
@@ -232,6 +233,59 @@ def get_checkpoint_tracker_filename(root_path: str):
     Tracker file rescords the latest chckpoint during training to restart from.
     """
     return os.path.join(root_path, "latest_checkpointed_iteration.txt")
+
+
+def convert_timeout_to_seconds(timeout: str) -> int:
+    """Convert a timeout string in DD:HH:MM:SS format to seconds."""
+    days, hours, minutes, seconds = map(int, timeout.split(":"))
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def _resolve_timeout_deadline(
+    *,
+    checkpoint_must_save_by: str | None = None,
+    start_time: float | None = None,
+) -> float | None:
+    """Resolve an absolute timeout deadline from an explicit duration or SLURM env."""
+    if checkpoint_must_save_by is not None and start_time is not None:
+        return float(start_time) + convert_timeout_to_seconds(checkpoint_must_save_by)
+
+    slurm_end_time = os.getenv("SLURM_JOB_END_TIME")
+    if slurm_end_time:
+        try:
+            return float(slurm_end_time)
+        except ValueError:
+            pass
+
+    return None
+
+
+def should_save_ckpt_timeout(
+    *,
+    max_steps_duration: float,
+    save_ckpt_duration: float = 60,
+    redundant_time: float = 0,
+    checkpoint_must_save_by: str | None = None,
+    start_time: float | None = None,
+) -> bool:
+    """Determine if a checkpoint should be saved before the current job deadline.
+
+    The deadline is resolved in this order:
+    1. `checkpoint_must_save_by`, interpreted as a DD:HH:MM:SS duration from `start_time`
+    2. `SLURM_JOB_END_TIME` if present
+    """
+    deadline = _resolve_timeout_deadline(
+        checkpoint_must_save_by=checkpoint_must_save_by,
+        start_time=start_time,
+    )
+    if deadline is None:
+        return False
+
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        return False
+
+    return remaining <= save_ckpt_duration + max(max_steps_duration, 0) + redundant_time
 
 
 def should_save_ckpt_esi(max_steps_duration: float, save_ckpt_duration: float = 60, redundant_time: float = 0) -> bool:

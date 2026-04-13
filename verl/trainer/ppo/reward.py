@@ -13,9 +13,11 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
 import inspect
 import multiprocessing
 import warnings
+from collections import defaultdict
 from functools import partial
 from typing import TYPE_CHECKING, Any, Optional, cast
 
@@ -132,7 +134,12 @@ def load_reward_manager(config: DictConfig, tokenizer: Any, **reward_kwargs: Any
     if reward_manager_cfg.source == "register":
         from verl.experimental.reward_loop.reward_manager import get_reward_manager_cls
 
-        reward_manager_cls = get_reward_manager_cls(reward_manager_cfg.name)
+        try:
+            reward_manager_cls = get_reward_manager_cls(reward_manager_cfg.name)
+        except ValueError:
+            from verl.workers.reward_manager.registry import get_reward_manager_cls as get_legacy_reward_manager_cls
+
+            reward_manager_cls = get_legacy_reward_manager_cls(reward_manager_cfg.name)
     elif reward_manager_cfg.source == "importlib":
         from verl.utils.import_utils import load_extern_object
 
@@ -163,13 +170,26 @@ def load_reward_manager(config: DictConfig, tokenizer: Any, **reward_kwargs: Any
         else:
             final_compute_score = default_compute_score
 
+    init_kwargs = dict(reward_kwargs)
+    try:
+        init_sig = inspect.signature(reward_manager_cls.__init__)
+    except (TypeError, ValueError):
+        init_sig = None
+
+    if init_sig is not None and "num_examine" in init_sig.parameters and "num_examine" not in init_kwargs:
+        init_kwargs["num_examine"] = 0
+
+    ctor_kwargs = {
+        "config": config,
+        "tokenizer": tokenizer,
+        "compute_score": final_compute_score,
+        **init_kwargs,
+    }
+    if init_sig is not None:
+        ctor_kwargs = _select_kwargs_for_callable(reward_manager_cls.__init__, ctor_kwargs)
+
     # Instantiate and return the reward manager with the specified parameters
-    return reward_manager_cls(
-        config=config,
-        tokenizer=tokenizer,
-        compute_score=final_compute_score,
-        **reward_kwargs,
-    )
+    return reward_manager_cls(**ctor_kwargs)
 
 def extract_reward(batch: DataProto):
     """
@@ -181,10 +201,45 @@ def extract_reward(batch: DataProto):
     return reward_tensor, reward_extra_infos_dict
 
 
+def _compute_reward_via_run_single(data: DataProto, reward_fn: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Compatibility path for experimental reward managers without __call__."""
+    if "rm_scores" in data.batch.keys():
+        reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
+        reward_extra_info = {key: data.non_tensor_batch[key] for key in reward_extra_keys}
+        return data.batch["rm_scores"], reward_extra_info
+
+    reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+    reward_extra_info = defaultdict(list)
+
+    async def process_batch():
+        tasks = []
+        for idx in range(len(data)):
+            tasks.append(reward_fn.run_single(data[idx : idx + 1]))
+        return await asyncio.gather(*tasks)
+
+    results = reward_fn.loop.run_until_complete(process_batch())
+
+    for idx, result in enumerate(results):
+        data_item = data[idx]
+        response_ids = data_item.batch["responses"]
+        response_length = response_ids.shape[-1]
+        valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
+
+        reward_tensor[idx, valid_response_length - 1] = result["reward_score"]
+        if "reward_extra_info" in result:
+            for key, value in result["reward_extra_info"].items():
+                reward_extra_info[key].append(value)
+
+    return reward_tensor, reward_extra_info
+
+
 def compute_reward(data: DataProto, reward_fn: Any, **kwargs: Any) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute reward for a batch of data.
     """
+    if not callable(reward_fn) and hasattr(reward_fn, "run_single"):
+        return _compute_reward_via_run_single(data, reward_fn)
+
     # Determine the effective callable to inspect
     call_target = reward_fn
     if not inspect.isfunction(reward_fn) and hasattr(reward_fn, "__call__"):

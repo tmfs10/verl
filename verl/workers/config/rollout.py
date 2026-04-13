@@ -41,6 +41,11 @@ class SamplingConfig(BaseConfig):
     top_p: float = 1.0
     do_sample: bool = True
     n: int = 1
+    response_length: Optional[int] = None
+
+    def __post_init__(self):
+        if self.response_length is not None and self.response_length < 0:
+            raise ValueError("`response_length` must be a non-negative integer or null.")
 
 
 @dataclass
@@ -49,6 +54,7 @@ class MultiTurnConfig(BaseConfig):
 
     enable: bool = False
     max_assistant_turns: Optional[int] = None
+    per_turn_response_length: Optional[int] = None
     tool_config_path: Optional[str] = None
     max_user_turns: Optional[int] = None
     max_parallel_calls: int = 1

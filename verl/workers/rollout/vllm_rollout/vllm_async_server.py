@@ -13,6 +13,7 @@
 # limitations under the License.
 import argparse
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -26,7 +27,6 @@ from packaging import version
 from ray.actor import ActorHandle
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
-from vllm.entrypoints.cli.serve import run_headless
 from vllm.entrypoints.openai.api_server import build_app, init_app_state
 from vllm.inputs import TokensPrompt
 from vllm.lora.request import LoRARequest
@@ -74,6 +74,68 @@ else:
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def _drop_cli_flag(args: list[str], flag: str, takes_value: bool = True) -> list[str]:
+    filtered: list[str] = []
+    idx = 0
+    while idx < len(args):
+        if args[idx] == flag:
+            idx += 1
+            if takes_value and idx < len(args):
+                idx += 1
+            continue
+        filtered.append(args[idx])
+        idx += 1
+    return filtered
+
+
+def _parse_vllm_cli_args(parser: FlexibleArgumentParser, args: list[str]) -> argparse.Namespace:
+    """Parse vLLM CLI args with limited compatibility fallbacks."""
+
+    try:
+        return parser.parse_args(args=args)
+    except SystemExit:
+        compat_filtered = _drop_cli_flag(args, "--logprobs-mode", takes_value=True)
+        compat_filtered = _drop_cli_flag(compat_filtered, "--logprobs_mode", takes_value=True)
+        if compat_filtered != args:
+            logger.warning("vLLM CLI does not support the logprobs_mode flag in this container; dropping it.")
+            return parser.parse_args(args=compat_filtered)
+        raise
+
+
+def _run_vllm_headless(args: argparse.Namespace) -> None:
+    """Bridge vLLM serve entrypoints across versions.
+
+    Some container builds no longer export ``run_headless`` directly from
+    ``vllm.entrypoints.cli.serve`` even though the CLI module is otherwise
+    importable. Fall back to the serve subcommand entrypoint in that case.
+    """
+
+    serve_module = vllm.entrypoints.cli.serve
+    run_headless = getattr(serve_module, "run_headless", None)
+    if run_headless is not None:
+        run_headless(args)
+        return
+
+    args.headless = True
+    args.api_server_count = 0
+
+    serve_subcommand_cls = getattr(serve_module, "ServeSubcommand", None)
+    if serve_subcommand_cls is not None:
+        serve_subcommand_cls.cmd(args)
+        return
+
+    cmds = serve_module.cmd_init()
+    for cmd in cmds:
+        if getattr(cmd, "name", None) == "serve":
+            cmd.cmd(args)
+            return
+
+    raise ImportError(
+        "Unable to find a compatible vLLM headless serve entrypoint. "
+        "Expected either run_headless or ServeSubcommand in vllm.entrypoints.cli.serve."
+    )
 
 
 class vLLMHttpServer:
@@ -421,7 +483,7 @@ class vLLMHttpServer:
             for cmd in new_cmds:
                 cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
                 cmds[cmd.name] = cmd
-        server_args = parser.parse_args(args=server_args)
+        server_args = _parse_vllm_cli_args(parser, server_args)
         server_args.model = server_args.model_tag
         if server_args.subparser in cmds:
             cmds[server_args.subparser].validate(server_args)
@@ -438,6 +500,10 @@ class vLLMHttpServer:
             await self.run_headless(server_args)
 
     async def run_server(self, args: argparse.Namespace):
+        # This container exposes the V1 async engine path but does not always
+        # set the corresponding env gate. Force it on before engine creation.
+        os.environ.setdefault("VLLM_USE_V1", "1")
+
         engine_args = AsyncEngineArgs.from_cli_args(args)
         usage_context = UsageContext.OPENAI_API_SERVER
         vllm_config = engine_args.create_engine_config(usage_context=usage_context)
@@ -452,11 +518,18 @@ class vLLMHttpServer:
 
         engine_client = AsyncLLM.from_vllm_config(vllm_config=vllm_config, usage_context=usage_context, **kwargs)
 
-        # Don't keep the dummy data in memory
-        await engine_client.reset_mm_cache()
-        await engine_client.collective_rpc(
-            method="monkey_patch_model", kwargs={"vocab_size": len(self.model_config.tokenizer)}
-        )
+        # Compatibility across vLLM async-engine variants.
+        if hasattr(engine_client, "reset_mm_cache"):
+            await engine_client.reset_mm_cache()
+        else:
+            logger.warning("AsyncLLM.reset_mm_cache is unavailable in this container; skipping cache reset.")
+
+        if hasattr(engine_client, "collective_rpc"):
+            await engine_client.collective_rpc(
+                method="monkey_patch_model", kwargs={"vocab_size": len(self.model_config.tokenizer)}
+            )
+        else:
+            logger.warning("AsyncLLM.collective_rpc is unavailable in this container; skipping monkey_patch_model.")
 
         build_app_sig = inspect.signature(build_app)
         supported_tasks: tuple[Any, ...] = ()
@@ -485,7 +558,7 @@ class vLLMHttpServer:
 
         def run_headless_wrapper():
             with SuppressSignalInThread():
-                run_headless(args)
+                _run_vllm_headless(args)
 
         def on_run_headless_done(future: asyncio.Future):
             try:
@@ -608,7 +681,7 @@ class vLLMHttpServer:
             routed_experts=routed_experts,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
-            extra_fields={"global_steps": self.global_steps},
+            extra_fields={"global_steps": self.global_steps, "finish_reason": finish_reason},
         )
 
     async def wake_up(self):
@@ -799,6 +872,19 @@ class vLLMReplica(RolloutReplica):
         super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
         self.server_class = ray.remote(vLLMHttpServer)
 
+    async def _cleanup_server_launch_attempt(self):
+        servers, self.servers = self.servers, []
+        self._server_handle = None
+        self._server_address = None
+
+        for server in servers:
+            with contextlib.suppress(Exception):
+                ray.kill(server, no_restart=True)
+
+        # Give Ray a brief window to tear down actors and release any named-actor
+        # registrations or sockets before the next launch attempt.
+        await asyncio.sleep(2)
+
     async def launch_servers(self):
         """Launch http server in each node."""
         assert len(self.workers) == self.world_size, (
@@ -827,70 +913,92 @@ class vLLMReplica(RolloutReplica):
         worker_cuda_visible_devices = [worker_info[1] for worker_info in worker_infos]
         worker_node_ids = [worker_info[0] for worker_info in worker_infos]
 
-        # create server actor in each node with node affinity and cuda visible devices
         nnodes, gpus_per_replica_node = self.nnodes, self.gpus_per_replica_node
-        for node_rank in range(nnodes):
-            workers = self.workers[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
-            node_cuda_visible_devices = ",".join(
-                worker_cuda_visible_devices[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
-            )
-            node_id = worker_node_ids[node_rank * gpus_per_replica_node]
-            name = (
-                f"vllm_server_{self.replica_rank}_{node_rank}"
-                if not self.is_reward_model
-                else f"vllm_server_reward_{self.replica_rank}_{node_rank}"
-            )
+        max_launch_attempts = 3
 
-            server = self.server_class.options(
-                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                    node_id=node_id,
-                    soft=False,
-                ),
-                runtime_env={
-                    "env_vars": {
-                        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-                        "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
-                        # To prevent hanging or crash during synchronization of weights between actor and rollout
-                        # in disaggregated mode. See:
-                        # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
-                        # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
-                        "NCCL_CUMEM_ENABLE": "0",
-                    }
-                },
-                name=name,
-                max_concurrency=self.max_concurrency,
-            ).remote(
-                config=self.config,
-                model_config=self.model_config,
-                rollout_mode=self.rollout_mode,
-                workers=workers,
-                replica_rank=self.replica_rank,
-                node_rank=node_rank,
-                gpus_per_node=gpus_per_replica_node,
-                nnodes=nnodes,
-                cuda_visible_devices=node_cuda_visible_devices,
-            )
-            self.servers.append(server)
+        for launch_attempt in range(max_launch_attempts):
+            self.servers = []
+            try:
+                # create server actor in each node with node affinity and cuda visible devices
+                for node_rank in range(nnodes):
+                    workers = self.workers[
+                        node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node
+                    ]
+                    node_cuda_visible_devices = ",".join(
+                        worker_cuda_visible_devices[
+                            node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node
+                        ]
+                    )
+                    node_id = worker_node_ids[node_rank * gpus_per_replica_node]
+                    name = (
+                        f"vllm_server_{self.replica_rank}_{node_rank}"
+                        if not self.is_reward_model
+                        else f"vllm_server_reward_{self.replica_rank}_{node_rank}"
+                    )
+                    if launch_attempt > 0:
+                        name = f"{name}_retry{launch_attempt}"
 
-        # launch http server in each node
-        master_address, master_port, dp_rpc_port = await self.servers[0].get_master_address.remote()
-        await asyncio.gather(
-            *[
-                server.launch_server.remote(
-                    master_address=master_address, master_port=master_port, dp_rpc_port=dp_rpc_port
+                    server = self.server_class.options(
+                        scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                            node_id=node_id,
+                            soft=False,
+                        ),
+                        runtime_env={
+                            "env_vars": {
+                                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                                "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                                # To prevent hanging or crash during synchronization of weights between actor and rollout
+                                # in disaggregated mode. See:
+                                # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
+                                # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445
+                                "NCCL_CUMEM_ENABLE": "0",
+                            }
+                        },
+                        name=name,
+                        max_concurrency=self.max_concurrency,
+                    ).remote(
+                        config=self.config,
+                        model_config=self.model_config,
+                        rollout_mode=self.rollout_mode,
+                        workers=workers,
+                        replica_rank=self.replica_rank,
+                        node_rank=node_rank,
+                        gpus_per_node=gpus_per_replica_node,
+                        nnodes=nnodes,
+                        cuda_visible_devices=node_cuda_visible_devices,
+                    )
+                    self.servers.append(server)
+
+                # launch http server in each node
+                master_address, master_port, dp_rpc_port = await self.servers[0].get_master_address.remote()
+                await asyncio.gather(
+                    *[
+                        server.launch_server.remote(
+                            master_address=master_address, master_port=master_port, dp_rpc_port=dp_rpc_port
+                        )
+                        for server in self.servers
+                    ]
                 )
-                for server in self.servers
-            ]
-        )
 
-        # get http server address from first server
-        server_address, server_port = await self.servers[0].get_server_address.remote()
-        self._server_handle = self.servers[0]
-        self._server_address = (
-            f"[{server_address}]:{server_port}"
-            if is_valid_ipv6_address(server_address)
-            else f"{server_address}:{server_port}"
-        )
+                # get http server address from first server
+                server_address, server_port = await self.servers[0].get_server_address.remote()
+                self._server_handle = self.servers[0]
+                self._server_address = (
+                    f"[{server_address}]:{server_port}"
+                    if is_valid_ipv6_address(server_address)
+                    else f"{server_address}:{server_port}"
+                )
+                return
+            except Exception:
+                logger.exception(
+                    "vLLM server launch attempt %d/%d failed for replica %d",
+                    launch_attempt + 1,
+                    max_launch_attempts,
+                    self.replica_rank,
+                )
+                await self._cleanup_server_launch_attempt()
+                if launch_attempt + 1 >= max_launch_attempts:
+                    raise
 
     async def sleep(self):
         """Sleep each rollout server."""

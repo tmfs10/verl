@@ -26,6 +26,11 @@ val_max_samples: -1
 # The field in the dataset where the prompt is located. Default is 'prompt'.
 prompt_key: prompt
 
+# Optional field containing the reference solution / continuation. This is also
+# used for dynamic masked-solution prompt construction when the prompt contains
+# placeholders like `{solution}` or `{masked_solution}`.
+solution_key: ground_truth_answer
+
 # The field used to select the reward function (if using different ones per example).
 reward_fn_key: data_source
 
@@ -129,3 +134,41 @@ datagen:
 
 # Additional kwargs when calling tokenizer.apply_chat_template
 apply_chat_template_kwargs: {}
+
+# Optional train-only overrides merged on top of apply_chat_template_kwargs.
+train_apply_chat_template_kwargs: null
+
+# Optional validation-only overrides merged on top of apply_chat_template_kwargs.
+val_apply_chat_template_kwargs: null
+
+# Dynamically replace `{solution}` / `{masked_solution}` placeholders in the
+# prompt from the solution field at sample load time.
+dynamic_masked_solution: True
+
+# Fraction of non-whitespace solution chunks to replace with the mask token.
+min_masked_fraction: null
+max_masked_fraction: null
+
+# How to choose which solution tokens to mask.
+# - random_fraction: sample random token positions according to min/max fractions
+# - reward_focus_tail: mask exactly the same low-confidence tail token positions
+#   that the conditional reward uses
+masked_solution_selection_mode: random_fraction
+
+# Stable per-sample seed for dynamic masked-solution construction.
+mask_seed: null
+
+# Replacement token inserted into the masked solution prompt. This must map to
+# exactly one tokenizer token.
+masked_solution_token: "<|fim_middle|>"
+
+# Placeholders that will be replaced by the dynamically masked solution text.
+masked_solution_placeholders:
+  - "{solution}"
+  - "{masked_solution}"
+
+# Optional overrides for reward_focus_tail mode. When
+# masked_solution_selection_mode=reward_focus_tail, these are inherited from
+# reward.reward_kwargs.* unless explicitly set to the same values.
+masked_solution_focus_tail_percent: null
+masked_solution_focus_min_tokens: null

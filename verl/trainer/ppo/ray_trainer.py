@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -53,7 +54,11 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async, extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils import tensordict_utils as tu
-from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
+from verl.utils.checkpoint.checkpoint_manager import (
+    find_latest_ckpt_path,
+    should_save_ckpt_esi,
+    should_save_ckpt_timeout,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
@@ -61,11 +66,37 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
+from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.torch_functional import masked_mean
 from verl.trainer.ppo.one_logger_integration import OneLoggerInstrumented
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
+from verl.workers.reward_manager.conditional import _select_low_confidence_token_indices
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+def _pack_reward_extra_info(values: list[Any]) -> np.ndarray:
+    """Preserve ragged per-sample reward metadata as object arrays.
+
+    Scalar-like fields stay as dense numpy arrays. Variable-length fields such as
+    token index lists and top-k hit flags fall back to dtype=object.
+    """
+    try:
+        return np.array(values)
+    except ValueError:
+        return np.array(values, dtype=object)
+
+
+def _validation_metric_section(var_name: str, core_var: str, metric_name: str, n_max: int) -> str | None:
+    """Return the validation metric section for exported metrics.
+
+    Validation logging is intentionally restricted to the aggregated selection
+    metrics only. Plain mean/std summaries and aux counters are not exported.
+    """
+    if metric_name.startswith(("best@", "maj@", "worst@")):
+        return "val-agg"
+
+    return None
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -224,6 +255,45 @@ def compute_advantage(
     return data
 
 
+def _to_jsonable(value: Any) -> Any:
+    """Recursively normalize numpy-backed rollout metadata for JSONL dumps."""
+    if isinstance(value, dict):
+        return {k: _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_jsonable(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [_to_jsonable(v) for v in value.tolist()]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _extract_response_tokens_and_logprobs(
+    tokenizer,
+    responses: torch.Tensor,
+    response_mask: torch.Tensor,
+    response_logprobs: Optional[torch.Tensor] = None,
+) -> tuple[list[list[str]], Optional[list[list[float]]]]:
+    """Convert response ids to token strings and align optional per-token logprobs."""
+    response_rows = responses.detach().cpu()
+    response_mask_rows = response_mask.detach().cpu().bool()
+    logprob_rows = response_logprobs.detach().cpu() if response_logprobs is not None else None
+
+    response_tokens: list[list[str]] = []
+    response_token_logprobs: Optional[list[list[float]]] = [] if logprob_rows is not None else None
+
+    for row_idx in range(response_rows.size(0)):
+        valid_mask = response_mask_rows[row_idx]
+        token_ids = response_rows[row_idx][valid_mask].tolist()
+        response_tokens.append(tokenizer.convert_ids_to_tokens(token_ids))
+
+        if response_token_logprobs is not None:
+            row_logprobs = logprob_rows[row_idx][valid_mask].to(torch.float32).tolist()
+            response_token_logprobs.append([float(logprob) for logprob in row_logprobs])
+
+    return response_tokens, response_token_logprobs
+
+
 class RayPPOTrainer(OneLoggerInstrumented):
     """Distributed PPO trainer using Ray for scalable reinforcement learning.
 
@@ -247,6 +317,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
         collate_fn=None,
         train_sampler: Optional[Sampler] = None,
         device_name=None,
+        reward_fn=None,
+        val_reward_fn=None,
     ):
         """
         Initialize distributed PPO trainer with Ray backend.
@@ -270,6 +342,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+        self.reward_fn = reward_fn
+        self.val_reward_fn = val_reward_fn
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert self.hybrid_engine, "Currently, only support hybrid engine"
@@ -306,10 +380,25 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
+        self._enable_rollout_logprobs_for_generation_dumps()
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+
+    def _enable_rollout_logprobs_for_generation_dumps(self) -> None:
+        rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+        validation_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if not rollout_data_dir and not validation_data_dir:
+            return
+        if self.config.actor_rollout_ref.rollout.calculate_log_probs:
+            return
+
+        with open_dict(self.config):
+            self.config.actor_rollout_ref.rollout.calculate_log_probs = True
+        print(
+            "Enabled actor_rollout_ref.rollout.calculate_log_probs because generation dump JSONLs are configured."
+        )
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -393,7 +482,17 @@ class RayPPOTrainer(OneLoggerInstrumented):
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(
+        self,
+        inputs,
+        outputs,
+        gts,
+        scores,
+        reward_extra_infos_dict,
+        dump_path,
+        response_tokens=None,
+        response_token_logprobs=None,
+    ):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -406,6 +505,10 @@ class RayPPOTrainer(OneLoggerInstrumented):
             "score": scores,
             "step": [self.global_steps] * n,
         }
+        if response_tokens is not None:
+            base_data["response_tokens"] = response_tokens
+        if response_token_logprobs is not None:
+            base_data["response_token_logprobs"] = response_token_logprobs
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
@@ -413,7 +516,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
         lines = []
         for i in range(n):
-            entry = {k: v[i] for k, v in base_data.items()}
+            entry = {k: _to_jsonable(v[i]) for k, v in base_data.items()}
             lines.append(json.dumps(entry, ensure_ascii=False))
 
         with open(filename, "w") as f:
@@ -436,6 +539,15 @@ class RayPPOTrainer(OneLoggerInstrumented):
             outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
             scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
             sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+            response_logprobs = batch.batch.get("rollout_log_probs", None)
+            if response_logprobs is None:
+                response_logprobs = batch.batch.get("old_log_probs", None)
+            response_tokens, response_token_logprobs = _extract_response_tokens_and_logprobs(
+                self.tokenizer,
+                batch.batch["responses"],
+                batch.batch["response_mask"],
+                response_logprobs=response_logprobs,
+            )
 
             reward_extra_infos_to_dump = reward_extra_infos_dict.copy()
             if "request_id" in batch.non_tensor_batch:
@@ -451,6 +563,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 scores=scores,
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
+                response_tokens=response_tokens,
+                response_token_logprobs=response_token_logprobs,
             )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
@@ -478,7 +592,19 @@ class RayPPOTrainer(OneLoggerInstrumented):
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        # Keep algorithm-side supervision fields on the driver batch so post-generation
+        # updates (for example OPSD teacher construction) can still access them.
+        reward_keys = set(
+            {
+                "data_source",
+                "reward_model",
+                "extra_info",
+                "uid",
+                "prompt_group_id",
+                "ground_truth_answer",
+                "problem",
+            }
+        ) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -492,6 +618,201 @@ class RayPPOTrainer(OneLoggerInstrumented):
         gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    @staticmethod
+    def _drop_overlapping_non_tensor_keys(target: DataProto, reference: DataProto) -> None:
+        overlap = set(target.non_tensor_batch.keys()) & set(reference.non_tensor_batch.keys())
+        if overlap:
+            target.pop(non_tensor_batch_keys=list(overlap))
+
+    @staticmethod
+    def _resolve_pad_token_id_from_tokenizer(tokenizer) -> int:
+        pad_token_id = getattr(tokenizer, "pad_token_id", None)
+        if pad_token_id is not None:
+            return int(pad_token_id)
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is not None:
+            return int(eos_token_id)
+        return 0
+
+    @staticmethod
+    def _left_pad_token_lists(
+        token_lists: list[list[int]],
+        *,
+        pad_token_id: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        max_len = max((len(tokens) for tokens in token_lists), default=0)
+        if max_len <= 0:
+            raise ValueError("Expected at least one non-empty prompt prefix token list.")
+
+        batch_size = len(token_lists)
+        prompt_ids = torch.full((batch_size, max_len), fill_value=pad_token_id, dtype=torch.long, device=device)
+        prompt_attn = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+        prompt_pos = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+
+        for row_idx, tokens in enumerate(token_lists):
+            token_count = len(tokens)
+            if token_count <= 0:
+                continue
+            token_tensor = torch.tensor(tokens, dtype=torch.long, device=device)
+            prompt_ids[row_idx, -token_count:] = token_tensor
+            prompt_attn[row_idx, -token_count:] = 1
+            prompt_pos[row_idx, -token_count:] = torch.arange(token_count, dtype=torch.long, device=device)
+
+        return prompt_ids, prompt_attn, prompt_pos
+
+    @staticmethod
+    def _pad_right_token_lists(
+        token_lists: list[list[int]],
+        *,
+        pad_token_id: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        max_len = max((len(tokens) for tokens in token_lists), default=0)
+        if max_len <= 0:
+            raise ValueError("Expected at least one non-empty ground-truth token list.")
+
+        batch_size = len(token_lists)
+        token_ids = torch.full((batch_size, max_len), fill_value=pad_token_id, dtype=torch.long, device=device)
+        token_mask = torch.zeros((batch_size, max_len), dtype=torch.long, device=device)
+
+        for row_idx, tokens in enumerate(token_lists):
+            token_count = len(tokens)
+            if token_count <= 0:
+                continue
+            token_tensor = torch.tensor(tokens, dtype=torch.long, device=device)
+            token_ids[row_idx, :token_count] = token_tensor
+            token_mask[row_idx, :token_count] = 1
+
+        return token_ids, token_mask
+
+    def _maybe_apply_reward_focus_tail_mask(self, batch: DataProto) -> None:
+        if self.config.data.get("masked_solution_selection_mode", "random_fraction") != "reward_focus_tail":
+            return
+
+        dataset = self.train_dataset
+        required_methods = (
+            "_has_masked_solution_placeholders",
+            "_build_prompt_template_with_sentinel",
+            "_masked_solution_sentinel",
+            "materialize_masked_solution_prompt",
+            "_build_messages",
+        )
+        if not all(hasattr(dataset, method_name) for method_name in required_methods):
+            raise ValueError(
+                "data.masked_solution_selection_mode='reward_focus_tail' requires the default RLHFDataset "
+                "masked-solution helpers on the training dataset."
+            )
+
+        prompt_key = self.config.data.get("prompt_key", "prompt")
+        solution_key = self.config.data.get("solution_key", "ground_truth_answer")
+        reward_tail_percent = float(self.config.reward.reward_kwargs.low_confidence_tail_percent)
+        reward_min_tokens = int(OmegaConf.select(self.config, "reward.reward_kwargs.low_confidence_min_tokens", default=1))
+
+        prompt_messages = list(batch.non_tensor_batch[prompt_key])
+        solution_values = list(batch.non_tensor_batch.get(solution_key, np.array([None] * len(prompt_messages), dtype=object)))
+        sample_indices = list(batch.non_tensor_batch.get("index", np.arange(len(prompt_messages), dtype=object)))
+
+        selected_rows: list[int] = []
+        prompt_prefix_token_lists: list[list[int]] = []
+        gt_token_lists: list[list[int]] = []
+        sample_examples: list[dict[str, Any]] = []
+        sample_items: list[Any] = []
+
+        for row_idx, (messages, solution_text, item_key) in enumerate(zip(prompt_messages, solution_values, sample_indices, strict=False)):
+            example = {
+                prompt_key: messages,
+                solution_key: solution_text,
+            }
+            if not dataset._has_masked_solution_placeholders(example):
+                continue
+            if not isinstance(solution_text, str) or not solution_text:
+                continue
+
+            prompt_template, _, _ = dataset._build_prompt_template_with_sentinel(example, item=item_key)
+            sentinel = dataset._masked_solution_sentinel(item_key)
+            prompt_prefix_text = prompt_template.replace(sentinel, "")
+            prefix_token_ids = normalize_token_ids(self.tokenizer(prompt_prefix_text, add_special_tokens=False)["input_ids"])
+            gt_token_ids = normalize_token_ids(self.tokenizer(solution_text, add_special_tokens=False)["input_ids"])
+            if not prefix_token_ids or not gt_token_ids:
+                continue
+
+            selected_rows.append(row_idx)
+            prompt_prefix_token_lists.append(list(prefix_token_ids))
+            gt_token_lists.append(list(gt_token_ids))
+            sample_examples.append(example)
+            sample_items.append(item_key)
+
+        if not selected_rows:
+            return
+
+        device = torch.device("cpu")
+        pad_token_id = self._resolve_pad_token_id_from_tokenizer(self.tokenizer)
+        prompt_ids, prompt_attn, prompt_pos = self._left_pad_token_lists(
+            prompt_prefix_token_lists,
+            pad_token_id=pad_token_id,
+            device=device,
+        )
+        gt_ids, gt_mask = self._pad_right_token_lists(
+            gt_token_lists,
+            pad_token_id=pad_token_id,
+            device=device,
+        )
+
+        gt_len = gt_ids.size(1)
+        seq_concat = torch.cat([prompt_ids, gt_ids], dim=-1)
+        delta_pos = torch.arange(1, gt_len + 1, device=device, dtype=torch.long).unsqueeze(0).expand(prompt_ids.size(0), -1)
+        gt_position_ids = prompt_pos[:, -1:] + delta_pos
+        position_ids = torch.cat([prompt_pos, gt_position_ids], dim=-1)
+        attention_mask = torch.cat([prompt_attn, gt_mask], dim=-1)
+
+        prompt_only_batch = DataProto.from_dict(
+            tensors={
+                "prompts": prompt_ids,
+                "responses": gt_ids,
+                "input_ids": seq_concat,
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+            },
+        )
+        prompt_only_batch_padded, pad_size = pad_dataproto_to_divisor(prompt_only_batch, self.actor_rollout_wg.world_size)
+        prompt_only_output = self.actor_rollout_wg.compute_log_prob(prompt_only_batch_padded)
+        prompt_only_log_probs = unpad_dataproto(prompt_only_output, pad_size=pad_size).batch["old_log_probs"]
+
+        updated_prompt_messages = np.empty(len(prompt_messages), dtype=object)
+        updated_prompt_messages[:] = list(prompt_messages)
+        updated_raw_prompts = np.empty(len(prompt_messages), dtype=object)
+        updated_raw_prompts[:] = list(batch.non_tensor_batch["raw_prompt"])
+        updated_prompt_overrides = np.empty(len(prompt_messages), dtype=object)
+        updated_prompt_overrides[:] = None
+        updated_focus_indices = np.empty(len(prompt_messages), dtype=object)
+        updated_focus_indices[:] = None
+
+        for local_idx, row_idx in enumerate(selected_rows):
+            focus_indices = _select_low_confidence_token_indices(
+                prompt_only_log_probs[local_idx],
+                len(gt_token_lists[local_idx]),
+                tail_percent=reward_tail_percent,
+                min_tokens=reward_min_tokens,
+            )
+            prepared_messages, prompt_ids_override = dataset.materialize_masked_solution_prompt(
+                sample_examples[local_idx],
+                masked_positions=set(focus_indices),
+                item=sample_items[local_idx],
+            )
+            prompt_example = dict(sample_examples[local_idx])
+            prompt_example[prompt_key] = prepared_messages
+
+            updated_prompt_messages[row_idx] = prepared_messages
+            updated_raw_prompts[row_idx] = dataset._build_messages(prompt_example)
+            updated_prompt_overrides[row_idx] = prompt_ids_override
+            updated_focus_indices[row_idx] = list(focus_indices)
+
+        batch.non_tensor_batch[prompt_key] = updated_prompt_messages
+        batch.non_tensor_batch["raw_prompt"] = updated_raw_prompts
+        batch.non_tensor_batch["prompt_ids_override"] = updated_prompt_overrides
+        batch.non_tensor_batch["masked_solution_focus_token_indices"] = updated_focus_indices
 
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
@@ -512,6 +833,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
         sample_scores = []
         sample_turns = []
         sample_uids = []
+        sample_response_tokens = []
+        sample_response_token_logprobs = []
 
         for test_data in self.val_dataloader:
             test_batch = DataProto.from_single_dict(test_data)
@@ -540,6 +863,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 "validate": True,
                 "global_steps": self.global_steps,
             }
+            val_response_length = self.config.actor_rollout_ref.rollout.val_kwargs.response_length
+            if val_response_length is not None:
+                test_gen_batch.meta_info["response_length"] = val_response_length
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
@@ -566,9 +892,36 @@ class RayPPOTrainer(OneLoggerInstrumented):
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
+            response_logprobs = test_output_gen_batch.batch.get("rollout_log_probs", None)
+            if response_logprobs is None:
+                response_logprobs = test_output_gen_batch.batch.get("old_log_probs", None)
+            response_tokens, response_token_logprobs = _extract_response_tokens_and_logprobs(
+                self.tokenizer,
+                test_output_gen_batch.batch["responses"],
+                test_output_gen_batch.batch["response_mask"],
+                response_logprobs=response_logprobs,
+            )
+            sample_response_tokens.extend(response_tokens)
+            if response_token_logprobs is None:
+                sample_response_token_logprobs.extend([None] * len(response_tokens))
+            else:
+                sample_response_token_logprobs.extend(response_token_logprobs)
 
+            self._drop_overlapping_non_tensor_keys(test_output_gen_batch, test_batch)
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
+
+            # Validation must use the dedicated val_reward_fn rather than any inline reward
+            # scores attached during generation. This keeps validation behavior consistent
+            # across reward-manager variants.
+            if "rm_scores" in test_batch.batch.keys():
+                test_batch.pop(batch_keys=["rm_scores"])
+            reward_extra_keys = list(test_batch.meta_info.get("reward_extra_keys", []))
+            reward_extra_keys = [key for key in reward_extra_keys if key in test_batch.non_tensor_batch]
+            if reward_extra_keys:
+                test_batch.pop(non_tensor_batch_keys=reward_extra_keys)
+            if "reward_extra_keys" in test_batch.meta_info:
+                test_batch.pop(meta_info_keys=["reward_extra_keys"])
 
             # Store original inputs
             input_ids = test_batch.batch["prompts"]
@@ -619,6 +972,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                response_tokens=sample_response_tokens,
+                response_token_logprobs=sample_response_token_logprobs,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
@@ -643,22 +998,13 @@ class RayPPOTrainer(OneLoggerInstrumented):
             for var_name, metric2val in var2metric2val.items():
                 n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
                 for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
+                    metric_sec = _validation_metric_section(
+                        var_name=var_name, core_var=core_var, metric_name=metric_name, n_max=n_max
+                    )
+                    if metric_sec is None:
+                        continue
                     pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
                     metric_dict[pfx] = metric_val
-
-        if len(sample_turns) > 0:
-            sample_turns = np.concatenate(sample_turns)
-            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
-            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
-            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
 
         return metric_dict
 
@@ -841,7 +1187,10 @@ class RayPPOTrainer(OneLoggerInstrumented):
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-        enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        disable_agent_reward_loop = bool(getattr(self.reward_fn, "disable_async_reward_loop", False))
+        enable_agent_reward_loop = (
+            (not self.use_rm or self.config.reward.reward_model.enable_resource_pool) and not disable_agent_reward_loop
+        )
 
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
@@ -1257,6 +1606,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
         )
 
         self.global_steps = 0
+        self.training_start_time = time.time()
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
@@ -1300,6 +1650,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
                 timing_raw = {}
+                stop_after_timeout_checkpoint = False
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1311,10 +1662,11 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
 
                 # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                )
+                prompt_group_ids = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                batch.non_tensor_batch["uid"] = prompt_group_ids.copy()
+                batch.non_tensor_batch["prompt_group_id"] = prompt_group_ids
 
+                self._maybe_apply_reward_focus_tail_mask(batch)
                 gen_batch = self._get_gen_batch(batch)
 
                 # pass global_steps to trace
@@ -1347,6 +1699,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             self.checkpoint_manager.sleep_replicas()
                             if curr_step_profile:
                                 self.async_rollout_manager.stop_profile()
+                            self._drop_overlapping_non_tensor_keys(gen_baseline_output, batch)
                             batch = batch.union(gen_baseline_output)
                             reward_fn = getattr(self, "reward_fn", None)
                             rm_scores = None
@@ -1374,6 +1727,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    self._drop_overlapping_non_tensor_keys(gen_batch_output, batch)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1402,7 +1756,12 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             batch = batch.union(batch_reward)
 
                         reward_fn = getattr(self, "reward_fn", None)
-                        if reward_fn is not None and self.config.reward_model.launch_reward_fn_async:
+                        launch_reward_fn_async = OmegaConf.select(
+                            self.config,
+                            "reward.reward_model.launch_reward_fn_async",
+                            default=False,
+                        )
+                        if reward_fn is not None and launch_reward_fn_async:
                             future_reward = compute_reward_async.remote(data=batch, reward_fn=reward_fn, actor_wg=self.actor_rollout_wg)
                         elif reward_fn is not None:
                             reward_tensor, reward_extra_infos_dict = compute_reward(
@@ -1480,7 +1839,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            batch.non_tensor_batch.update(
+                                {k: _pack_reward_extra_info(v) for k, v in reward_extra_infos_dict.items()}
+                            )
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
@@ -1537,39 +1898,45 @@ class RayPPOTrainer(OneLoggerInstrumented):
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
                             max_steps_duration=self.max_steps_duration,
+                            save_ckpt_duration=self.config.trainer.get("checkpoint_save_duration", 60),
                             redundant_time=self.config.trainer.esi_redundant_time,
                         )
+                        timeout_close_to_expiration = should_save_ckpt_timeout(
+                            max_steps_duration=self.max_steps_duration,
+                            save_ckpt_duration=self.config.trainer.get("checkpoint_save_duration", 60),
+                            redundant_time=self.config.trainer.esi_redundant_time,
+                            checkpoint_must_save_by=self.config.trainer.get("checkpoint_must_save_by", None),
+                            start_time=self.training_start_time,
+                        )
                         # Check if the conditions for saving a checkpoint are met.
-                        # The conditions include a mandatory condition (1) and
-                        # one of the following optional conditions (2/3/4):
-                        # 1. The save frequency is set to a positive value.
-                        # 2. It's the last training step.
-                        # 3. The current step number is a multiple of the save frequency.
-                        # 4. The ESI(Elastic Server Instance)/training plan is close to expiration.
-                        if self.config.trainer.save_freq > 0 and (
-                            is_last_step
-                            or self.global_steps % self.config.trainer.save_freq == 0
-                            or esi_close_to_expiration
-                        ):
+                        save_due_to_schedule = self.config.trainer.save_freq > 0 and (
+                            is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                        )
+                        if save_due_to_schedule or esi_close_to_expiration or timeout_close_to_expiration:
                             if esi_close_to_expiration:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
+                            if timeout_close_to_expiration:
+                                print("Force saving checkpoint: job timeout approaching.")
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
                                 self._save_checkpoint()
+                            if timeout_close_to_expiration:
+                                stop_after_timeout_checkpoint = True
 
                         # update weights from trainer to rollout
-                        with marked_timer("update_weights", timing_raw, color="red"):
-                            self.checkpoint_manager.update_weights(self.global_steps)
+                        if not stop_after_timeout_checkpoint:
+                            with marked_timer("update_weights", timing_raw, color="red"):
+                                self.checkpoint_manager.update_weights(self.global_steps)
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
+                    if rollout_data_dir and not stop_after_timeout_checkpoint:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
-                if self.config.trainer.test_freq > 0 and (
+                if (not stop_after_timeout_checkpoint) and self.config.trainer.test_freq > 0 and (
                     is_last_step or self.global_steps % self.config.trainer.test_freq == 0
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
@@ -1632,6 +1999,13 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
                 progress_bar.update(1)
                 self.global_steps += 1
+
+                if stop_after_timeout_checkpoint:
+                    if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
+                        self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
+                    print("Timeout-triggered checkpoint saved, stopping training early.")
+                    progress_bar.close()
+                    return
 
                 if (
                     hasattr(self.config.actor_rollout_ref.actor, "profiler")

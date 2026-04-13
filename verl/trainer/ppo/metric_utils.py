@@ -222,6 +222,20 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    # Log the actual rule accuracy when the reward manager provides it.
+    # This is critical for reward managers (e.g. conditional_logprob) where
+    # critic/score/mean reflects a surrogate reward, not rule accuracy.
+    if "acc" in batch.batch:
+        acc_tensor = batch.batch["acc"].float()
+        metrics["reward/acc/mean"] = acc_tensor.mean().detach().item()
+        metrics["reward/acc/max"] = acc_tensor.max().detach().item()
+        metrics["reward/acc/min"] = acc_tensor.min().detach().item()
+    elif "acc" in batch.non_tensor_batch:
+        acc_vals = np.asarray(batch.non_tensor_batch["acc"], dtype=np.float32)
+        metrics["reward/acc/mean"] = float(np.mean(acc_vals))
+        metrics["reward/acc/max"] = float(np.max(acc_vals))
+        metrics["reward/acc/min"] = float(np.min(acc_vals))
+
     metrics = compute_data_metrics_reward(batch, metrics)
 
     return metrics
@@ -627,8 +641,16 @@ def process_validation_metrics(
             var_dict = uid_dict.setdefault(uid, {})
 
             for var_name, var_vals in var2vals.items():
-                # skip empty or string values
-                if not var_vals or isinstance(var_vals[0], str):
+                # Skip non-numeric values such as string predictions or partially missing outputs.
+                if not var_vals:
+                    continue
+                if not all(
+                    val is not None
+                    and np.isscalar(val)
+                    and not isinstance(val, (str, bytes))
+                    and np.asarray(val).dtype.kind in "biufc"
+                    for val in var_vals
+                ):
                     continue
 
                 # compute mean and std

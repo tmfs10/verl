@@ -11,9 +11,84 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
+from collections import Counter
+
 # from . import gsm8k, math, prime_math, prime_code
 
 from verl.utils.import_utils import deprecated
+
+DEFAULT_ENTROPY_BONUS_COEF = 0.0
+INVALID_ANSWER = "[INVALID]"
+
+
+def _normalize_answer_history(answer_history):
+    if answer_history is None:
+        return []
+
+    if isinstance(answer_history, str):
+        answer_history = [answer_history]
+
+    normalized_history = []
+    for answer in answer_history:
+        normalized_history.append(answer if answer not in (None, "") else INVALID_ANSWER)
+    return normalized_history
+
+
+def _compute_normalized_answer_entropy(answer_history) -> float:
+    answer_history = _normalize_answer_history(answer_history)
+    num_turns = len(answer_history)
+    if num_turns <= 1:
+        return 0.0
+
+    entropy = 0.0
+    for count in Counter(answer_history).values():
+        probability = count / num_turns
+        entropy -= probability * math.log(probability)
+
+    return entropy / math.log(num_turns)
+
+
+def _apply_math_answer_entropy_bonus(result, extra_info):
+    if not extra_info or "answer_history" not in extra_info:
+        return result
+
+    if isinstance(result, dict):
+        updated_result = dict(result)
+        is_correct = bool(updated_result.get("acc", updated_result.get("score", 0.0) > 0))
+    else:
+        updated_result = {"score": float(result), "acc": float(result) > 0}
+        is_correct = updated_result["acc"]
+
+    if is_correct:
+        return result
+
+    entropy_bonus_coef = extra_info.get("entropy_bonus_coef", DEFAULT_ENTROPY_BONUS_COEF)
+    entropy_bonus_coef = float(entropy_bonus_coef) if entropy_bonus_coef is not None else DEFAULT_ENTROPY_BONUS_COEF
+    normalized_entropy = _compute_normalized_answer_entropy(extra_info.get("answer_history"))
+    entropy_bonus = entropy_bonus_coef * normalized_entropy if entropy_bonus_coef > 0 else 0.0
+
+    updated_result["score"] = entropy_bonus
+    updated_result["acc"] = False
+    updated_result["normalized_answer_entropy"] = normalized_entropy
+    updated_result["answer_entropy_bonus"] = entropy_bonus
+    updated_result["entropy_bonus_coef"] = entropy_bonus_coef
+    return updated_result
+
+
+def _get_last_completed_turn_reward(extra_info):
+    if not extra_info or extra_info.get("reward_mode") != "last_completed_turn":
+        return None
+
+    has_last_completed_answer = bool(extra_info.get("has_last_completed_answer", False))
+    pred = extra_info.get("last_completed_answer")
+    acc = bool(extra_info.get("last_completed_answer_correct", False)) if has_last_completed_answer else False
+    return {
+        "score": 1.0 if acc else 0.0,
+        "acc": acc,
+        "pred": pred,
+        "reward_mode": "last_completed_turn",
+    }
 
 
 def default_compute_score(
@@ -48,7 +123,10 @@ def default_compute_score(
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
         from . import math_reward
 
-        res = math_reward.compute_score(solution_str, ground_truth)
+        res = _get_last_completed_turn_reward(extra_info)
+        if res is None:
+            res = math_reward.compute_score(solution_str, ground_truth)
+            res = _apply_math_answer_entropy_bonus(res, extra_info)
         # [Optional] Math-Verify Integration
         # For enhanced accuracy, consider utilizing Math-Verify (https://github.com/huggingface/Math-Verify).
         # Note: Math-Verify needs to be manually installed via pip: `pip install math-verify`.
@@ -59,7 +137,10 @@ def default_compute_score(
     elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
         from . import math_dapo
 
-        res = math_dapo.compute_score(solution_str, ground_truth)
+        res = _get_last_completed_turn_reward(extra_info)
+        if res is None:
+            res = math_dapo.compute_score(solution_str, ground_truth)
+            res = _apply_math_answer_entropy_bonus(res, extra_info)
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",

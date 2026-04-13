@@ -18,12 +18,14 @@ from typing import Any
 import numpy as np
 import pytest
 import ray
+import torch
 from omegaconf import DictConfig
+from tensordict import TensorDict
 from transformers.utils import get_json_schema
 
 from tests.experimental.agent_loop.agent_utils import init_agent_loop_manager
 from verl.checkpoint_engine import CheckpointEngineManager
-from verl.experimental.agent_loop.agent_loop import GlobalRequestLoadBalancer, get_trajectory_info
+from verl.experimental.agent_loop.agent_loop import AgentLoopManager, GlobalRequestLoadBalancer, get_trajectory_info
 from verl.protocol import DataProto
 from verl.tools.base_tool import BaseTool, OpenAIFunctionToolSchema
 from verl.tools.schemas import ToolResponse
@@ -125,6 +127,41 @@ def test_single_turn(init_config):
 
     print("Test passed!")
     ray.shutdown()
+
+
+def test_agent_loop_manager_handles_fewer_prompts_than_workers():
+    class FakeWorker:
+        def __init__(self):
+            self.call_sizes = []
+            self.generate_sequences = self
+
+        async def remote(self, chunk: DataProto) -> DataProto:
+            self.call_sizes.append(len(chunk))
+            bsz = len(chunk)
+            batch = TensorDict(
+                {
+                    "attention_mask": torch.ones((bsz, 4), dtype=torch.long),
+                    "prompts": torch.zeros((bsz, 2), dtype=torch.long),
+                    "responses": torch.zeros((bsz, 2), dtype=torch.long),
+                },
+                batch_size=[bsz],
+            )
+            metrics = [{"generate_sequences": 1.0, "tool_calls": 0.0, "num_preempted": 0} for _ in range(bsz)]
+            return DataProto(
+                batch=batch,
+                non_tensor_batch={"raw_prompt": chunk.non_tensor_batch["raw_prompt"]},
+                meta_info={"metrics": metrics},
+            )
+
+    manager = AgentLoopManager.__new__(AgentLoopManager)
+    manager.agent_loop_workers = [FakeWorker() for _ in range(8)]
+    prompts = DataProto(non_tensor_batch={"raw_prompt": np.array(["a"], dtype=object)})
+
+    output = manager.generate_sequences(prompts)
+
+    assert len(output) == 1
+    assert manager.agent_loop_workers[0].call_sizes == [1]
+    assert all(worker.call_sizes == [] for worker in manager.agent_loop_workers[1:])
 
 
 class WeatherTool(BaseTool):

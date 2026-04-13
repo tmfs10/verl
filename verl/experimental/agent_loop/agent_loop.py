@@ -295,6 +295,7 @@ class AgentLoopBase(ABC):
         images: list[Image.Image] = None,
         videos: list[tuple[torch.Tensor, dict]] = None,
         remove_system_prompt: bool = False,
+        chat_template_kwargs: dict | None = None,
     ):
         """Apply chat template to messages with optional tools, images, and videos.
 
@@ -308,6 +309,10 @@ class AgentLoopBase(ABC):
         Returns:
             list[int]: Prompt token ids.
         """
+        effective_chat_template_kwargs = dict(self.apply_chat_template_kwargs)
+        if chat_template_kwargs:
+            effective_chat_template_kwargs.update(dict(chat_template_kwargs))
+
         if self.processor is not None:
             raw_prompt = await self.loop.run_in_executor(
                 None,
@@ -317,7 +322,7 @@ class AgentLoopBase(ABC):
                     tools=tools,
                     add_generation_prompt=True,
                     tokenize=False,
-                    **self.apply_chat_template_kwargs,
+                    **effective_chat_template_kwargs,
                 ),
             )
 
@@ -346,7 +351,7 @@ class AgentLoopBase(ABC):
                     tools=tools,
                     add_generation_prompt=True,
                     tokenize=True,
-                    **self.apply_chat_template_kwargs,
+                    **effective_chat_template_kwargs,
                 ),
             )
             prompt_ids = normalize_token_ids(tokenized_prompt)
@@ -486,6 +491,8 @@ class AgentLoopWorker:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
+            if config.val_kwargs.response_length is not None:
+                sampling_params["max_tokens"] = config.val_kwargs.response_length
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
@@ -563,10 +570,38 @@ class AgentLoopWorker:
                 dataset_cls=self.dataset_cls,
                 data_config=DictConfigWrap(self.config.data),
             )
-            output: AgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
-            return await self._agent_loop_postprocess(output, **kwargs)
+            response_length = self._resolve_response_length(sampling_params)
+            output: AgentLoopOutput = await agent_loop.run(
+                sampling_params,
+                response_length_override=response_length,
+                **kwargs,
+            )
+            return await self._agent_loop_postprocess(
+                output,
+                response_length=response_length,
+                validate=trajectory["validate"],
+                **kwargs,
+            )
 
-    async def _agent_loop_postprocess(self, output, **kwargs) -> _InternalAgentLoopOutput:
+    def _resolve_response_length(self, sampling_params: dict[str, Any]) -> int:
+        max_tokens = sampling_params.get("max_tokens")
+        if max_tokens is not None:
+            return int(max_tokens)
+
+        max_new_tokens = sampling_params.get("max_new_tokens")
+        if max_new_tokens is not None:
+            return int(max_new_tokens)
+
+        return int(self.rollout_config.response_length)
+
+    async def _agent_loop_postprocess(
+        self,
+        output,
+        *,
+        response_length: int,
+        validate: bool = False,
+        **kwargs,
+    ) -> _InternalAgentLoopOutput:
         """Perform post-processing operations on the output of each individual agent loop."""
         output.extra_fields["raw_prompt"] = kwargs["raw_prompt"]
 
@@ -607,7 +642,7 @@ class AgentLoopWorker:
         response_output = self.tokenizer.pad(
             {"input_ids": output.response_ids},
             padding="max_length",
-            max_length=self.rollout_config.response_length,
+            max_length=response_length,
             return_tensors="pt",
             return_attention_mask=True,
         )
@@ -618,7 +653,7 @@ class AgentLoopWorker:
         response_mask_output = self.tokenizer.pad(
             {"input_ids": output.response_mask},
             padding="max_length",
-            max_length=self.rollout_config.response_length,
+            max_length=response_length,
             return_tensors="pt",
             return_attention_mask=False,
         )
@@ -627,7 +662,7 @@ class AgentLoopWorker:
 
         response_logprobs = None
         if output.response_logprobs is not None:
-            pad_size = self.rollout_config.response_length - len(output.response_logprobs)
+            pad_size = response_length - len(output.response_logprobs)
             response_logprobs = torch.tensor(output.response_logprobs + [0.0] * pad_size).unsqueeze(0)
 
         response_mask = response_mask_output["input_ids"] * response_output["attention_mask"]
@@ -670,6 +705,7 @@ class AgentLoopWorker:
             attention_mask=attention_mask,
             input_ids=input_ids,
             position_ids=position_ids,
+            validate=validate,
             kwargs=kwargs,
         )
 
@@ -756,9 +792,21 @@ class AgentLoopWorker:
         position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
         return position_ids
 
-    async def _compute_score(self, output, prompts, responses, attention_mask, input_ids, position_ids, kwargs):
+    async def _compute_score(
+        self,
+        output,
+        prompts,
+        responses,
+        attention_mask,
+        input_ids,
+        position_ids,
+        kwargs,
+        validate: bool = False,
+    ):
         """Compute reward score for single sample."""
-        enable_async_reward = self.reward_loop_worker_handles is not None
+        # Validation should always go through the trainer's explicit val_reward_fn so metrics
+        # are consistent across reward-manager variants.
+        enable_async_reward = self.reward_loop_worker_handles is not None and not validate
 
         if output.reward_score is None and enable_async_reward:
             batch = TensorDict(
@@ -1036,12 +1084,19 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
+        if len(prompts) == 0:
+            raise ValueError("prompts must be non-empty")
 
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
+        # Small rollout batches are valid in smoke tests and low-throughput runs.
+        # Do not require equal chunking across the full worker pool when there are
+        # fewer prompts than workers or when the batch is not evenly divisible.
+        active_workers = min(len(self.agent_loop_workers), len(prompts))
+        split_size = (len(prompts) + active_workers - 1) // active_workers
+        chunkes = prompts.split(split_size)
         outputs = await asyncio.gather(
             *[
                 worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+                for worker, chunk in zip(self.agent_loop_workers[: len(chunkes)], chunkes, strict=True)
             ]
         )
         output = DataProto.concat(outputs)

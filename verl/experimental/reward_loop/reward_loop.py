@@ -20,7 +20,7 @@ import aiohttp
 import numpy as np
 import ray
 import torch
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tensordict import TensorDict
 
 from verl.protocol import DataProto
@@ -46,9 +46,15 @@ def migrate_legacy_reward_impl(config):
 
     # 2. reward manager migration
     # config.reward_model.reward_manager -> config.reward.reward_manager
-    if config.reward_model.reward_manager is not None:
+    reward_manager_cfg = config.reward.reward_manager
+    using_default_reward_manager = (
+        reward_manager_cfg.name == "naive"
+        and reward_manager_cfg.source == "register"
+        and reward_manager_cfg.module.path is None
+    )
+    if config.reward_model.reward_manager is not None and using_default_reward_manager:
         config.reward.reward_manager.name = config.reward_model.reward_manager
-    if config.reward_model.reward_loop_source is not None:
+    if config.reward_model.reward_loop_source is not None and using_default_reward_manager:
         config.reward.reward_manager.source = config.reward_model.reward_loop_source
         config.reward.reward_manager.module.path = config.reward_model.reward_loop_module_path
         config.reward.reward_manager.module.name = config.reward_model.reward_loop_class_name
@@ -68,7 +74,16 @@ def migrate_legacy_reward_impl(config):
     # config.reward_model.reward_kwargs -> config.reward.reward_kwargs (for dapo algo)
     if config.reward_model.get("reward_kwargs") is not None:
         with open_dict(config.reward):
-            config.reward["reward_kwargs"] = config.reward_model["reward_kwargs"]
+            legacy_reward_kwargs = OmegaConf.create(
+                OmegaConf.to_container(config.reward_model["reward_kwargs"], resolve=False)
+            )
+            current_reward_kwargs = OmegaConf.create(
+                OmegaConf.to_container(config.reward.get("reward_kwargs", {}), resolve=False)
+            )
+            config.reward["reward_kwargs"] = OmegaConf.to_container(
+                OmegaConf.merge(legacy_reward_kwargs, current_reward_kwargs),
+                resolve=False,
+            )
     # config.reward_model.rollout -> config.reward.reward_model.rollout
     legacy_rollout = config.reward_model.rollout
     for key in legacy_rollout.keys():
@@ -128,6 +143,7 @@ class RewardLoopWorker:
             self.input_tokenizer,
             reward_router_address=self.reward_router_address,
             reward_model_tokenizer=self.reward_model_tokenizer,
+            **self.config.reward.get("reward_kwargs", {}),
         )
 
     async def compute_score_batch(self, data: DataProto) -> list[dict]:

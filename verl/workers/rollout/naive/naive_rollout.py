@@ -59,13 +59,14 @@ class NaiveRollout(BaseRollout):
 
         batch_size = idx.size(0)
         prompt_length = idx.size(1)
+        response_length = prompts.meta_info.get("response_length", self.config.response_length)
 
         self.module.eval()
 
         prev_attention_mask = torch.ones(size=(batch_size, 1), dtype=attention_mask.dtype, device=attention_mask.device)
 
         logits_lst = []
-        for _ in range(self.config.response_length):
+        for _ in range(response_length):
             # if the sequence context is growing too long we must crop it at block_size
             # idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             idx_cond = idx

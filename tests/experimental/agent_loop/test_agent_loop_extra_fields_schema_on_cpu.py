@@ -67,6 +67,9 @@ class _FakeServerManager:
 class _FakeTokenizer:
     padding_side = "right"
 
+    def __init__(self):
+        self.last_apply_chat_template_kwargs: dict[str, Any] | None = None
+
     def apply_chat_template(
         self,
         messages: list[dict[str, Any]],
@@ -76,7 +79,8 @@ class _FakeTokenizer:
         tokenize: bool = True,
         **kwargs,
     ) -> list[int]:
-        del messages, tools, add_generation_prompt, tokenize, kwargs
+        del messages, tools, add_generation_prompt, tokenize
+        self.last_apply_chat_template_kwargs = dict(kwargs)
         # Minimal tokenization: return a small prompt.
         return [101, 102]
 
@@ -249,6 +253,44 @@ async def test_agent_loop_extra_fields_schema_stable_for_training_concat_on_cpu(
 
 
 @pytest.mark.asyncio
+async def test_single_turn_agent_loop_uses_per_sample_chat_template_kwargs_on_cpu():
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {"prompt_length": 16, "response_length": 16, "multi_turn": {"tool_config_path": None}},
+                "model": {},
+            },
+            "data": {
+                "tool_config_path": None,
+                "apply_chat_template_kwargs": {"enable_thinking": True},
+            },
+        }
+    )
+
+    server_manager = _FakeServerManager()
+    tokenizer = _FakeTokenizer()
+    processor = None
+
+    single_turn = SingleTurnAgentLoop(
+        trainer_config=DictConfigWrap(config),
+        server_manager=server_manager,
+        tokenizer=tokenizer,
+        processor=processor,
+        dataset_cls=RLHFDataset,
+        data_config=DictConfigWrap(config.data),
+    )
+
+    await single_turn.run(
+        sampling_params={},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        chat_template_kwargs={"enable_thinking": False},
+    )
+
+    assert tokenizer.last_apply_chat_template_kwargs is not None
+    assert tokenizer.last_apply_chat_template_kwargs["enable_thinking"] is False
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
     class _DummyWorker:
         _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
@@ -292,3 +334,74 @@ async def test_agent_loop_postprocess_accepts_read_only_routed_experts_on_cpu():
     torch.testing.assert_close(internal.routed_experts[:, 2:6], expected)
     assert torch.count_nonzero(internal.routed_experts[:, :2]) == 0
     assert torch.count_nonzero(internal.routed_experts[:, 6:]) == 0
+
+
+@pytest.mark.asyncio
+async def test_single_turn_agent_respects_response_length_override_on_cpu():
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {"prompt_length": 16, "response_length": 4, "multi_turn": {"tool_config_path": None}},
+                "model": {},
+            },
+            "data": {
+                "tool_config_path": None,
+                "apply_chat_template_kwargs": {},
+            },
+        }
+    )
+
+    single_turn = SingleTurnAgentLoop(
+        trainer_config=DictConfigWrap(config),
+        server_manager=_FakeServerManager(),
+        tokenizer=_FakeTokenizer(),
+        processor=None,
+        dataset_cls=RLHFDataset,
+        data_config=DictConfigWrap(config.data),
+    )
+
+    output = await single_turn.run(
+        sampling_params={},
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        response_length_override=2,
+    )
+
+    assert output.response_ids == [102, 11]
+    assert output.response_mask == [1, 1]
+    assert output.response_logprobs == [0.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_postprocess_uses_validation_response_length_override_on_cpu():
+    class _DummyWorker:
+        _compute_multi_modal_inputs = AgentLoopWorker._compute_multi_modal_inputs
+        _compute_position_ids = AgentLoopWorker._compute_position_ids
+        _compute_score = AgentLoopWorker._compute_score
+
+        def __init__(self):
+            self.tokenizer = _FakeTokenizer()
+            self.rollout_config = OmegaConf.create({"prompt_length": 4, "response_length": 2})
+            self.processor = None
+            self.reward_loop_worker_handles = None
+
+    output = AgentLoopOutput(
+        prompt_ids=[101, 102],
+        response_ids=[11, 12, 13, 14],
+        response_mask=[1, 1, 1, 1],
+        response_logprobs=[0.1, 0.2, 0.3, 0.4],
+        metrics=AgentLoopMetrics(),
+        extra_fields={},
+    )
+
+    internal = await AgentLoopWorker._agent_loop_postprocess(
+        _DummyWorker(),
+        output,
+        raw_prompt=[{"role": "user", "content": "hi"}],
+        response_length=4,
+        validate=True,
+    )
+
+    assert internal.response_ids.shape == (1, 4)
+    torch.testing.assert_close(internal.response_ids, torch.tensor([[11, 12, 13, 14]], dtype=torch.long))
+    torch.testing.assert_close(internal.response_mask, torch.tensor([[1, 1, 1, 1]], dtype=torch.long))
+    torch.testing.assert_close(internal.response_logprobs, torch.tensor([[0.1, 0.2, 0.3, 0.4]]))

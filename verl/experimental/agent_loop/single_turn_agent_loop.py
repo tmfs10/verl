@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.utils.profiler import simple_timer
+from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.replica import TokenOutput
 
 logger = logging.getLogger(__file__)
@@ -35,6 +36,7 @@ class SingleTurnAgentLoop(AgentLoopBase):
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         messages = list(kwargs["raw_prompt"])
+        response_length = int(kwargs.get("response_length_override", self.response_length))
 
         # 1. extract images and videos from messages
         multi_modal_data = await self.process_vision_info(messages)
@@ -42,16 +44,20 @@ class SingleTurnAgentLoop(AgentLoopBase):
         videos = multi_modal_data.get("videos")
 
         # 2. apply chat template and tokenize
-        prompt_ids = await self.apply_chat_template(
-            messages,
-            images=images,
-            videos=videos,
-        )
+        if kwargs.get("prompt_ids_override", None) is not None:
+            prompt_ids = normalize_token_ids(kwargs["prompt_ids_override"])
+        else:
+            prompt_ids = await self.apply_chat_template(
+                messages,
+                images=images,
+                videos=videos,
+                chat_template_kwargs=kwargs.get("chat_template_kwargs"),
+            )
 
         # 3. generate sequences
         metrics = {}
         with simple_timer("generate_sequences", metrics):
-            output: TokenOutput = await self.server_manager.generate(
+            token_output: TokenOutput = await self.server_manager.generate(
                 request_id=uuid4().hex,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
@@ -59,26 +65,34 @@ class SingleTurnAgentLoop(AgentLoopBase):
                 video_data=videos,
             )
         if metrics.get("num_preempted") is None:
-            metrics["num_preempted"] = output.num_preempted if output.num_preempted is not None else -1
-        response_mask = [1] * len(output.token_ids)
+            metrics["num_preempted"] = token_output.num_preempted if token_output.num_preempted is not None else -1
+        response_mask = [1] * len(token_output.token_ids)
 
         output: AgentLoopOutput = AgentLoopOutput(
             prompt_ids=prompt_ids,
-            response_ids=output.token_ids[: self.response_length],
-            response_mask=response_mask[: self.response_length],
-            response_logprobs=output.log_probs[: self.response_length] if output.log_probs else None,
+            response_ids=token_output.token_ids[:response_length],
+            response_mask=response_mask[:response_length],
+            response_logprobs=token_output.log_probs[:response_length] if token_output.log_probs else None,
             routed_experts=(
-                output.routed_experts[: len(prompt_ids) + self.response_length]
-                if output.routed_experts is not None
+                token_output.routed_experts[: len(prompt_ids) + response_length]
+                if token_output.routed_experts is not None
                 else None
             ),
             multi_modal_data=multi_modal_data,
             num_turns=2,
             metrics=metrics,
-            extra_fields=output.extra_fields,
+            extra_fields=token_output.extra_fields,
         )
 
         # keeping the schema consistent with tool_agent_loop
-        output.extra_fields.update({"turn_scores": [], "tool_rewards": []})
+        finish_reason = output.extra_fields.get("finish_reason", token_output.stop_reason)
+        output.extra_fields.update(
+            {
+                "turn_scores": [],
+                "tool_rewards": [],
+                "stop_reason": token_output.stop_reason,
+                "finish_reason": finish_reason,
+            }
+        )
 
         return output

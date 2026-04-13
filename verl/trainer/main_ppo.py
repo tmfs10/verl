@@ -20,11 +20,12 @@ import socket
 
 import hydra
 import ray
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
+from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
@@ -42,6 +43,7 @@ def main(config):
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)
     config = migrate_legacy_reward_impl(config)
+    config = _apply_reward_focus_mask_alignment(config)
     run_ppo(config)
 
 
@@ -103,6 +105,91 @@ def run_ppo(config, task_runner_class=None) -> None:
     timeline_json_file = config.ray_kwargs.get("timeline_json_file", None)
     if timeline_json_file:
         ray.timeline(filename=timeline_json_file)
+
+
+def _build_validation_reward_config(config):
+    train_reward_kwargs = dict(config.reward.get("reward_kwargs", {}))
+    val_reward_kwargs = dict(config.reward.get("val_reward_kwargs", {}))
+    val_reward_manager_cfg = config.reward.get("val_reward_manager")
+    uniform_outcome_reward_kwarg = "use_response_logprob_reward_for_uniform_outcome_groups"
+
+    def _disable_uniform_outcome_reward(kwargs):
+        # Validation must stay on the standard GRPO reward path even when
+        # training adds the uniform-outcome response-logprob reward.
+        kwargs = dict(kwargs)
+        kwargs[uniform_outcome_reward_kwarg] = False
+        return kwargs
+
+    if val_reward_manager_cfg is not None:
+        val_config = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
+        val_config.reward.reward_manager = OmegaConf.create(OmegaConf.to_container(val_reward_manager_cfg, resolve=False))
+        return val_config, _disable_uniform_outcome_reward(val_reward_kwargs)
+
+    train_reward_source = OmegaConf.select(config, "reward.reward_manager.source", default="register")
+    train_reward_name = OmegaConf.select(config, "reward.reward_manager.name", default=None)
+
+    if train_reward_source == "register" and train_reward_name == "conditional_logprob":
+        val_config = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
+        val_config.reward.reward_manager.name = "batch"
+        print("Using batch validation reward manager for conditional_logprob training.")
+        return val_config, _disable_uniform_outcome_reward(val_reward_kwargs)
+
+    if val_reward_kwargs:
+        train_reward_kwargs.update(val_reward_kwargs)
+    return config, _disable_uniform_outcome_reward(train_reward_kwargs)
+
+
+def _apply_reward_focus_mask_alignment(config):
+    data_selection_mode = OmegaConf.select(config, "data.masked_solution_selection_mode", default="random_fraction")
+    if data_selection_mode != "reward_focus_tail":
+        return config
+
+    reward_mode = OmegaConf.select(config, "reward.reward_kwargs.conditioning_reward_mode", default=None)
+    valid_reward_modes = {
+        "low_confidence_recovery_ratio",
+        "low_confidence_token_topk_recall",
+        "low_confidence_token_mrr",
+    }
+    if reward_mode not in valid_reward_modes:
+        raise ValueError(
+            "data.masked_solution_selection_mode='reward_focus_tail' requires "
+            "reward.reward_kwargs.conditioning_reward_mode to be one of "
+            f"{sorted(valid_reward_modes)}, got {reward_mode!r}."
+        )
+
+    reward_tail_percent = OmegaConf.select(config, "reward.reward_kwargs.low_confidence_tail_percent", default=None)
+    if reward_tail_percent is None:
+        raise ValueError(
+            "data.masked_solution_selection_mode='reward_focus_tail' requires "
+            "reward.reward_kwargs.low_confidence_tail_percent to be set."
+        )
+    data_tail_percent = OmegaConf.select(config, "data.masked_solution_focus_tail_percent", default=None)
+    if data_tail_percent is None:
+        config.data.masked_solution_focus_tail_percent = reward_tail_percent
+    elif float(data_tail_percent) != float(reward_tail_percent):
+        raise ValueError(
+            "data.masked_solution_focus_tail_percent must match "
+            "reward.reward_kwargs.low_confidence_tail_percent when "
+            "data.masked_solution_selection_mode='reward_focus_tail'. "
+            f"Got data={data_tail_percent!r}, reward={reward_tail_percent!r}."
+        )
+
+    reward_min_tokens = OmegaConf.select(config, "reward.reward_kwargs.low_confidence_min_tokens", default=1)
+    data_min_tokens = OmegaConf.select(config, "data.masked_solution_focus_min_tokens", default=None)
+    if data_min_tokens is None:
+        config.data.masked_solution_focus_min_tokens = reward_min_tokens
+    elif int(data_min_tokens) != int(reward_min_tokens):
+        raise ValueError(
+            "data.masked_solution_focus_min_tokens must match "
+            "reward.reward_kwargs.low_confidence_min_tokens when "
+            "data.masked_solution_selection_mode='reward_focus_tail'. "
+            f"Got data={data_min_tokens!r}, reward={reward_min_tokens!r}."
+        )
+
+    with open_dict(config.reward.reward_kwargs):
+        config.reward.reward_kwargs["low_confidence_min_tokens"] = int(reward_min_tokens)
+        config.reward.reward_kwargs["align_conditioning_focus_with_prompt_mask"] = True
+    return config
 
 
 class TaskRunner:
@@ -339,10 +426,16 @@ class TaskRunner:
         )
         train_sampler = create_rl_sampler(config.data, train_dataset)
 
+        reward_fn = load_reward_manager(config, tokenizer, num_examine=0, **config.reward.get("reward_kwargs", {}))
+        val_reward_config, val_reward_kwargs = _build_validation_reward_config(config)
+        val_reward_fn = load_reward_manager(val_reward_config, tokenizer, num_examine=1, **val_reward_kwargs)
+
         # Initialize the PPO trainer.
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
+            reward_fn=reward_fn,
+            val_reward_fn=val_reward_fn,
             processor=processor,
             role_worker_mapping=self.role_worker_mapping,
             resource_pool_manager=resource_pool_manager,
@@ -376,13 +469,23 @@ def create_rl_dataset(data_paths, data_config, tokenizer, processor, is_train=Tr
 
     # Get the dataset class
     dataset_cls = get_dataset_class(data_config)
+    dataset_config = OmegaConf.create(OmegaConf.to_container(data_config, resolve=False))
+    split_apply_kwargs = OmegaConf.select(
+        data_config,
+        "train_apply_chat_template_kwargs" if is_train else "val_apply_chat_template_kwargs",
+        default=None,
+    )
+    if split_apply_kwargs is not None:
+        dataset_config.apply_chat_template_kwargs = OmegaConf.create(
+            OmegaConf.to_container(split_apply_kwargs, resolve=False)
+        )
 
     # Instantiate the dataset using the determined dataset class
     dataset = dataset_cls(
         data_files=data_paths,
         tokenizer=tokenizer,
         processor=processor,
-        config=data_config,
+        config=dataset_config,
         max_samples=max_samples,
     )
 

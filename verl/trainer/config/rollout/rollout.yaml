@@ -155,6 +155,9 @@ val_kwargs:
   # whether to repeat n times for validation
   n: 1
 
+  # Optional validation-only response length override. null uses rollout.response_length.
+  response_length: null
+
   # Whether to sample during training rollout. False uses greedy sampling.
   do_sample: False
 
@@ -169,6 +172,9 @@ multi_turn:
 
   # null for no limit (default max_length // 3)
   max_assistant_turns: null
+
+  # null to use the rollout response_length as the per-turn generation cap
+  per_turn_response_length: null
 
   # null for no tool
   tool_config_path: null

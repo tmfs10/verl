@@ -129,7 +129,7 @@ class HFRollout(BaseRollout):
 
         # huggingface generate will stop generating when all the batch reaches [EOS].
         # We have to pad to response_length
-        sequence_length = prompt_length + self.config.response_length
+        sequence_length = prompt_length + response_length
         delta_length = sequence_length - seq.shape[1]
 
         if delta_length > 0:

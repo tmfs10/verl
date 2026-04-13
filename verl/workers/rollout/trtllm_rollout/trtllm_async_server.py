@@ -237,7 +237,14 @@ class TRTLLMHttpServer:
     ) -> TokenOutput:
         from tensorrt_llm.llmapi import SamplingParams
 
-        max_tokens = min(self.config.response_length, self.config.max_model_len - len(prompt_ids))
+        max_possible_tokens = self.config.max_model_len - len(prompt_ids)
+        if "max_tokens" in sampling_params:
+            max_tokens = sampling_params.pop("max_tokens")
+        elif "max_new_tokens" in sampling_params:
+            max_tokens = sampling_params.pop("max_new_tokens")
+        else:
+            max_tokens = self.config.response_length
+        max_tokens = max(0, min(max_tokens, max_possible_tokens))
         sampling_params["max_tokens"] = max_tokens
         sampling_params["logprobs"] = 1 if sampling_params.pop("logprobs", False) else None
         if sampling_params["top_k"] == -1:

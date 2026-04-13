@@ -2,6 +2,8 @@
 
 # we launch num_workers reward managers to parallelize the reward computation
 num_workers: 8
+reward_kwargs: {}
+val_reward_kwargs: {}
 
 # custom reward function definition
 custom_reward_function:
@@ -20,6 +22,8 @@ reward_manager:
     _target_: verl.trainer.config.config.ModuleConfig
     path: null
     name: custom_reward_manager
+
+val_reward_manager: null
 
 # Inference config for reward models,
 # support both discriminative and generative models

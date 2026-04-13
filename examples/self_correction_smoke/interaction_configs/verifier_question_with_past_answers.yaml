@@ -1,0 +1,7 @@
+interaction:
+  - name: "selfcorr"
+    class_name: "verl.interactions.math_verify_interaction.MathVerifyInteraction"
+    config:
+      interaction_mode: verifier
+      turn_context_mode: question_with_past_answers
+

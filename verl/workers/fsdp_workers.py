@@ -280,6 +280,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.config.ref.log_prob_micro_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             self.config.ref.log_prob_micro_batch_size_per_gpu = self.config.ref.log_prob_micro_batch_size
 
+    def _get_data_parallel_group(self):
+        if self.ulysses_device_mesh is not None:
+            return self.ulysses_device_mesh.get_group(mesh_dim="dp")
+        return torch.distributed.group.WORLD
+
     def _init_qat_config(self):
         """Initialize QAT configuration from actor.qat."""
         try:
@@ -1006,9 +1011,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
             data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+            dp_group = self._get_data_parallel_group()
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data)
+                metrics = self.actor.update_policy(data=data, dp_group=dp_group, same_micro_num_in_dp=True)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             images_seqlens = data.meta_info.get("images_seqlens", None)
@@ -1113,9 +1119,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         # perform recompute log_prob
         calculate_entropy = not is_lora
+        dp_group = self._get_data_parallel_group()
         with self.ulysses_sharding_manager:
             with adapter_ctx:
-                outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
+                outputs = self.actor.compute_log_prob(
+                    data=data,
+                    calculate_entropy=calculate_entropy,
+                    dp_group=dp_group,
+                    same_micro_num_in_dp=True,
+                )
             if not is_lora:
                 tensors = {"old_log_probs": outputs["log_probs"]}
             else:
@@ -1124,6 +1136,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 tensors["entropys"] = outputs["entropys"]
             if "sum_pi_squared" in outputs:
                 tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
+            if "topk_token_ids" in outputs:
+                tensors["topk_token_ids"] = outputs["topk_token_ids"]
+            if "token_reciprocal_ranks" in outputs:
+                tensors["token_reciprocal_ranks"] = outputs["token_reciprocal_ranks"]
             output = DataProto.from_dict(
                 tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},
@@ -1159,9 +1175,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
+        dp_group = self._get_data_parallel_group()
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on ref.compute_log_prob
-            outputs = self.ref_policy.compute_log_prob(data=data, calculate_entropy=False)
+            outputs = self.ref_policy.compute_log_prob(
+                data=data,
+                calculate_entropy=False,
+                dp_group=dp_group,
+                same_micro_num_in_dp=True,
+            )
             output = DataProto.from_dict(tensors={"ref_log_prob": outputs["log_probs"]})
 
         output = output.to("cpu")

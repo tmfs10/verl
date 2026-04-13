@@ -17,7 +17,7 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "OPSDConfig", "RolloutCorrectionConfig"]
 
 
 @dataclass
@@ -565,6 +565,183 @@ class RolloutCorrectionConfig(BaseConfig):
 
 
 @dataclass
+class OPSDConfig(BaseConfig):
+    """Configuration for On-Policy Self Distillation (OPSD).
+
+    OPSD trains on model-generated responses, but compares the student policy
+    (conditioned on the original prompt) against a teacher branch that is
+    conditioned either on the original prompt plus the ground-truth answer, or
+    on the original prompt plus a successful same-batch rollout in SDPO style.
+
+    In ``opsd_rlvr`` mode, the teacher branch additionally receives the usual
+    RLVR objective using verifier rewards, with optional off-policy correction
+    against the student/original-prompt behavior policy.
+    """
+
+    enable: bool = False
+    mode: str = "opsd"
+    teacher_source: str = "ground_truth"
+    teacher_model: str = "actor"
+    teacher_ema_rate: float = 0.05
+    teacher_ema_cpu_offload: bool = True
+    ground_truth_field: str = "ground_truth_answer"
+    teacher_prompt_style: str = "append_instruction"
+    teacher_apply_chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
+    teacher_prefix: str = "\n\nBelow is the ground truth answer:\n"
+    teacher_suffix: str = "\n\nNow solve the problem"
+    sdpo_success_prefix: str = "\n\nBelow is a successful previous attempt for this question:\n"
+    sdpo_success_suffix: str = "\n\nUse the successful previous attempt as implicit feedback and solve the problem again."
+    sdpo_distill_only_failed: bool = True
+    sdpo_exclude_self_success: bool = True
+    distill_loss: str = "topk_jsd"
+    topk: int = 16
+    distill_beta: float = 0.5
+    distill_token_clip: Optional[float] = None
+    distill_token_clip_tail: bool = True
+    distill_max_response_tokens: Optional[int] = None
+    mix_weight: float = 0.5
+    balance_mode: str = "grad_norm"
+    balance_param_subset: str = "lm_head"
+    separate_backward: bool = True
+    distill_backward_scale: float = 1.0
+    rlvr_backward_scale: float = 1.0
+    rlvr_warmup_steps: int = 0
+    offpolicy_is_mode: str = "sequence"
+    offpolicy_is_clip: float = 2.0
+    behavior_logprob_source: str = "rollout"
+    max_prompt_length: Optional[int] = None
+    truncation: Optional[str] = None
+    text_only: bool = True
+    log_diagnostics: bool = False
+    debug_print_interval: int = 0
+    debug_num_tokens: int = 8
+
+    def __post_init__(self):
+        valid_modes = {"opsd", "opsd_rlvr"}
+        if self.mode not in valid_modes:
+            raise ValueError(f"Invalid opsd.mode: {self.mode}. Must be one of {sorted(valid_modes)}")
+
+        valid_teacher_sources = {"ground_truth", "sdpo_success_rollout"}
+        if self.teacher_source not in valid_teacher_sources:
+            raise ValueError(
+                f"Invalid opsd.teacher_source: {self.teacher_source}. "
+                f"Must be one of {sorted(valid_teacher_sources)}"
+            )
+
+        valid_teacher_models = {"actor", "ema", "fixed"}
+        if self.teacher_model not in valid_teacher_models:
+            raise ValueError(
+                f"Invalid opsd.teacher_model: {self.teacher_model}. "
+                f"Must be one of {sorted(valid_teacher_models)}"
+            )
+        if self.teacher_model == "ema" and self.mode == "opsd_rlvr":
+            raise ValueError("opsd.teacher_model=ema is only supported with opsd.mode=opsd.")
+        if self.teacher_model == "fixed" and self.mode == "opsd_rlvr":
+            raise ValueError("opsd.teacher_model=fixed is only supported with opsd.mode=opsd.")
+        if not 0.0 <= self.teacher_ema_rate <= 1.0:
+            raise ValueError(
+                f"opsd.teacher_ema_rate must be in [0, 1], got {self.teacher_ema_rate}"
+            )
+
+        valid_teacher_prompt_styles = {"append_instruction", "reference_solution_single_user"}
+        if self.teacher_prompt_style not in valid_teacher_prompt_styles:
+            raise ValueError(
+                "Invalid opsd.teacher_prompt_style: "
+                f"{self.teacher_prompt_style}. Must be one of {sorted(valid_teacher_prompt_styles)}"
+            )
+
+        valid_distill_losses = {"topk_jsd", "full_jsd", "sampled_reverse_kl"}
+        if self.distill_loss not in valid_distill_losses:
+            raise ValueError(
+                f"Invalid opsd.distill_loss: {self.distill_loss}. Must be one of {sorted(valid_distill_losses)}"
+            )
+
+        if self.distill_loss == "topk_jsd":
+            if self.topk <= 0:
+                raise ValueError(f"opsd.topk must be positive when distill_loss=topk_jsd, got {self.topk}")
+        elif self.topk < 0:
+            raise ValueError(f"opsd.topk must be non-negative, got {self.topk}")
+
+        if not 0.0 <= self.distill_beta <= 1.0:
+            raise ValueError(f"opsd.distill_beta must be in [0, 1], got {self.distill_beta}")
+
+        if self.distill_token_clip is not None and self.distill_token_clip <= 0.0:
+            raise ValueError(
+                "opsd.distill_token_clip must be positive when set, "
+                f"got {self.distill_token_clip}"
+            )
+
+        if self.distill_max_response_tokens is not None and self.distill_max_response_tokens <= 0:
+            raise ValueError(
+                "opsd.distill_max_response_tokens must be positive when set, "
+                f"got {self.distill_max_response_tokens}"
+            )
+
+        if self.debug_print_interval < 0:
+            raise ValueError(f"opsd.debug_print_interval must be non-negative, got {self.debug_print_interval}")
+
+        if self.debug_num_tokens <= 0:
+            raise ValueError(f"opsd.debug_num_tokens must be positive, got {self.debug_num_tokens}")
+
+        if not 0.0 <= self.mix_weight <= 1.0:
+            raise ValueError(f"opsd.mix_weight must be in [0, 1], got {self.mix_weight}")
+
+        if self.distill_backward_scale < 0.0:
+            raise ValueError(
+                "opsd.distill_backward_scale must be non-negative, "
+                f"got {self.distill_backward_scale}"
+            )
+
+        if self.rlvr_backward_scale < 0.0:
+            raise ValueError(
+                "opsd.rlvr_backward_scale must be non-negative, "
+                f"got {self.rlvr_backward_scale}"
+            )
+
+        if self.rlvr_warmup_steps < 0:
+            raise ValueError(
+                "opsd.rlvr_warmup_steps must be non-negative, "
+                f"got {self.rlvr_warmup_steps}"
+            )
+
+        valid_balance_modes = {"none", "grad_norm"}
+        if self.balance_mode not in valid_balance_modes:
+            raise ValueError(
+                f"Invalid opsd.balance_mode: {self.balance_mode}. Must be one of {sorted(valid_balance_modes)}"
+            )
+
+        valid_balance_subsets = {"lm_head", "last_layer", "all"}
+        if self.balance_param_subset not in valid_balance_subsets:
+            raise ValueError(
+                "Invalid opsd.balance_param_subset: "
+                f"{self.balance_param_subset}. Must be one of {sorted(valid_balance_subsets)}"
+            )
+
+        valid_is_modes = {"none", "token", "sequence"}
+        if self.offpolicy_is_mode not in valid_is_modes:
+            raise ValueError(
+                f"Invalid opsd.offpolicy_is_mode: {self.offpolicy_is_mode}. Must be one of {sorted(valid_is_modes)}"
+            )
+
+        if self.offpolicy_is_clip <= 0:
+            raise ValueError(f"opsd.offpolicy_is_clip must be positive, got {self.offpolicy_is_clip}")
+
+        valid_behavior_sources = {"rollout", "recompute"}
+        if self.behavior_logprob_source not in valid_behavior_sources:
+            raise ValueError(
+                "Invalid opsd.behavior_logprob_source: "
+                f"{self.behavior_logprob_source}. Must be one of {sorted(valid_behavior_sources)}"
+            )
+
+        valid_truncation = {None, "left", "right", "middle", "error"}
+        if self.truncation not in valid_truncation:
+            raise ValueError(
+                f"Invalid opsd.truncation: {self.truncation}. Must be one of "
+                f"{sorted(x for x in valid_truncation if x is not None)} or None"
+            )
+
+
+@dataclass
 class AlgoConfig(BaseConfig):
     """Configuration for the algorithm.
 
@@ -612,6 +789,7 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    opsd: OPSDConfig = field(default_factory=OPSDConfig)
     # GDPO (Group reward-Decoupled Normalization Policy Optimization) settings.
     # gdpo_reward_keys: keys in non_tensor_batch (from compute_score's return dict) that
     #   correspond to individual reward dimensions, e.g. ["format_reward", "accuracy_reward"].

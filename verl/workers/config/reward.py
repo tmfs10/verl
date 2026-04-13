@@ -15,7 +15,7 @@
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 from verl.trainer.config.config import ModuleConfig
@@ -96,7 +96,10 @@ class RewardConfig(BaseConfig):
 
     # reward manager args
     num_workers: int = 8
+    reward_kwargs: dict[str, Any] = field(default_factory=dict)
+    val_reward_kwargs: dict[str, Any] = field(default_factory=dict)
     reward_manager: RewardManagerConfig = field(default_factory=RewardManagerConfig)
+    val_reward_manager: Optional[RewardManagerConfig] = None
 
     # reward model args
     reward_model: RewardModelConfig = field(default_factory=RewardModelConfig)

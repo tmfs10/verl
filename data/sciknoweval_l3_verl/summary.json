@@ -1,0 +1,14 @@
+{
+  "test": {
+    "Biology": 22,
+    "Chemistry": 201,
+    "Physics": 94,
+    "combined": 317
+  },
+  "train": {
+    "Biology": 278,
+    "Chemistry": 1899,
+    "Physics": 706,
+    "combined": 2883
+  }
+}

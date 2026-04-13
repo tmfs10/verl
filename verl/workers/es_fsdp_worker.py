@@ -341,7 +341,11 @@ class ESFSDPWorker(Worker):
             temperature=(val_cfg.temperature if val_cfg is not None else self.gen_args.temperature),
             top_p=(val_cfg.top_p if val_cfg is not None else self.gen_args.top_p),
             top_k=(val_cfg.top_k if val_cfg is not None else self.gen_args.top_k),
-            response_length=self.gen_args.response_length,
+            response_length=(
+                val_cfg.response_length
+                if val_cfg is not None and val_cfg.response_length is not None
+                else self.gen_args.response_length
+            ),
         )
 
         bsz = self.algo.rollout_batch_size or 1

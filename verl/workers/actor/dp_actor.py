@@ -111,7 +111,12 @@ class DataParallelPPOActor(BasePPOActor):
             )
 
     def _forward_micro_batch(
-        self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
+        self,
+        micro_batch: dict[str, torch.Tensor],
+        temperature: float,
+        calculate_entropy: bool = False,
+        calculate_token_topk: int = 0,
+        calculate_token_mrr: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
         Returns:
@@ -131,6 +136,7 @@ class DataParallelPPOActor(BasePPOActor):
                 and not self.use_ulysses_sp
                 and not self.use_fused_kernels
                 and not self.use_dynamic_bsz
+                and calculate_token_topk == 0
             )
             if can_use_pg and "response_mask" in micro_batch and "uid" in micro_batch:
                 from verl.trainer.ppo.prefix_grouper_utils import forward_micro_batch_with_prefix_grouper
@@ -251,12 +257,23 @@ class DataParallelPPOActor(BasePPOActor):
                 )  # prevent model thinks we are generating
 
                 if self.use_fused_kernels:
+                    if calculate_token_topk > 0 or calculate_token_mrr:
+                        raise ValueError(
+                            "top-k token extraction and token reciprocal-rank extraction are not supported "
+                            "when fused kernels are enabled."
+                        )
                     log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
                     entropy_rmpad = output.entropy.squeeze(0)  # (total_nnz,)
 
                 else:
                     logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                     logits_rmpad.div_(temperature)
+                    if calculate_token_topk > 0:
+                        topk_token_ids_rmpad = torch.topk(logits_rmpad, k=calculate_token_topk, dim=-1).indices
+                    if calculate_token_mrr:
+                        gt_logits_rmpad = logits_rmpad.gather(dim=-1, index=input_ids_rmpad_rolled.unsqueeze(-1)).squeeze(-1)
+                        better_token_counts_rmpad = (logits_rmpad > gt_logits_rmpad.unsqueeze(-1)).sum(dim=-1)
+                        token_reciprocal_ranks_rmpad = (better_token_counts_rmpad.to(torch.float32) + 1.0).reciprocal()
 
                     # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                     inplace_backward = True
@@ -307,11 +324,26 @@ class DataParallelPPOActor(BasePPOActor):
                         sum_pi_squared_rmpad = gather_outputs_and_unpad(
                             sum_pi_squared_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
                         )
+                    if calculate_token_topk > 0:
+                        topk_token_ids_rmpad = gather_outputs_and_unpad(
+                            topk_token_ids_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
+                        )
+                    if calculate_token_mrr:
+                        token_reciprocal_ranks_rmpad = gather_outputs_and_unpad(
+                            token_reciprocal_ranks_rmpad,
+                            gather_dim=0,
+                            unpad_dim=0,
+                            padding_size=pad_size,
+                        )
 
                 if is_mask_all_zero:
                     log_probs = log_probs[:0]
                     if calculate_entropy:
                         entropy_rmpad = entropy_rmpad[:0]
+                    if calculate_token_topk > 0:
+                        topk_token_ids_rmpad = topk_token_ids_rmpad[:0]
+                    if calculate_token_mrr:
+                        token_reciprocal_ranks_rmpad = token_reciprocal_ranks_rmpad[:0]
 
                 # pad back to (bsz, seqlen)
                 if calculate_entropy:
@@ -334,6 +366,20 @@ class DataParallelPPOActor(BasePPOActor):
                     batch=batch_size,
                     seqlen=seqlen,
                 )
+                if calculate_token_topk > 0:
+                    full_topk_token_ids = pad_input(
+                        hidden_states=topk_token_ids_rmpad,
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
+                if calculate_token_mrr:
+                    full_token_reciprocal_ranks = pad_input(
+                        hidden_states=token_reciprocal_ranks_rmpad.unsqueeze(-1),
+                        indices=indices,
+                        batch=batch_size,
+                        seqlen=seqlen,
+                    )
 
                 # only return response part:
                 if calculate_entropy:
@@ -342,6 +388,10 @@ class DataParallelPPOActor(BasePPOActor):
                     # (bsz, response_length)
                     sum_pi_squared = full_sum_pi_squared.squeeze(-1)[:, -response_length - 1 : -1]
                 log_probs = full_log_probs.squeeze(-1)[:, -response_length - 1 : -1]  # (bsz, response_length)
+                if calculate_token_topk > 0:
+                    topk_token_ids = full_topk_token_ids[:, -response_length - 1 : -1, :]
+                if calculate_token_mrr:
+                    token_reciprocal_ranks = full_token_reciprocal_ranks.squeeze(-1)[:, -response_length - 1 : -1]
 
             else:  # not using rmpad and no ulysses sp
                 extra_args = {}
@@ -359,6 +409,11 @@ class DataParallelPPOActor(BasePPOActor):
                 )  # prevent model thinks we are generating
 
                 if self.use_fused_kernels:
+                    if calculate_token_topk > 0 or calculate_token_mrr:
+                        raise ValueError(
+                            "top-k token extraction and token reciprocal-rank extraction are not supported "
+                            "when fused kernels are enabled."
+                        )
                     log_probs = output.log_probs[:, -response_length - 1 : -1]
                     entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
@@ -368,6 +423,12 @@ class DataParallelPPOActor(BasePPOActor):
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    if calculate_token_topk > 0:
+                        topk_token_ids = torch.topk(logits, k=calculate_token_topk, dim=-1).indices
+                    if calculate_token_mrr:
+                        gt_logits = logits.gather(dim=-1, index=micro_batch["responses"].unsqueeze(-1)).squeeze(-1)
+                        better_token_counts = (logits > gt_logits.unsqueeze(-1)).sum(dim=-1)
+                        token_reciprocal_ranks = (better_token_counts.to(torch.float32) + 1.0).reciprocal()
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
@@ -386,6 +447,10 @@ class DataParallelPPOActor(BasePPOActor):
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
+            if calculate_token_topk > 0:
+                outputs["topk_token_ids"] = topk_token_ids
+            if calculate_token_mrr:
+                outputs["token_reciprocal_ranks"] = token_reciprocal_ranks
             return outputs
 
     def _optimizer_step(self):
@@ -422,7 +487,13 @@ class DataParallelPPOActor(BasePPOActor):
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False) -> dict[str, torch.Tensor]:
+    def compute_log_prob(
+        self,
+        data: DataProto,
+        calculate_entropy: bool = False,
+        dp_group=None,
+        same_micro_num_in_dp: bool = False,
+    ) -> dict[str, torch.Tensor]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -444,6 +515,8 @@ class DataParallelPPOActor(BasePPOActor):
                 - ``sum_pi_squared``: tensor of shape [batch_size, response_length]. torch.float32.
         """
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
+        calculate_token_topk = int(data.meta_info.get("topk_token_ids_k", 0) or 0)
+        calculate_token_mrr = bool(data.meta_info.get("calculate_token_mrr", False))
 
         # set to eval
         self.actor_module.eval()
@@ -465,31 +538,50 @@ class DataParallelPPOActor(BasePPOActor):
 
         if use_dynamic_bsz:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+            micro_batches, batch_idx_list = prepare_dynamic_batch(
+                data,
+                max_token_len=max_token_len,
+                dp_group=dp_group,
+                same_micro_num_in_dp=same_micro_num_in_dp,
+            )
         else:
             micro_batches = data.split(micro_batch_size)
 
         log_probs_lst = []
         entropy_lst = []
         sum_pi_squared_lst = []
+        topk_token_ids_lst = []
+        token_reciprocal_ranks_lst = []
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
             with torch.no_grad():
                 outputs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    calculate_token_topk=calculate_token_topk,
+                    calculate_token_mrr=calculate_token_mrr,
                 )
             log_probs_lst.append(outputs["log_probs"])
             if calculate_entropy:
                 entropy_lst.append(outputs["entropys"])
             if calculate_sum_pi_squared:
                 sum_pi_squared_lst.append(outputs["sum_pi_squared"])
+            if calculate_token_topk > 0:
+                topk_token_ids_lst.append(outputs["topk_token_ids"])
+            if calculate_token_mrr:
+                token_reciprocal_ranks_lst.append(outputs["token_reciprocal_ranks"])
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         if calculate_entropy:
             entropys = torch.concat(entropy_lst, dim=0)
         if calculate_sum_pi_squared:
             sum_pi_squared = torch.concat(sum_pi_squared_lst, dim=0)
+        if calculate_token_topk > 0:
+            topk_token_ids = torch.concat(topk_token_ids_lst, dim=0)
+        if calculate_token_mrr:
+            token_reciprocal_ranks = torch.concat(token_reciprocal_ranks_lst, dim=0)
 
         if use_dynamic_bsz:
             log_probs = restore_dynamic_batch(log_probs, batch_idx_list)
@@ -497,16 +589,24 @@ class DataParallelPPOActor(BasePPOActor):
                 entropys = restore_dynamic_batch(entropys, batch_idx_list)
             if calculate_sum_pi_squared:
                 sum_pi_squared = restore_dynamic_batch(sum_pi_squared, batch_idx_list)
+            if calculate_token_topk > 0:
+                topk_token_ids = restore_dynamic_batch(topk_token_ids, batch_idx_list)
+            if calculate_token_mrr:
+                token_reciprocal_ranks = restore_dynamic_batch(token_reciprocal_ranks, batch_idx_list)
 
         outputs = {"log_probs": log_probs}
         if calculate_entropy:
             outputs["entropys"] = entropys
         if calculate_sum_pi_squared:
             outputs["sum_pi_squared"] = sum_pi_squared
+        if calculate_token_topk > 0:
+            outputs["topk_token_ids"] = topk_token_ids
+        if calculate_token_mrr:
+            outputs["token_reciprocal_ranks"] = token_reciprocal_ranks
         return outputs
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def update_policy(self, data: DataProto):
+    def update_policy(self, data: DataProto, dp_group=None, same_micro_num_in_dp: bool = True):
         # make sure we are in training mode
         self.actor_module.train()
 
@@ -557,7 +657,12 @@ class DataParallelPPOActor(BasePPOActor):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    micro_batches, _ = prepare_dynamic_batch(
+                        mini_batch,
+                        max_token_len=max_token_len,
+                        dp_group=dp_group,
+                        same_micro_num_in_dp=same_micro_num_in_dp,
+                    )
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
@@ -590,6 +695,14 @@ class DataParallelPPOActor(BasePPOActor):
                     )
                     log_prob = outputs["log_probs"]
                     entropy = outputs["entropys"] if calculate_entropy else None
+                    valid_log_probs = log_prob[response_mask.bool()]
+                    if valid_log_probs.numel() > 0:
+                        valid_lengths = response_mask.sum(dim=-1).clamp_min(1)
+                        seq_logprob_mean = (log_prob * response_mask).sum(dim=-1) / valid_lengths
+                        micro_batch_metrics["actor/token_logprob_mean"] = valid_log_probs.mean().item()
+                        micro_batch_metrics["actor/token_logprob_std"] = valid_log_probs.std(unbiased=False).item()
+                        micro_batch_metrics["actor/seq_logprob_mean"] = seq_logprob_mean.mean().item()
+                        micro_batch_metrics["actor/seq_logprob_std"] = seq_logprob_mean.std(unbiased=False).item()
 
                     # for fully_async_policy
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
