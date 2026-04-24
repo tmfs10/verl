@@ -1,3 +1,205 @@
+## Math Self-Correction Smoke Suite
+
+### Purpose
+
+Smoke test the five math self-correction interaction variants that were added around `MathVerifyInteraction` and the `tool_agent` multi-turn loop.
+
+### Interaction configs
+
+- `/home/siddjain/workspace/verl/verl_main/examples/self_correction_smoke/interaction_configs/verifier_full_history.yaml`
+- `/home/siddjain/workspace/verl/verl_main/examples/self_correction_smoke/interaction_configs/verifier_question_with_past_answers.yaml`
+- `/home/siddjain/workspace/verl/verl_main/examples/self_correction_smoke/interaction_configs/repeat_until_stable_full_history.yaml`
+- `/home/siddjain/workspace/verl/verl_main/examples/self_correction_smoke/interaction_configs/repeat_until_stable_question_with_past_answers.yaml`
+- `/home/siddjain/workspace/verl/verl_main/examples/self_correction_smoke/interaction_configs/s2r_full_history.yaml`
+
+### Dataset expectations
+
+- Samples should use `agent_name: "tool_agent"`.
+- `data.return_raw_chat=True` must be enabled.
+- Each sample should carry `extra_info.interaction_kwargs` with at least:
+  - `name: "selfcorr"`
+  - `ground_truth`
+- The historical smoke workflow used:
+  - `/data/rl/mathgen/selfcorr_smoke8.jsonl`
+
+### DFW smoke submission
+
+- Use the submit wrapper, not a direct local trainer invocation.
+- Keep W&B disabled for the smoke.
+- Keep the multi-turn knobs explicit instead of relying on defaults.
+
+```bash
+cd /home/siddjain/workspace/verl/verl_main
+
+COMMON=(
+  --cluster cw-dfw
+  --config_dir /home/siddjain/workspace/scripts/nemo_configs/cluster/codegen
+  --partition interactive
+  --output_base_dir /output/rl/selfcorr
+  --local_verl_folder /home/siddjain/workspace/verl/verl_main
+  --actor_model /my_models/Qwen3-1.7B-Base
+  --prompt_data /data/rl/mathgen/selfcorr_smoke8.jsonl
+  --eval_data /data/rl/mathgen/selfcorr_smoke8.jsonl
+  --nodes 1
+  --n_prompts 8
+  --n_samples 1
+  --n_val_samples 1
+  --max_prompt_len 2k
+  --max_len 4k
+  --num_epochs 1
+  --num_ppo_iter 1
+  --actor_lr 2e-6
+  --save_freq 1000
+  --test_freq 1000
+  --sequence_parallel_size 1
+  --ref_sequence_parallel_size 1
+  --script_module verl.trainer.main_ppo
+)
+
+submit_one () {
+  local expname="$1"
+  local cfg="$2"
+
+  conda run -n skills_latest python /home/siddjain/workspace/scripts/src/nemo_verl/skills_verl_submit_addons.py \
+    "${COMMON[@]}" \
+    --expname "$expname" \
+    --extra_args "trainer.val_before_train=False actor_rollout_ref.rollout.multi_turn.enable=True actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent actor_rollout_ref.rollout.multi_turn.interaction_config_path=/opt/verl/examples/self_correction_smoke/interaction_configs/$cfg actor_rollout_ref.rollout.multi_turn.max_assistant_turns=4 actor_rollout_ref.rollout.multi_turn.max_user_turns=4"
+}
+
+submit_one selfcorr_verifier_full_history_smoke verifier_full_history.yaml
+submit_one selfcorr_verifier_qwpa_smoke verifier_question_with_past_answers.yaml
+submit_one selfcorr_repeat_full_history_smoke repeat_until_stable_full_history.yaml
+submit_one selfcorr_repeat_qwpa_smoke repeat_until_stable_question_with_past_answers.yaml
+submit_one selfcorr_s2r_full_history_smoke s2r_full_history.yaml
+```
+
+### Expected behavior
+
+- `verifier`:
+  - retries only after incorrect verified answers
+- `repeat_until_stable`:
+  - stops once the extracted completed answer repeats
+- `question_with_past_answers`:
+  - later turns rebuild the next generation prompt from the original question plus prior extracted answers
+- `s2r`:
+  - runs answer -> self-verification -> retry / terminate
+  - must stay on `turn_context_mode=full_history`
+
+## Aligned Reward-Focus-Tail Conditional Runs
+
+### Purpose
+
+Run the masked-solution conditional-reward workflow where the prompt mask and reward focus are tied to the same low-confidence tail token set.
+
+### Behavior
+
+- `data.masked_solution_selection_mode=reward_focus_tail`
+- trainer computes low-confidence tail positions from the live actor
+- those exact positions are masked in the prompt with `<|fim_middle|>`
+- those same positions are reused by the reward manager
+
+### Smoke guidance
+
+- Smoke tests should disable W&B.
+- Keep the smoke as close to production as feasible:
+  - same reward mode
+  - same `reward_focus_tail` masking mode
+  - same `low_confidence_tail_percent`
+  - same `truncate_conditioning_response_at_last_think` setting
+  - same explicit prompt/response token budgets where possible
+- The passing smoke path explicitly needed:
+  - `reward.reward_kwargs.low_confidence_min_tokens=1`
+  - `data.max_prompt_length=2048`
+  - `data.max_response_length=8192`
+  - `actor_rollout_ref.actor.ppo_max_token_len_per_gpu=10240`
+  - `actor_rollout_ref.rollout.max_num_batched_tokens=10240`
+  - `critic.ppo_max_token_len_per_gpu=10240`
+
+### Recovery-ratio variant
+
+Use:
+
+- `reward.reward_kwargs.conditioning_reward_mode=low_confidence_recovery_ratio`
+- `reward.reward_kwargs.low_confidence_tail_percent=20`
+- `reward.reward_kwargs.low_confidence_min_tokens=1`
+- `reward.reward_kwargs.use_rlvr_reward_when_group_has_success=False`
+- `reward.reward_kwargs.truncate_conditioning_response_at_last_think=False`
+- `data.masked_solution_selection_mode=reward_focus_tail`
+
+### Top-k recall variant
+
+Use:
+
+- `reward.reward_kwargs.conditioning_reward_mode=low_confidence_token_topk_recall`
+- `reward.reward_kwargs.low_confidence_tail_percent=20`
+- `reward.reward_kwargs.low_confidence_min_tokens=1`
+- `reward.reward_kwargs.conditioned_token_topk=2`
+- `reward.reward_kwargs.use_rlvr_reward_when_group_has_success=False`
+- `reward.reward_kwargs.truncate_conditioning_response_at_last_think=False`
+- `data.masked_solution_selection_mode=reward_focus_tail`
+
+## Offline Reward Replay On Saved Rollouts
+
+### Purpose
+
+Isolate reward-manager behavior on identical saved responses without touching the live training path.
+
+### When to use
+
+- Investigate train-side metric gaps between `batch` / GRPO and `conditional_logprob` runs.
+- Verify whether a gap is coming from:
+  - scorer output on identical responses
+  - conditional reward replacement on identical responses
+  - or generation differences upstream of reward computation
+
+### Procedure
+
+1. Cancel the currently running RL jobs on DFW if they are no longer needed for the investigation.
+2. Pick one saved rollout JSONL from each experiment to compare, for example:
+   - GRPO rollout: `/lustre/fsw/portfolios/llmservice/users/siddjain/nemo-run/output/rl/grpo_qwen3_30b_a3b_deepmath_compmath_prompt4k_train8k_val20k_full_v1_tp4/generations/rollout/59.jsonl`
+   - RR20 rollout: `/lustre/fsw/portfolios/llmservice/users/siddjain/nemo-run/output/rl/condlogprob_qwen3_30b_a3b_deepmath_compmath_prompt4k_train8k_val20k_recoveryratio20_allfail_full_v1_tp4/generations/rollout/59.jsonl`
+3. Run an offline replay script from `~/data`, not from the repo workspace.
+4. Reconstruct a minimal `DataProto` from the saved rows and run:
+   - `BatchRewardManager`
+   - `ConditionalLogProbRewardManager`
+   on the exact same saved responses.
+5. Compare:
+   - raw `acc`
+   - `reward/standard_acc`
+   - `rule_reward`
+   - final `score`
+   - conditional-only fields such as `used_conditional_logprob` and `low_confidence_recovery_ratio`
+6. Treat any gap that survives replay on identical responses as a scoring / reward-manager issue. Treat any gap that disappears under replay as upstream generation / batching behavior.
+
+### Local replay script
+
+- Script:
+  - `/home/siddjain/data/codex_tmp/stage1_reward_replay/replay_saved_rollout_scores.py`
+- Example artifacts used:
+  - `/home/siddjain/data/codex_tmp/stage1_reward_replay/grpo_59.jsonl`
+  - `/home/siddjain/data/codex_tmp/stage1_reward_replay/rr20_59.jsonl`
+- Example summary outputs:
+  - `/home/siddjain/data/codex_tmp/stage1_reward_replay/summary_step59.json`
+  - `/home/siddjain/data/codex_tmp/stage1_reward_replay/summary_step59_skills_env.json`
+
+Run it with the `skills_latest` env and `PYTHONPATH` pointing at both `skills_latest` and `verl_main`, otherwise the math grader falls back to all-incorrect:
+
+```bash
+PYTHONPATH=/home/siddjain/workspace/skills_latest:/home/siddjain/workspace/verl/verl_main \
+conda run -n skills_latest python \
+  /home/siddjain/data/codex_tmp/stage1_reward_replay/replay_saved_rollout_scores.py \
+  --reward-module /home/siddjain/workspace/scripts/src/nemo_verl/reward/verl_code_reward.py \
+  --grpo /home/siddjain/data/codex_tmp/stage1_reward_replay/grpo_59.jsonl \
+  --rr20 /home/siddjain/data/codex_tmp/stage1_reward_replay/rr20_59.jsonl \
+  --out /home/siddjain/data/codex_tmp/stage1_reward_replay/summary_step59_skills_env.json
+```
+
+### Notes
+
+- This workflow is intentionally offline-only.
+- It should not modify trainer code, rollout code, or cluster job configuration.
+- Temporary scripts for this workflow belong under `~/data/codex_tmp`.
+
 ## Validation Dashboard Filtering
 
 ### Purpose

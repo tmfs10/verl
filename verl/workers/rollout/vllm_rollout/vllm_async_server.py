@@ -244,6 +244,10 @@ class vLLMHttpServer:
         assert self._server_port is not None, "http server is not launched, port is None"
         return self._server_address, self._server_port
 
+    async def set_env_vars(self, env_vars: dict[str, str]):
+        for key, value in env_vars.items():
+            os.environ[str(key)] = str(value)
+
     @property
     def lora_as_adapter(self) -> bool:
         return (
@@ -871,15 +875,20 @@ class vLLMReplica(RolloutReplica):
     ):
         super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
         self.server_class = ray.remote(vLLMHttpServer)
+        self._article_rag_service = None
 
     async def _cleanup_server_launch_attempt(self):
         servers, self.servers = self.servers, []
         self._server_handle = None
         self._server_address = None
+        article_rag_service, self._article_rag_service = self._article_rag_service, None
 
         for server in servers:
             with contextlib.suppress(Exception):
                 ray.kill(server, no_restart=True)
+        if article_rag_service is not None:
+            with contextlib.suppress(Exception):
+                ray.kill(article_rag_service, no_restart=True)
 
         # Give Ray a brief window to tear down actors and release any named-actor
         # registrations or sockets before the next launch attempt.
@@ -988,6 +997,56 @@ class vLLMReplica(RolloutReplica):
                     if is_valid_ipv6_address(server_address)
                     else f"{server_address}:{server_port}"
                 )
+
+                article_rag_tool_config = None
+                tool_config_path = self.config.multi_turn.tool_config_path
+                if tool_config_path:
+                    from recipe.article_rag.tool_config_utils import load_article_rag_tool_config
+
+                    article_rag_tool_config = load_article_rag_tool_config(tool_config_path)
+
+                if article_rag_tool_config is not None:
+                    from recipe.article_rag.node_sidecar import ArticleRagNodeSidecar
+
+                    node_id = worker_node_ids[0]
+                    service_cuda_visible_devices = article_rag_tool_config.get("service_cuda_visible_devices")
+                    if service_cuda_visible_devices is None:
+                        service_cuda_visible_devices = ",".join(worker_cuda_visible_devices[:gpus_per_replica_node])
+                    service_name = (
+                        f"article_rag_service_{self.replica_rank}"
+                        if not self.is_reward_model
+                        else f"article_rag_service_reward_{self.replica_rank}"
+                    )
+                    if launch_attempt > 0:
+                        service_name = f"{service_name}_retry{launch_attempt}"
+
+                    sidecar_actor_cls = ray.remote(ArticleRagNodeSidecar)
+                    self._article_rag_service = sidecar_actor_cls.options(
+                        scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                            node_id=node_id,
+                            soft=False,
+                        ),
+                        runtime_env={
+                            "env_vars": {
+                                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                                "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                            }
+                        },
+                        name=service_name,
+                        max_concurrency=self.max_concurrency,
+                    ).remote(
+                        config=article_rag_tool_config,
+                        cuda_visible_devices=str(service_cuda_visible_devices),
+                    )
+                    await self._article_rag_service.launch_services.remote()
+                    service_info = await self._article_rag_service.get_service_info.remote()
+                    sidecar_env = {
+                        "VERL_ARTICLE_RAG_ASK_URL": service_info["ask_url"],
+                        "VERL_ARTICLE_RAG_ANSWER_BASE_URL": service_info["answer_api_base"],
+                    }
+                    await asyncio.gather(
+                        *[server.set_env_vars.remote(sidecar_env) for server in self.servers]
+                    )
                 return
             except Exception:
                 logger.exception(

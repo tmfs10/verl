@@ -23,6 +23,11 @@ from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, 
 from verl.workers.rollout.replica import TokenOutput
 
 
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
 @pytest.mark.asyncio
 async def test_interacting_state_merges_interaction_metadata():
     loop = object.__new__(ToolAgentLoop)
@@ -191,3 +196,33 @@ def test_finalize_output_sequences_uses_selected_turn_rollout_for_prompt_reset_m
     assert response_ids == [4, 5]
     assert response_mask == [1, 1]
     assert response_logprobs == [-0.1, -0.2]
+
+
+@pytest.mark.anyio
+async def test_run_injects_ground_truth_and_extra_info_into_interaction_kwargs():
+    loop = object.__new__(ToolAgentLoop)
+    loop.response_length = 32
+    loop.per_turn_response_length = None
+    loop.interaction_config_file = "interaction.json"
+    loop.interaction_map = {"lean_goedel": AsyncMock()}
+    loop.process_vision_info = AsyncMock(return_value={})
+    loop._handle_pending_state = AsyncMock(return_value=AgentState.TERMINATED)
+    interaction = loop.interaction_map["lean_goedel"]
+    interaction.start_interaction = AsyncMock(return_value="req-goedel")
+    interaction.finalize_interaction = AsyncMock()
+
+    await ToolAgentLoop.run(
+        loop,
+        sampling_params={},
+        raw_prompt=[{"role": "user", "content": "Initial Goedel prompt"}],
+        extra_info={"problem_id": "Goedel-Pset-7", "interaction_kwargs": {"name": "lean_goedel"}},
+        reward_model={"ground_truth": '{"formal_statement": "theorem foo : True := by sorry"}'},
+        data_source="goedel_lean",
+    )
+
+    _, call_kwargs = interaction.start_interaction.await_args
+    assert call_kwargs["raw_prompt"] == [{"role": "user", "content": "Initial Goedel prompt"}]
+    assert call_kwargs["ground_truth"] == '{"formal_statement": "theorem foo : True := by sorry"}'
+    assert call_kwargs["extra_info"]["problem_id"] == "Goedel-Pset-7"
+    assert call_kwargs["data_source"] == "goedel_lean"
+    interaction.finalize_interaction.assert_awaited_once()

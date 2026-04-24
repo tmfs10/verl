@@ -1,0 +1,5 @@
+interaction:
+  - name: "lean_goedel"
+    class_name: "verl.interactions.lean_goedel_interaction.LeanGoedelInteraction"
+    config:
+      turn_context_mode: full_history

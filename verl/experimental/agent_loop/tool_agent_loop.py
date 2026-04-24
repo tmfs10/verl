@@ -158,9 +158,19 @@ class ToolAgentLoop(AgentLoopBase):
         interaction = None
         interaction_kwargs = {}
         if self.interaction_config_file:
-            interaction_kwargs = dict(kwargs["extra_info"]["interaction_kwargs"])
+            extra_info = dict(kwargs.get("extra_info") or {})
+            interaction_kwargs = dict(extra_info.get("interaction_kwargs") or {})
             if "name" not in interaction_kwargs:
                 raise ValueError("'name' key is required in interaction_kwargs")
+            reward_model = kwargs.get("reward_model") or {}
+            if not isinstance(reward_model, dict):
+                reward_model = {}
+            ground_truth = reward_model.get("ground_truth")
+            if ground_truth is None:
+                ground_truth = kwargs.get("ground_truth_answer")
+            interaction_kwargs.setdefault("ground_truth", ground_truth)
+            interaction_kwargs.setdefault("extra_info", extra_info)
+            interaction_kwargs.setdefault("data_source", kwargs.get("data_source"))
             if self.per_turn_response_length is not None:
                 interaction_kwargs.setdefault("per_turn_response_length", self.per_turn_response_length)
             interaction_name = interaction_kwargs["name"]

@@ -1,3 +1,45 @@
+## 2026-04-15
+
+### Math Self-Correction Interaction Stack
+
+- Added a dedicated multi-turn math interaction in `/home/siddjain/workspace/verl/verl_main/verl/interactions/math_verify_interaction.py`.
+- Added three math self-correction modes:
+  - `verifier`
+  - `repeat_until_stable`
+  - `s2r`
+- Added two turn-context modes:
+  - `full_history`
+  - `question_with_past_answers`
+- Added per-turn state tracking for:
+  - extracted answer history
+  - completed-answer history
+  - answer correctness history
+  - S2R verification verdict and agreement history
+- Added turn-budget reminder support so interactions can inject per-turn response-budget hints into prompts.
+
+### Tool-Agent Multi-Turn PPO Alignment
+
+- Updated `/home/siddjain/workspace/verl/verl_main/verl/experimental/agent_loop/tool_agent_loop.py` so the interaction path:
+  - passes `stop_reason` into the interaction
+  - still records terminal assistant turns on cap-based termination
+  - carries interaction metadata into `extra_fields`
+  - supports prompt reset via `next_generation_messages`
+  - aligns PPO with the actual prompt used for the selected retry turn in `question_with_past_answers` mode
+
+### Reward Handling For Self-Correction
+
+- Updated `/home/siddjain/workspace/verl/verl_main/verl/utils/reward_score/__init__.py` to support `reward_mode=\"last_completed_turn\"`.
+- Added optional wrong-answer entropy shaping over `answer_history`.
+- Final default for `entropy_bonus_coef` was set back to `0.0`; entropy shaping is opt-in.
+- The resulting self-correction path remains sparse final-reward PPO, not dense per-turn PPO shaping.
+
+### Tests, Notes, And Smoke Configs
+
+- Added interaction tests in `/home/siddjain/workspace/verl/verl_main/tests/interactions/test_math_verify_interaction.py`.
+- Added reward-entropy coverage in `/home/siddjain/workspace/verl/verl_main/tests/utils/reward_score/test_math_entropy_bonus.py`.
+- Added self-correction interaction configs under `/home/siddjain/workspace/verl/verl_main/examples/self_correction_smoke/interaction_configs`.
+- Added a repo summary note at `/home/siddjain/workspace/verl/verl_main/self_correction.md`.
+
 ## 2026-04-12
 
 ### Validation Metric Export Filtering
