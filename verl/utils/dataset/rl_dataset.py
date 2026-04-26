@@ -146,7 +146,11 @@ class RLHFDataset(Dataset):
             1 if masked_solution_focus_min_tokens is None else int(masked_solution_focus_min_tokens)
         )
         self._masked_solution_positions_cache: dict[str, tuple[int, ...]] = {}
-        self.masked_solution_token_id = self._resolve_masked_solution_token_id(self.masked_solution_token)
+        self.masked_solution_token_id = (
+            self._resolve_masked_solution_token_id(self.masked_solution_token)
+            if self.dynamic_masked_solution
+            else None
+        )
 
         self.tool_config_path = config.get("tool_config_path", None)
         self.tool_schemas = None

@@ -430,8 +430,15 @@ class TaskRunner:
         val_reward_config, val_reward_kwargs = _build_validation_reward_config(config)
         val_reward_fn = load_reward_manager(val_reward_config, tokenizer, num_examine=1, **val_reward_kwargs)
 
+        trainer_cls = RayPPOTrainer
+        if bool(config.data.get("use_dataset_responses", False)):
+            from verl.trainer.ppo.ray_trainer_off_policy import RayTrainerOffPolicy
+
+            trainer_cls = RayTrainerOffPolicy
+            print("Using RayTrainerOffPolicy because data.use_dataset_responses=true")
+
         # Initialize the PPO trainer.
-        trainer = RayPPOTrainer(
+        trainer = trainer_cls(
             config=config,
             tokenizer=tokenizer,
             reward_fn=reward_fn,

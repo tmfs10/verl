@@ -172,6 +172,15 @@ class AgentLoopMetrics(BaseModel):
     generate_sequences: float = 0.0
     tool_calls: float = 0.0
     num_preempted: int = -1  # -1 means not available
+    article_rag_encode_ms: float = 0.0
+    article_rag_search_ms: float = 0.0
+    article_rag_retrieve_total_ms: float = 0.0
+    article_rag_answer_ms: float = 0.0
+    article_rag_total_ms: float = 0.0
+    article_rag_valid_candidates: float = 0.0
+    article_rag_retrieved_count: float = 0.0
+    article_rag_faiss_search_k: float = 0.0
+    article_rag_faiss_iterations: float = 0.0
 
 
 class AgentLoopOutput(BaseModel):
@@ -883,9 +892,23 @@ class AgentLoopWorker:
 
         # add reward_extra_info to non_tensor_batch
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        # Reward workers can run in different Python processes, so dict insertion order is not
+        # a stable contract for set-derived diagnostic keys. Treat these as columns and sort them
+        # before storing in meta_info, otherwise DataProto.concat can see false conflicts.
+        reward_extra_keys = sorted(
+            {
+                key
+                for info in reward_extra_infos
+                if isinstance(info, dict)
+                for key in info.keys()
+            }
+        )
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            values = [info.get(key) if isinstance(info, dict) else None for info in reward_extra_infos]
+            try:
+                non_tensor_batch[key] = np.array(values)
+            except ValueError:
+                non_tensor_batch[key] = np.array(values, dtype=object)
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]
@@ -972,6 +995,7 @@ class AgentLoopManager:
         self.worker_group = worker_group
         self.rollout_resource_pool = rollout_resource_pool
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self.agent_loop_runtime_env_vars: dict[str, str] = {}
 
         assert worker_group is not None or self.rollout_config.nnodes > 0, "nnodes must be > 0 in standalone mode"
 
@@ -1035,6 +1059,21 @@ class AgentLoopManager:
 
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
+        self.agent_loop_runtime_env_vars = {}
+        for replica in self.rollout_replicas:
+            sidecar_env = getattr(replica, "_article_rag_sidecar_env", None) or {}
+            for key, value in sidecar_env.items():
+                value = str(value)
+                old_value = self.agent_loop_runtime_env_vars.get(key)
+                if old_value is not None and old_value != value:
+                    logger.warning(
+                        "Conflicting Article RAG env value for %s across rollout replicas; keeping %s and ignoring %s",
+                        key,
+                        old_value,
+                        value,
+                    )
+                    continue
+                self.agent_loop_runtime_env_vars[key] = value
 
         print(f"AgentLoopManager: {self.server_addresses}")
 
@@ -1054,13 +1093,16 @@ class AgentLoopManager:
         for i in range(num_workers):
             # Round-robin scheduling over the all nodes
             node_id = node_ids[i % len(node_ids)]
+            worker_options = {
+                "name": f"agent_loop_worker_{i}" + f"_{uuid4().hex[:8]}",
+                "scheduling_strategy": ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                    node_id=node_id, soft=True
+                ),
+            }
+            if self.agent_loop_runtime_env_vars:
+                worker_options["runtime_env"] = {"env_vars": self.agent_loop_runtime_env_vars}
             self.agent_loop_workers.append(
-                self.agent_loop_workers_class.options(
-                    name=f"agent_loop_worker_{i}" + f"_{uuid4().hex[:8]}",
-                    scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                        node_id=node_id, soft=True
-                    ),
-                ).remote(
+                self.agent_loop_workers_class.options(**worker_options).remote(
                     self.config,
                     servers,
                     load_balancer_handle,
@@ -1132,6 +1174,22 @@ class AgentLoopManager:
         timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
         timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
         timing["agent_loop/slowest/num_preempted"] = num_preempted[slowest]
+
+        for key in (
+            "article_rag_encode_ms",
+            "article_rag_search_ms",
+            "article_rag_retrieve_total_ms",
+            "article_rag_answer_ms",
+            "article_rag_total_ms",
+            "article_rag_valid_candidates",
+            "article_rag_retrieved_count",
+            "article_rag_faiss_search_k",
+            "article_rag_faiss_iterations",
+        ):
+            values = np.array([metric.get(key, 0.0) for chunk in metrics for metric in chunk], dtype=np.float64)
+            timing[f"agent_loop/{key}/min"] = values.min()
+            timing[f"agent_loop/{key}/max"] = values.max()
+            timing[f"agent_loop/{key}/mean"] = values.mean()
 
         return timing
 

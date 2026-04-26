@@ -24,7 +24,10 @@ import os
 from functools import wraps
 from typing import Any, Callable, Tuple, List
 
-from one_logger_utils import OneLoggerUtils
+try:
+    from one_logger_utils import OneLoggerUtils
+except ModuleNotFoundError:
+    OneLoggerUtils = None
 
 import ray
 
@@ -290,7 +293,10 @@ class OneLoggerInstrumented:
             "is_log_throughput_enabled": False,
             "save_checkpoint_strategy": "sync",
         }
-        self.one_logger_callbacks = OneLoggerUtils(cfg)
+        if OneLoggerUtils is None:
+            self.one_logger_callbacks = _NullLogger()
+        else:
+            self.one_logger_callbacks = OneLoggerUtils(cfg)
         self.one_logger_callbacks.on_dataloader_init_start(app_build_dataiters_start_time=self.app_build_dataiters_start_time)
         self.one_logger_callbacks.on_dataloader_init_end(app_build_dataiters_finish_time=self.app_build_dataiters_finish_time)
 

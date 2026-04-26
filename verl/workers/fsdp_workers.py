@@ -724,9 +724,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 4. build rollout model
         log_gpu_memory_usage(f"Before building {self.config.rollout.name} rollout", logger=logger)
-        self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
-            config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
-        )
+        if rollout_name == "hf":
+            from verl.workers.rollout.hf_rollout import HFRollout
+
+            self.rollout = HFRollout(module=self.actor_module_fsdp, config=rollout_config)
+        else:
+            self.rollout = get_rollout_class(rollout_config.name, rollout_config.mode)(
+                config=rollout_config, model_config=model_config, device_mesh=rollout_device_mesh
+            )
         log_gpu_memory_usage(f"After building {self.config.rollout.name} rollout", logger=logger)
 
         # Full params

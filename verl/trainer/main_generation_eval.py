@@ -13,6 +13,7 @@ import datasets
 import time
 import shutil
 import torch
+import copy
 
 os.environ["NCCL_DEBUG"] = "WARN"
 os.environ["TOKENIZERS_PARALLELISM"] = "true"
@@ -31,9 +32,75 @@ from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.utils.hdfs_io import makedirs
 from verl.utils.model import compute_position_id_with_mask
+from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 from verl.trainer.ppo.reward import get_custom_reward_fn
 from verl.utils.dataset.rl_dataset import RLHFDataset, _to_hf_dataset
+
+
+def _jsonable(value):
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _prompt_record_from_batch(batch, row_idx: int) -> dict:
+    record = {}
+    for key, values in batch.non_tensor_batch.items():
+        if key in {"uid"}:
+            continue
+        try:
+            record[key] = _jsonable(values[row_idx])
+        except Exception:
+            pass
+    return record
+
+
+def _data_files_from_config(data_config) -> list[str]:
+    value = data_config.get("path", None)
+    if value is None:
+        value = data_config.get("train_files", None)
+    if value is None:
+        raise ValueError("Generation eval requires either data.path or data.train_files")
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        files = [str(item) for item in value]
+        if not files:
+            raise ValueError("Generation eval received an empty data file list")
+        return files
+    raise TypeError(f"Unsupported generation data file config type: {type(value).__name__}")
+
+
+def _get_generation_custom_reward_fn(config):
+    if config.get("reward", None) is not None:
+        return get_custom_reward_fn(config)
+
+    reward_fn_config = config.get("custom_reward_function", None)
+    if not reward_fn_config:
+        return None
+    if OmegaConf.is_config(reward_fn_config):
+        reward_fn_config = OmegaConf.to_container(reward_fn_config, resolve=True)
+    compat_config = OmegaConf.create({"reward": {"custom_reward_function": reward_fn_config}})
+    return get_custom_reward_fn(compat_config)
+
+
+def _resume_line_number(row: dict, row_idx: int) -> int:
+    extra_info = row.get("extra_info")
+    if isinstance(extra_info, dict) and "line_number" in extra_info:
+        try:
+            return int(json.loads(str(extra_info["line_number"])))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return int(extra_info["line_number"])
+    return row_idx
 
 def format_metrics_line(iteration, num_prompts, n_samples, metrics):
     """Format metrics as a single line string for logging."""
@@ -73,6 +140,54 @@ class GenerateDataset(RLHFDataset):
         self.rank = rank
         self.world_size = world_size
         super().__init__(data_files, tokenizer, config, processor)
+
+    def _prepare_prompt_messages(self, example: dict, item=None, *, masked_positions=None):
+        return copy.deepcopy(example[self.prompt_key])
+
+    def __getitem__(self, item):
+        row_dict = super().__getitem__(item)
+
+        messages = row_dict.get("raw_prompt") or self._build_messages(row_dict)
+        apply_kwargs = dict(**self.apply_chat_template_kwargs)
+        if self.tool_schemas is not None:
+            apply_kwargs["tools"] = self.tool_schemas
+        apply_kwargs.pop("tokenize", None)
+        apply_kwargs.pop("return_dict", None)
+        apply_kwargs.pop("return_tensors", None)
+
+        prompt_ids = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            **apply_kwargs,
+        )
+        prompt_ids = normalize_token_ids(prompt_ids)
+        if len(prompt_ids) > self.max_prompt_length:
+            if self.truncation == "left":
+                prompt_ids = prompt_ids[-self.max_prompt_length :]
+            elif self.truncation == "right":
+                prompt_ids = prompt_ids[: self.max_prompt_length]
+            elif self.truncation == "error":
+                raise ValueError(f"Prompt length {len(prompt_ids)} exceeds max_prompt_length {self.max_prompt_length}")
+            else:
+                raise ValueError(f"Unsupported generation prompt truncation mode: {self.truncation}")
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("Tokenizer must define either pad_token_id or eos_token_id for generation eval.")
+
+        input_ids = torch.full((self.max_prompt_length,), int(pad_token_id), dtype=torch.long)
+        attention_mask = torch.zeros((self.max_prompt_length,), dtype=torch.long)
+        token_tensor = torch.tensor(prompt_ids, dtype=torch.long)
+        if len(prompt_ids) > 0:
+            input_ids[-len(prompt_ids) :] = token_tensor
+            attention_mask[-len(prompt_ids) :] = 1
+        row_dict["input_ids"] = input_ids
+        row_dict["attention_mask"] = attention_mask
+        row_dict["position_ids"] = compute_position_id_with_mask(attention_mask)
+        return row_dict
     
     def _read_files_and_tokenize(self):
         if os.path.exists(self.exclude_indices_file):
@@ -89,6 +204,11 @@ class GenerateDataset(RLHFDataset):
             if parquet_file.endswith('.parquet'):
                 # read parquet files and cache
                 dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
+                dataframe = dataframe.filter(
+                    lambda row, idx: (idx % self.world_size == self.rank) and (_resume_line_number(row, idx) not in exclude_indices),
+                    with_indices=True,
+                    desc=f"Sharding/resume filtering {parquet_file}",
+                )
             elif parquet_file.endswith('.jsonl'):
                 d = []
                 with open(parquet_file, 'r') as f:
@@ -150,6 +270,7 @@ def main_task(config):
 
     if not config.resume:
         shutil.rmtree(config.data.output_path, ignore_errors=True)
+    os.makedirs(config.data.output_path, exist_ok=True)
 
     assert config.data.batch_size % (config.trainer.n_gpus_per_node * config.trainer.nnodes) == 0, f"batch_size {config.data.batch_size} must be divisible by n_gpus_per_node {config.trainer.n_gpus_per_node} * nnodes {config.trainer.nnodes}"
 
@@ -158,7 +279,7 @@ def main_task(config):
     from verl.utils.dataset.rl_dataset import collate_fn
     from verl.trainer.main_ppo import create_rl_sampler
     from torchdata.stateful_dataloader import StatefulDataLoader
-    dataset = GenerateDataset(data_files=[config.data.path], tokenizer=tokenizer, processor=processor, config=config.data, exclude_indices_file=indices_done_path, rank=config.rank, world_size=config.world_size)
+    dataset = GenerateDataset(data_files=_data_files_from_config(config.data), tokenizer=tokenizer, processor=processor, config=config.data, exclude_indices_file=indices_done_path, rank=config.rank, world_size=config.world_size)
     dataloader = StatefulDataLoader(dataset, batch_size=config.data.batch_size, shuffle=config.data.shuffle, num_workers=config.data.dataloader.num_workers, collate_fn=collate_fn)
 
     config.data.output_path = os.path.join(config.data.output_path, f'rank_{config.rank}_{seed}.jsonl')
@@ -166,6 +287,10 @@ def main_task(config):
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+
+    compute_score = _get_generation_custom_reward_fn(config)
+    if compute_score is None:
+        raise ValueError("Generation eval requires a custom reward function.")
 
     ray_cls_with_init = RayClassWithInitArgs(cls=ray.remote(ActorRolloutRefWorker), config=config, role="rollout")
     resource_pool = RayResourcePool(process_on_nodes=[config.trainer.n_gpus_per_node] * config.trainer.nnodes)
@@ -176,7 +301,6 @@ def main_task(config):
     )
     wg.init_model()
 
-    compute_score = get_custom_reward_fn(config)
     mode = "a" if config.resume else "w"
 
     with open(config.data.output_path, mode) as f, open(indices_done_path, mode) as f_done:
@@ -257,6 +381,10 @@ def main_task(config):
                             value = item[key]
                             if isinstance(value, (int, float)):
                                 reward_extra_infos[key].append(value)
+            elif isinstance(score_result, list):
+                scores = [float(item) for item in score_result]
+            elif score_result is not None:
+                scores = [float(score_result)] * len(responses_str)
             
             # Compute response length statistics
             response_lengths = []
@@ -299,7 +427,16 @@ def main_task(config):
 
             assert len(batch) == num_prompts * config.data.n_samples, f"len(data) == {len(batch)} != {num_prompts * config.data.n_samples}"
             for i in range(num_prompts):
-                o = {'prompt': input_texts[i], 'responses': [], 'scores': []}
+                prompt_record = _prompt_record_from_batch(batch, i * config.data.n_samples)
+                o = {
+                    'prompt': input_texts[i],
+                    'responses': [],
+                    'scores': [],
+                    'prompt_record': prompt_record,
+                    'data_source': prompt_record.get('data_source'),
+                    'extra_info': prompt_record.get('extra_info'),
+                    'reward_model': prompt_record.get('reward_model'),
+                }
                 assert batch.batch['attention_mask'].shape[-1] == config.data.max_prompt_length + config.data.max_response_length, f"data['attention_mask'].shape[-1] == {batch.batch['attention_mask'].shape[-1]} != {config.data.max_prompt_length + config.data.max_response_length}"
                 for n_sample in range(config.data.n_samples):
                     data_item = batch[i * config.data.n_samples + n_sample]
@@ -309,7 +446,10 @@ def main_task(config):
                     o['responses'].append(response_str)
                     o['scores'].append(scores[i * config.data.n_samples + n_sample])
                 print(json.dumps(o), file=f)
-                line_number = json.loads(batch.non_tensor_batch['extra_info'][i * config.data.n_samples]['line_number'])
+                line_number = _resume_line_number(
+                    {"extra_info": batch.non_tensor_batch['extra_info'][i * config.data.n_samples]},
+                    i_batch * num_prompts + i,
+                )
                 f_done.write(f"{line_number}\n")
 
             print(metrics_line)

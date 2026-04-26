@@ -36,15 +36,32 @@ from .base import BaseRollout
 __all__ = ["HFRollout"]
 
 
+def _config_get(config, key, default=None):
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
 class HFRollout(BaseRollout):
-    def __init__(self, module: nn.Module, config):
-        super().__init__()
+    def __init__(self, module: nn.Module, config, *args, **kwargs):
+        if module is None:
+            raise ValueError("HFRollout requires an initialized actor/FSDP module.")
         self.config = config
         self.module = module
 
+    async def resume(self, tags: list[str]):
+        return None
+
+    async def update_weights(self, weights, **kwargs):
+        return None
+
+    async def release(self):
+        return None
+
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
-        num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
+        micro_batch_size = _config_get(self.config, "micro_batch_size", batch_size)
+        num_chunks = max(batch_size // micro_batch_size, 1)
         batch_prompts = prompts.chunk(chunks=num_chunks)
         output = [self._generate_minibatch(p) for p in batch_prompts]
         output = DataProto.concat(output)
@@ -58,8 +75,8 @@ class HFRollout(BaseRollout):
 
         temperature = prompts.meta_info.get("temperature", self.config.temperature)
         response_length = prompts.meta_info.get("response_length", self.config.response_length)
-        top_p = prompts.meta_info.get("top_p", self.config.get("top_p", 1.0))
-        top_k = max(0, prompts.meta_info.get("top_k", self.config.get("top_k", 0)))  # to be compatible with vllm
+        top_p = prompts.meta_info.get("top_p", _config_get(self.config, "top_p", 1.0))
+        top_k = max(0, prompts.meta_info.get("top_k", _config_get(self.config, "top_k", 0)))  # vLLM compat
 
         if not do_sample:
             # do_sample==False -> greedy decoding

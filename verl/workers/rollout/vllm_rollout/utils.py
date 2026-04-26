@@ -199,11 +199,16 @@ class vLLMColocateWorkerExtension:
             logger.info("QAT: process_weights_after_loading completed")
         elif use_standard_weight_load:
             # Some post-load transforms are non-idempotent; run once after all buckets.
-            from vllm.model_executor.model_loader.utils import process_weights_after_loading
-
             model = self.model_runner.model
             model_config = self.model_runner.vllm_config.model_config
-            process_weights_after_loading(model, model_config, self.device)
+            try:
+                from vllm.model_executor.model_loader.utils import process_weights_after_loading
+            except ImportError:
+                logger.warning(
+                    "vLLM process_weights_after_loading is unavailable; skipping standard post-load hook."
+                )
+            else:
+                process_weights_after_loading(model, model_config, self.device)
 
     def _update_weights(self, weights: list[tuple[str, torch.Tensor]], peft_config: dict, base_sync_done: bool):
         if peft_config and base_sync_done:

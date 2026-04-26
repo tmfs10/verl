@@ -95,6 +95,8 @@ def _validation_metric_section(var_name: str, core_var: str, metric_name: str, n
     """
     if metric_name.startswith(("best@", "maj@", "worst@")):
         return "val-agg"
+    if metric_name in {"max", "min"} and var_name.endswith("trade_pnl_percent"):
+        return "val-agg"
 
     return None
 
@@ -996,7 +998,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys() if "@" in name], default=1)
                 for metric_name, metric_val in metric2val.items():
                     metric_sec = _validation_metric_section(
                         var_name=var_name, core_var=core_var, metric_name=metric_name, n_max=n_max

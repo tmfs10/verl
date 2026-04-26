@@ -82,7 +82,8 @@ def get_free_port(address: str, with_alive_sock: bool = False) -> tuple[int, soc
     family = socket.AF_INET6 if is_valid_ipv6_address(address) else socket.AF_INET
 
     sock = socket.socket(family=family, type=socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if not with_alive_sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((address, 0))
     port = sock.getsockname()[1]
     if with_alive_sock:

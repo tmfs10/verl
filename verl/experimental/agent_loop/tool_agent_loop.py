@@ -152,7 +152,7 @@ class ToolAgentLoop(AgentLoopBase):
 
         metrics = {}
         request_id = uuid4().hex
-        tools_kwargs = kwargs.get("tools_kwargs", {})
+        tools_kwargs = kwargs.get("tools_kwargs") or {}
 
         # Initialize interaction if needed
         interaction = None
@@ -259,6 +259,15 @@ class ToolAgentLoop(AgentLoopBase):
     def _strip_ephemeral_interaction_fields(self, agent_data: AgentData) -> None:
         agent_data.extra_fields.pop("next_generation_messages", None)
         agent_data.extra_fields.pop("reset_generation_prompt", None)
+
+    @staticmethod
+    def _merge_tool_metrics(agent_data: AgentData, tool_metrics: dict[str, Any]) -> None:
+        for key, value in (tool_metrics or {}).items():
+            if not key.startswith("article_rag_"):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            agent_data.metrics[key] = float(agent_data.metrics.get(key, 0.0)) + float(value)
 
     def _build_turn_sampling_params(self, sampling_params: dict[str, Any]) -> dict[str, Any]:
         if self.per_turn_response_length is None:
@@ -412,7 +421,9 @@ class ToolAgentLoop(AgentLoopBase):
 
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
-        for tool_response, tool_reward, _ in responses:
+        for tool_response, tool_reward, tool_metrics in responses:
+            self._merge_tool_metrics(agent_data, tool_metrics)
+
             # Create message from tool response
             if tool_response.image or tool_response.video:
                 # Multi-modal content with structured format

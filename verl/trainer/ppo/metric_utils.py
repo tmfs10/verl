@@ -264,6 +264,51 @@ def compute_data_metrics_reward(batch, metrics):
             except:
                 pass
 
+    def _add_trade_geomean_metrics(prefix: str):
+        ratio_key = f"{prefix}/trade_return_ratio"
+        if ratio_key not in batch.non_tensor_batch:
+            return
+        try:
+            ratios = np.asarray(batch.non_tensor_batch[ratio_key], dtype=np.float64)
+            ratios = ratios[np.isfinite(ratios)]
+        except Exception:
+            return
+        if ratios.size == 0:
+            return
+
+        product = float(np.prod(ratios))
+        nonpositive_count = int(np.sum(ratios <= 0.0))
+        if nonpositive_count:
+            geomean = 0.0
+        else:
+            geomean = float(np.exp(np.mean(np.log(ratios))))
+
+        metrics[f"{prefix}/trade_return_product"] = product
+        metrics[f"{prefix}/trade_return_geomean"] = geomean
+        metrics[f"{prefix}/trade_pnl_geomean_percent"] = float(100.0 * (geomean - 1.0))
+        metrics[f"{prefix}/trade_return_nonpositive_count"] = float(nonpositive_count)
+
+    def _add_trade_pnl_extrema(prefix: str):
+        pnl_key = f"{prefix}/trade_pnl_percent"
+        if pnl_key not in batch.non_tensor_batch:
+            return
+        try:
+            pnl_values = np.asarray(batch.non_tensor_batch[pnl_key], dtype=np.float64)
+            pnl_values = pnl_values[np.isfinite(pnl_values)]
+        except Exception:
+            return
+        if pnl_values.size == 0:
+            return
+        metrics[f"{pnl_key}/max"] = float(np.max(pnl_values))
+        metrics[f"{pnl_key}/min"] = float(np.min(pnl_values))
+
+    # Per-example trade_return_ratio is logged as a mean above. These are batch-level
+    # cumulative/geometric trade metrics requested for stock forecast training.
+    _add_trade_geomean_metrics("reward")
+    _add_trade_geomean_metrics("reward/quantile_regression")
+    _add_trade_pnl_extrema("reward")
+    _add_trade_pnl_extrema("reward/quantile_regression")
+
     return metrics
 
 
@@ -712,4 +757,26 @@ def process_validation_metrics(
         for var_name, metric2uid_vals in var2metric2uid_vals.items():
             for metric_name, uid_vals in metric2uid_vals.items():
                 data_src2var2metric2val[data_source][var_name][metric_name] = np.mean(uid_vals)
+
+    for data_source, uid2var2vals in data_src2uid2var2vals.items():
+        pnl_vals_by_var: dict[str, list[float]] = defaultdict(list)
+        for var2vals in uid2var2vals.values():
+            for var_name, var_vals in var2vals.items():
+                if not var_name.endswith("trade_pnl_percent"):
+                    continue
+                for val in var_vals:
+                    if (
+                        val is not None
+                        and np.isscalar(val)
+                        and not isinstance(val, (str, bytes))
+                        and np.asarray(val).dtype.kind in "biufc"
+                    ):
+                        val_float = float(val)
+                        if np.isfinite(val_float):
+                            pnl_vals_by_var[var_name].append(val_float)
+        for var_name, pnl_vals in pnl_vals_by_var.items():
+            if not pnl_vals:
+                continue
+            data_src2var2metric2val[data_source][var_name]["max"] = float(np.max(pnl_vals))
+            data_src2var2metric2val[data_source][var_name]["min"] = float(np.min(pnl_vals))
     return data_src2var2metric2val

@@ -254,13 +254,15 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
-        # Deprecation warning for mode field - only async mode is supported
-        if self.mode == "sync":
+        # Async server rollout is the production training path. Keep a narrow sync
+        # exception for HFRollout, which is still used by offline generation/eval
+        # code paths that call generate_sequences directly.
+        if self.mode == "sync" and self.name != "hf":
             raise ValueError(
                 "Rollout mode 'sync' has been removed. Please set "
                 "`actor_rollout_ref.rollout.mode=async` or remove the mode setting entirely."
             )
-        if self.mode != "async":
+        if self.mode not in {"async", "sync"}:
             warnings.warn(
                 f"Unknown rollout mode '{self.mode}'. Only 'async' mode is supported. "
                 "The 'mode' field is deprecated and will be removed in a future version.",

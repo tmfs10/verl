@@ -14,6 +14,7 @@
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import logging
@@ -630,7 +631,10 @@ class vLLMHttpServer:
         if video_data is not None:
             multi_modal_data["video"] = video_data
 
-        prompt = TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data)
+        prompt_kwargs = {"prompt_token_ids": prompt_ids}
+        if multi_modal_data:
+            prompt_kwargs["multi_modal_data"] = multi_modal_data
+        prompt = TokensPrompt(**prompt_kwargs)
 
         # Add lora request
         lora_request = None
@@ -747,7 +751,22 @@ class vLLMHttpServer:
         self.global_steps = global_steps
 
     async def wait_for_requests_to_drain(self):
-        await self.engine.wait_for_requests_to_drain()
+        drain = getattr(self.engine, "wait_for_requests_to_drain", None)
+        if drain is not None:
+            await drain()
+            return
+
+        pause_generation = getattr(self.engine, "pause_generation", None)
+        resume_generation = getattr(self.engine, "resume_generation", None)
+        if pause_generation is not None and resume_generation is not None:
+            try:
+                await pause_generation(wait_for_inflight_requests=True, clear_cache=False)
+            except TypeError:
+                await pause_generation()
+            await resume_generation()
+            return
+
+        logger.warning("AsyncLLM.wait_for_requests_to_drain is unavailable; skipping explicit drain.")
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort all ongoing generation requests.
@@ -876,6 +895,7 @@ class vLLMReplica(RolloutReplica):
         super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
         self.server_class = ray.remote(vLLMHttpServer)
         self._article_rag_service = None
+        self._article_rag_sidecar_env: dict[str, str] = {}
 
     async def _cleanup_server_launch_attempt(self):
         servers, self.servers = self.servers, []
@@ -887,6 +907,7 @@ class vLLMReplica(RolloutReplica):
             with contextlib.suppress(Exception):
                 ray.kill(server, no_restart=True)
         if article_rag_service is not None:
+            logger.info("Killing Article RAG sidecar actor after failed rollout-server launch attempt.")
             with contextlib.suppress(Exception):
                 ray.kill(article_rag_service, no_restart=True)
 
@@ -1012,38 +1033,55 @@ class vLLMReplica(RolloutReplica):
                     service_cuda_visible_devices = article_rag_tool_config.get("service_cuda_visible_devices")
                     if service_cuda_visible_devices is None:
                         service_cuda_visible_devices = ",".join(worker_cuda_visible_devices[:gpus_per_replica_node])
+                    service_config_hash = hashlib.sha1(
+                        json.dumps(
+                            {
+                                "config": article_rag_tool_config,
+                                "cuda_visible_devices": str(service_cuda_visible_devices),
+                                "node_id": node_id,
+                            },
+                            sort_keys=True,
+                            default=str,
+                        ).encode("utf-8")
+                    ).hexdigest()[:12]
+                    service_role = "reward" if self.is_reward_model else "rollout"
                     service_name = (
-                        f"article_rag_service_{self.replica_rank}"
-                        if not self.is_reward_model
-                        else f"article_rag_service_reward_{self.replica_rank}"
+                        f"article_rag_service_{service_role}_{node_id[:8]}_{service_config_hash}"
                     )
-                    if launch_attempt > 0:
-                        service_name = f"{service_name}_retry{launch_attempt}"
-
                     sidecar_actor_cls = ray.remote(ArticleRagNodeSidecar)
-                    self._article_rag_service = sidecar_actor_cls.options(
-                        scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
-                            node_id=node_id,
-                            soft=False,
-                        ),
-                        runtime_env={
-                            "env_vars": {
-                                "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-                                "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
-                            }
-                        },
-                        name=service_name,
-                        max_concurrency=self.max_concurrency,
-                    ).remote(
-                        config=article_rag_tool_config,
-                        cuda_visible_devices=str(service_cuda_visible_devices),
-                    )
+                    try:
+                        self._article_rag_service = ray.get_actor(service_name)
+                        logger.info("Reusing Article RAG sidecar actor %s", service_name)
+                    except ValueError:
+                        try:
+                            self._article_rag_service = sidecar_actor_cls.options(
+                                scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
+                                    node_id=node_id,
+                                    soft=False,
+                                ),
+                                runtime_env={
+                                    "env_vars": {
+                                        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                                        "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
+                                    }
+                                },
+                                name=service_name,
+                                max_concurrency=self.max_concurrency,
+                            ).remote(
+                                config=article_rag_tool_config,
+                                cuda_visible_devices=str(service_cuda_visible_devices),
+                            )
+                            logger.info("Created Article RAG sidecar actor %s", service_name)
+                        except ValueError:
+                            self._article_rag_service = ray.get_actor(service_name)
+                            logger.info("Reusing concurrently-created Article RAG sidecar actor %s", service_name)
                     await self._article_rag_service.launch_services.remote()
                     service_info = await self._article_rag_service.get_service_info.remote()
                     sidecar_env = {
                         "VERL_ARTICLE_RAG_ASK_URL": service_info["ask_url"],
                         "VERL_ARTICLE_RAG_ANSWER_BASE_URL": service_info["answer_api_base"],
                     }
+                    self._article_rag_sidecar_env = dict(sidecar_env)
                     await asyncio.gather(
                         *[server.set_env_vars.remote(sidecar_env) for server in self.servers]
                     )

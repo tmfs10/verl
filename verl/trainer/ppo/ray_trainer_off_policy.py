@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
+from verl.protocol import pad_dataproto_to_divisor
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer as RayTrainer,
     apply_kl_penalty,
@@ -31,6 +32,8 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.utils.debug import marked_timer
 from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
+from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.torch_functional import postprocess_data, get_response_mask
 from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.rollout_skip import RolloutSkip
@@ -40,6 +43,83 @@ class RayTrainerOffPolicy(RayTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+    def _build_prompt_tensors(self, batch: DataProto) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return left-padded prompt tensors, tokenizing raw chat prompts when needed."""
+        if all(key in batch.batch.keys() for key in ("input_ids", "attention_mask", "position_ids")):
+            return batch.batch["input_ids"], batch.batch["attention_mask"], batch.batch["position_ids"]
+
+        if "raw_prompt" not in batch.non_tensor_batch:
+            raise KeyError(
+                "Off-policy training expected either tokenized prompt tensors "
+                "or 'raw_prompt' chat messages in the dataset batch"
+            )
+
+        max_prompt_length = int(self.config.data.max_prompt_length)
+        truncation = self.config.data.get("truncation", "error")
+        apply_kwargs = self.config.data.get("apply_chat_template_kwargs", {}) or {}
+        if not isinstance(apply_kwargs, dict):
+            apply_kwargs = OmegaConf.to_container(apply_kwargs, resolve=True) or {}
+        else:
+            apply_kwargs = dict(apply_kwargs)
+        apply_kwargs.pop("tokenize", None)
+        apply_kwargs.pop("return_dict", None)
+        apply_kwargs.pop("return_tensors", None)
+
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("Tokenizer must define either pad_token_id or eos_token_id for off-policy prompts.")
+
+        input_ids_rows: list[torch.Tensor] = []
+        attention_rows: list[torch.Tensor] = []
+        position_rows: list[torch.Tensor] = []
+
+        for index, messages in enumerate(batch.non_tensor_batch["raw_prompt"]):
+            if isinstance(messages, np.ndarray):
+                messages = messages.tolist()
+            elif isinstance(messages, tuple):
+                messages = list(messages)
+            if not isinstance(messages, list):
+                raise TypeError(f"raw_prompt at index {index} must be a list of chat messages, got {type(messages)}")
+
+            prompt_ids = self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                **apply_kwargs,
+            )
+            prompt_ids = normalize_token_ids(prompt_ids)
+            if len(prompt_ids) > max_prompt_length:
+                if truncation == "left":
+                    prompt_ids = prompt_ids[-max_prompt_length:]
+                elif truncation == "right":
+                    prompt_ids = prompt_ids[:max_prompt_length]
+                elif truncation == "error":
+                    raise ValueError(
+                        f"Prompt length {len(prompt_ids)} exceeds max_prompt_length {max_prompt_length} "
+                        f"for off-policy row {index}"
+                    )
+                else:
+                    raise ValueError(f"Unsupported off-policy prompt truncation mode: {truncation}")
+
+            input_ids = torch.full((max_prompt_length,), int(pad_token_id), dtype=torch.long)
+            attention_mask = torch.zeros((max_prompt_length,), dtype=torch.long)
+            if prompt_ids:
+                token_tensor = torch.tensor(prompt_ids, dtype=torch.long)
+                input_ids[-len(prompt_ids):] = token_tensor
+                attention_mask[-len(prompt_ids):] = 1
+
+            input_ids_rows.append(input_ids)
+            attention_rows.append(attention_mask)
+            position_rows.append(compute_position_id_with_mask(attention_mask))
+
+        return (
+            torch.stack(input_ids_rows, dim=0),
+            torch.stack(attention_rows, dim=0),
+            torch.stack(position_rows, dim=0),
+        )
+
     def _build_offpolicy_outputs(self, batch: DataProto) -> DataProto:
         """
         Build generated outputs DataProto from precomputed output strings in batch.non_tensor_batch["outputs"].
@@ -47,9 +127,7 @@ class RayTrainerOffPolicy(RayTrainer):
         """
         assert "outputs" in batch.non_tensor_batch, "Expected 'outputs' in batch for off-policy training"
 
-        prompts = batch.batch["input_ids"]
-        prompt_attention = batch.batch["attention_mask"]
-        prompt_position = batch.batch["position_ids"]
+        prompts, prompt_attention, prompt_position = self._build_prompt_tensors(batch)
         batch_size = prompts.size(0)
 
         outputs_arr = batch.non_tensor_batch["outputs"]
@@ -178,6 +256,33 @@ class RayTrainerOffPolicy(RayTrainer):
 
         return DataProto(batch=gen_batch, non_tensor_batch=new_non_tensor)
 
+    def _pad_offpolicy_batch_to_dp_size(self, batch: DataProto, metrics: dict) -> tuple[DataProto, int]:
+        """Pad flattened off-policy batches so distributed worker dispatch can split them evenly."""
+        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        padded_batch, pad_size = pad_dataproto_to_divisor(batch, dp_size)
+        metrics["offpolicy/pad_size"] = pad_size
+        if pad_size == 0:
+            return padded_batch, pad_size
+
+        padding_mask = np.zeros(len(padded_batch), dtype=bool)
+        padding_mask[-pad_size:] = True
+        padded_batch.non_tensor_batch["offpolicy_is_padding"] = padding_mask
+
+        if "uid" in padded_batch.non_tensor_batch:
+            uids = np.array(padded_batch.non_tensor_batch["uid"], dtype=object)
+            for index in range(len(padded_batch) - pad_size, len(padded_batch)):
+                uids[index] = f"offpolicy-padding-{uuid.uuid4()}"
+            padded_batch.non_tensor_batch["uid"] = uids
+
+        if "response_mask" in padded_batch.batch.keys():
+            padded_batch.batch["response_mask"][-pad_size:] = 0
+
+        print(
+            "Padded flattened off-policy batch with "
+            f"{pad_size} rows to make size {len(padded_batch)} divisible by actor dp_size {dp_size}."
+        )
+        return padded_batch, pad_size
+
     def fit(self):
         from verl.utils.tracking import Tracking
 
@@ -249,8 +354,19 @@ class RayTrainerOffPolicy(RayTrainer):
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
 
+                    batch, offpolicy_pad_size = self._pad_offpolicy_batch_to_dp_size(batch, metrics)
+
                     if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
+                        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+                        flat_batch_size = int(batch.batch["attention_mask"].shape[0])
+                        if flat_batch_size % dp_size == 0:
+                            self._balance_batch(batch, metrics=metrics)
+                        else:
+                            print(
+                                "Skipping off-policy sequence-length balancing because flattened batch size "
+                                f"{flat_batch_size} is not divisible by actor dp_size {dp_size}."
+                            )
+                            metrics["global_seqlen/balance_skipped_non_divisible_batch"] = 1
 
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
@@ -266,13 +382,12 @@ class RayTrainerOffPolicy(RayTrainer):
                             # Build token-level reward tensor directly from provided scores
                             prompts = batch.batch["prompts"]
                             responses = batch.batch["responses"]
-                            attention_mask = batch.batch["attention_mask"]
-                            prompt_len = prompts.shape[-1]
-                            valid_response_lengths = attention_mask[:, prompt_len:].sum(dim=-1)
+                            valid_response_lengths = batch.batch["response_mask"].sum(dim=-1)
 
                             reward_tensor = torch.zeros_like(responses, dtype=torch.float32)
                             rewards_scalar: list[float] = []
                             scores_list = batch.non_tensor_batch["scores"]
+                            padding_mask = batch.non_tensor_batch.get("offpolicy_is_padding")
 
                             # Ensure iterable alignment
                             assert len(scores_list) == len(responses), (
@@ -282,11 +397,14 @@ class RayTrainerOffPolicy(RayTrainer):
                             for i in range(len(responses)):
                                 length = int(valid_response_lengths[i].item())
                                 score_item = scores_list[i]
+                                is_padding = padding_mask is not None and bool(padding_mask[i])
                                 if isinstance(score_item, dict):
-                                    reward_value = score_item.get("score")
+                                    reward_value = 0.0 if is_padding else score_item.get("score")
                                     # collect extra infos mirroring batch reward manager
                                     for k, v in score_item.items():
-                                        reward_extra_infos_dict.setdefault(k, []).append(v)
+                                        reward_extra_infos_dict.setdefault(k, []).append(0.0 if is_padding and k == "score" else v)
+                                elif is_padding:
+                                    reward_value = 0.0
                                 else:
                                     reward_value = score_item
 
