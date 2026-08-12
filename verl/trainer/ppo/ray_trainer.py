@@ -87,6 +87,159 @@ def _pack_reward_extra_info(values: list[Any]) -> np.ndarray:
         return np.array(values, dtype=object)
 
 
+def _compute_shortest_success_reward_metrics(reward_extra_info: dict[str, Any]) -> dict[str, float]:
+    """Summarize grouped shortest-success rewards without changing them."""
+    required = {
+        "acc",
+        "shortest_success_selected",
+        "shortest_success_response_tokens",
+        "shortest_success_group_id",
+        "shortest_success_group_has_success",
+        "shortest_success_group_min_tokens",
+    }
+    if not required.issubset(reward_extra_info):
+        return {}
+
+    acc = np.asarray(reward_extra_info["acc"], dtype=np.float64)
+    selected = np.asarray(reward_extra_info["shortest_success_selected"], dtype=np.float64)
+    response_tokens = np.asarray(reward_extra_info["shortest_success_response_tokens"], dtype=np.float64)
+    group_ids = [str(value) for value in reward_extra_info["shortest_success_group_id"]]
+    group_has_success = list(reward_extra_info["shortest_success_group_has_success"])
+    group_min_tokens = list(reward_extra_info["shortest_success_group_min_tokens"])
+    if not (
+        len(acc)
+        == len(selected)
+        == len(response_tokens)
+        == len(group_ids)
+        == len(group_has_success)
+        == len(group_min_tokens)
+    ):
+        raise ValueError("Shortest-success reward metric fields must have identical lengths")
+
+    correct_count = float((acc > 0.5).sum())
+    selected_mask = selected > 0.5
+    group_first_indices: dict[str, int] = {}
+    for idx, group_id in enumerate(group_ids):
+        group_first_indices.setdefault(group_id, idx)
+    first_indices = list(group_first_indices.values())
+    successful_group_indices = [idx for idx in first_indices if bool(group_has_success[idx])]
+    successful_group_mins = [float(group_min_tokens[idx]) for idx in successful_group_indices]
+
+    return {
+        "reward/shortest_success/selected_fraction": float(selected.mean()) if len(selected) else 0.0,
+        "reward/shortest_success/selected_per_correct": (
+            float(selected.sum()) / correct_count if correct_count > 0 else 0.0
+        ),
+        "reward/shortest_success/groups_with_success_fraction": (
+            float(len(successful_group_indices)) / float(len(first_indices)) if first_indices else 0.0
+        ),
+        "reward/shortest_success/mean_min_success_tokens": (
+            float(np.mean(successful_group_mins)) if successful_group_mins else 0.0
+        ),
+        "reward/shortest_success/mean_selected_tokens": (
+            float(response_tokens[selected_mask].mean()) if bool(selected_mask.any()) else 0.0
+        ),
+        "reward/shortest_success/raw_acc_mean": float(acc.mean()) if len(acc) else 0.0,
+    }
+
+
+def _compute_longest_success_penalty_reward_metrics(
+    reward_extra_info: dict[str, Any],
+) -> dict[str, float]:
+    """Summarize longest-success penalties without changing reward values."""
+    required = {
+        "acc",
+        "longest_success_penalty_reward",
+        "longest_success_penalized",
+        "longest_success_response_tokens",
+        "longest_success_group_id",
+        "longest_success_group_has_success",
+        "longest_success_group_within_margin",
+        "longest_success_group_min_tokens",
+        "longest_success_group_max_tokens",
+    }
+    if not required.issubset(reward_extra_info):
+        return {}
+
+    acc = np.asarray(reward_extra_info["acc"], dtype=np.float64)
+    reward = np.asarray(reward_extra_info["longest_success_penalty_reward"], dtype=np.float64)
+    penalized = np.asarray(reward_extra_info["longest_success_penalized"], dtype=np.float64)
+    response_tokens = np.asarray(reward_extra_info["longest_success_response_tokens"], dtype=np.float64)
+    group_ids = [str(value) for value in reward_extra_info["longest_success_group_id"]]
+    group_has_success = list(reward_extra_info["longest_success_group_has_success"])
+    group_within_margin = list(reward_extra_info["longest_success_group_within_margin"])
+    group_min_tokens = list(reward_extra_info["longest_success_group_min_tokens"])
+    group_max_tokens = list(reward_extra_info["longest_success_group_max_tokens"])
+    lengths = {
+        len(acc),
+        len(reward),
+        len(penalized),
+        len(response_tokens),
+        len(group_ids),
+        len(group_has_success),
+        len(group_within_margin),
+        len(group_min_tokens),
+        len(group_max_tokens),
+    }
+    if len(lengths) != 1:
+        raise ValueError("Longest-success-penalty reward metric fields must have identical lengths")
+
+    correct_count = float((acc > 0.5).sum())
+    rewarded_mask = reward > 0.5
+    penalized_mask = penalized > 0.5
+    group_first_indices: dict[str, int] = {}
+    for idx, group_id in enumerate(group_ids):
+        group_first_indices.setdefault(group_id, idx)
+    first_indices = list(group_first_indices.values())
+    successful_group_indices = [idx for idx in first_indices if bool(group_has_success[idx])]
+    within_margin_count = sum(bool(group_within_margin[idx]) for idx in successful_group_indices)
+    penalized_group_count = len(successful_group_indices) - within_margin_count
+    successful_group_mins = [float(group_min_tokens[idx]) for idx in successful_group_indices]
+    successful_group_maxes = [float(group_max_tokens[idx]) for idx in successful_group_indices]
+    max_to_min_ratios = [
+        float(group_max_tokens[idx]) / float(group_min_tokens[idx]) for idx in successful_group_indices
+    ]
+
+    return {
+        "reward/longest_success_penalty/rewarded_fraction": float(reward.mean()) if len(reward) else 0.0,
+        "reward/longest_success_penalty/rewarded_per_correct": (
+            float(reward.sum()) / correct_count if correct_count > 0 else 0.0
+        ),
+        "reward/longest_success_penalty/penalized_per_correct": (
+            float(penalized.sum()) / correct_count if correct_count > 0 else 0.0
+        ),
+        "reward/longest_success_penalty/groups_with_success_fraction": (
+            float(len(successful_group_indices)) / float(len(first_indices)) if first_indices else 0.0
+        ),
+        "reward/longest_success_penalty/successful_groups_within_margin_fraction": (
+            float(within_margin_count) / float(len(successful_group_indices))
+            if successful_group_indices
+            else 0.0
+        ),
+        "reward/longest_success_penalty/successful_groups_penalized_fraction": (
+            float(penalized_group_count) / float(len(successful_group_indices))
+            if successful_group_indices
+            else 0.0
+        ),
+        "reward/longest_success_penalty/mean_min_success_tokens": (
+            float(np.mean(successful_group_mins)) if successful_group_mins else 0.0
+        ),
+        "reward/longest_success_penalty/mean_max_success_tokens": (
+            float(np.mean(successful_group_maxes)) if successful_group_maxes else 0.0
+        ),
+        "reward/longest_success_penalty/mean_max_to_min_ratio": (
+            float(np.mean(max_to_min_ratios)) if max_to_min_ratios else 0.0
+        ),
+        "reward/longest_success_penalty/mean_rewarded_tokens": (
+            float(response_tokens[rewarded_mask].mean()) if bool(rewarded_mask.any()) else 0.0
+        ),
+        "reward/longest_success_penalty/mean_penalized_tokens": (
+            float(response_tokens[penalized_mask].mean()) if bool(penalized_mask.any()) else 0.0
+        ),
+        "reward/longest_success_penalty/raw_acc_mean": float(acc.mean()) if len(acc) else 0.0,
+    }
+
+
 def _validation_metric_section(var_name: str, core_var: str, metric_name: str, n_max: int) -> str | None:
     """Return the validation metric section for exported metrics.
 
@@ -607,6 +760,11 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 "problem",
             }
         ) & batch.non_tensor_batch.keys()
+        opsd_ground_truth_field = OmegaConf.select(self.config, "algorithm.opsd.ground_truth_field")
+        if OmegaConf.select(self.config, "algorithm.opsd.enable") and opsd_ground_truth_field:
+            ground_truth_root = str(opsd_ground_truth_field).split(".", 1)[0]
+            if ground_truth_root in batch.non_tensor_batch:
+                reward_keys.add(ground_truth_root)
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -1282,8 +1440,30 @@ class RayPPOTrainer(OneLoggerInstrumented):
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+    def _validate_expected_resume_step(self, actual_step: int) -> None:
+        """Fail closed when a chained job discovers an unexpected checkpoint."""
+        expected_step = OmegaConf.select(self.config, "trainer.expected_resume_step", default=None)
+        if expected_step is None:
+            return
+        if isinstance(expected_step, bool):
+            raise ValueError("trainer.expected_resume_step must be a non-negative integer or null")
+        try:
+            expected_step = int(expected_step)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("trainer.expected_resume_step must be a non-negative integer or null") from exc
+        if expected_step < 0:
+            raise ValueError("trainer.expected_resume_step must be a non-negative integer or null")
+        if actual_step != expected_step:
+            raise RuntimeError(
+                "Resume checkpoint guard failed: "
+                f"expected global step {expected_step}, discovered {actual_step}. "
+                "Refusing to load a stale, missing, or unexpectedly advanced checkpoint."
+            )
+        print(f"Resume checkpoint guard passed: expected={expected_step} actual={actual_step}")
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
+            self._validate_expected_resume_step(actual_step=0)
             return 0
 
         # load from hdfs
@@ -1300,6 +1480,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
         if self.config.trainer.resume_mode == "auto":
             if global_step_folder is None:
                 print("Training from scratch")
+                self._validate_expected_resume_step(actual_step=0)
                 return 0
         else:
             if self.config.trainer.resume_mode == "resume_path":
@@ -1314,9 +1495,25 @@ class RayPPOTrainer(OneLoggerInstrumented):
         print(f"Load from checkpoint folder: {global_step_folder}")
         # set global step
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
+        self._validate_expected_resume_step(actual_step=self.global_steps)
 
         print(f"Setting global step to {self.global_steps}")
         print(f"Resuming from {global_step_folder}")
+
+        # Validate the requested dataloader-resume contract before mutating any
+        # model state. A segmented production run must never silently restart
+        # its data cursor when the caller explicitly requested restoration.
+        load_dataloader_state = OmegaConf.select(
+            self.config, "trainer.load_dataloader_state_on_resume", default=True
+        )
+        if not isinstance(load_dataloader_state, bool):
+            raise ValueError("trainer.load_dataloader_state_on_resume must be true or false")
+        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
+        if load_dataloader_state and not os.path.exists(dataloader_local_path):
+            raise FileNotFoundError(
+                "trainer.load_dataloader_state_on_resume=true but the requested "
+                f"checkpoint has no dataloader state: {dataloader_local_path}"
+            )
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
@@ -1332,12 +1529,18 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
         # load dataloader,
         # TODO: from remote not implemented yet
-        dataloader_local_path = os.path.join(global_step_folder, "data.pt")
-        if os.path.exists(dataloader_local_path):
+        if not load_dataloader_state:
+            print(
+                "Resume dataloader state intentionally reset: "
+                f"global_step={self.global_steps} ignored_state={dataloader_local_path}"
+            )
+        else:
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
-        else:
-            print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+            print(
+                "Resume dataloader state restored: "
+                f"global_step={self.global_steps} state={dataloader_local_path}"
+            )
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1589,6 +1792,12 @@ class RayPPOTrainer(OneLoggerInstrumented):
             critic_output = self.critic_wg.update_critic(batch)
         return critic_output
 
+    def _completed_training_resume(self) -> bool:
+        """Return whether training should exit before any validation or update."""
+        if self.config.trainer.get("val_only", False):
+            return False
+        return self.global_steps >= self.total_training_steps
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1612,6 +1821,13 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
+        if self._completed_training_resume():
+            pprint(
+                "Training target already reached by resumed checkpoint: "
+                f"global_step={self.global_steps} total_training_steps={self.total_training_steps}. "
+                "Exiting without validation or an optimizer update."
+            )
+            return
         self.checkpoint_manager.update_weights(self.global_steps)
 
         current_epoch = self.global_steps // len(self.train_dataloader)
@@ -1841,6 +2057,10 @@ class RayPPOTrainer(OneLoggerInstrumented):
                         batch.batch["token_level_scores"] = reward_tensor
 
                         if reward_extra_infos_dict:
+                            metrics.update(_compute_shortest_success_reward_metrics(reward_extra_infos_dict))
+                            metrics.update(
+                                _compute_longest_success_penalty_reward_metrics(reward_extra_infos_dict)
+                            )
                             batch.non_tensor_batch.update(
                                 {k: _pack_reward_extra_info(v) for k, v in reward_extra_infos_dict.items()}
                             )

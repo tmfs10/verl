@@ -112,18 +112,22 @@ def _build_validation_reward_config(config):
     val_reward_kwargs = dict(config.reward.get("val_reward_kwargs", {}))
     val_reward_manager_cfg = config.reward.get("val_reward_manager")
     uniform_outcome_reward_kwarg = "use_response_logprob_reward_for_uniform_outcome_groups"
+    shortest_success_reward_kwarg = "use_shortest_success_reward"
+    longest_success_penalty_reward_kwarg = "use_longest_success_penalty_reward"
 
-    def _disable_uniform_outcome_reward(kwargs):
-        # Validation must stay on the standard GRPO reward path even when
-        # training adds the uniform-outcome response-logprob reward.
+    def _disable_training_only_group_rewards(kwargs):
+        # Validation must stay on the standard verifier reward path even when
+        # training applies a grouped reward transformation.
         kwargs = dict(kwargs)
         kwargs[uniform_outcome_reward_kwarg] = False
+        kwargs[shortest_success_reward_kwarg] = False
+        kwargs[longest_success_penalty_reward_kwarg] = False
         return kwargs
 
     if val_reward_manager_cfg is not None:
         val_config = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
         val_config.reward.reward_manager = OmegaConf.create(OmegaConf.to_container(val_reward_manager_cfg, resolve=False))
-        return val_config, _disable_uniform_outcome_reward(val_reward_kwargs)
+        return val_config, _disable_training_only_group_rewards(val_reward_kwargs)
 
     train_reward_source = OmegaConf.select(config, "reward.reward_manager.source", default="register")
     train_reward_name = OmegaConf.select(config, "reward.reward_manager.name", default=None)
@@ -132,11 +136,11 @@ def _build_validation_reward_config(config):
         val_config = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
         val_config.reward.reward_manager.name = "batch"
         print("Using batch validation reward manager for conditional_logprob training.")
-        return val_config, _disable_uniform_outcome_reward(val_reward_kwargs)
+        return val_config, _disable_training_only_group_rewards(val_reward_kwargs)
 
     if val_reward_kwargs:
         train_reward_kwargs.update(val_reward_kwargs)
-    return config, _disable_uniform_outcome_reward(train_reward_kwargs)
+    return config, _disable_training_only_group_rewards(train_reward_kwargs)
 
 
 def _apply_reward_focus_mask_alignment(config):

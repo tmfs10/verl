@@ -123,6 +123,15 @@ trainer:
   # Total training steps (can be set explicitly or derived from epochs)
   total_training_steps: null
 
+  # Optional fail-closed guard for chained jobs. When set, checkpoint discovery
+  # must resolve to exactly this global step before any model state is loaded.
+  expected_resume_step: null
+
+  # Restore the dataloader cursor from data.pt when resuming. Disable only for
+  # intentional phase boundaries that must restart the dataset at its beginning
+  # while retaining model, optimizer, scheduler, RNG, and global-step state.
+  load_dataloader_state_on_resume: true
+
   # Project name for experiment tracking (e.g., wandb)
   project_name: verl_examples
 
