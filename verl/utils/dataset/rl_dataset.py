@@ -122,6 +122,8 @@ class RLHFDataset(Dataset):
         self.max_prompt_length = config.get("max_prompt_length", 1024)
         self.return_raw_chat = config.get("return_raw_chat", False)
         self.return_full_prompt = config.get("return_full_prompt", False)
+        extra_info_drop_keys = config.get("extra_info_drop_keys", []) or []
+        self.extra_info_drop_keys = tuple(str(key) for key in extra_info_drop_keys)
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
@@ -239,6 +241,8 @@ class RLHFDataset(Dataset):
                 # Build "<dataset-index>-<line-number>" and store as JSON-encoded string (to match existing convention)
                 combined = f"{dataset_idx}-{idx}"
                 v["line_number"] = json.dumps(combined)  # e.g., "\"3-42\""
+                for key in self.extra_info_drop_keys:
+                    v.pop(key, None)
 
                 ex["extra_info"] = v
                 return ex
