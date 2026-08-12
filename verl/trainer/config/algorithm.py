@@ -12,12 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "OPSDConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "OPSDAdvantageShapingConfig",
+    "OPSDAuditConfig",
+    "OPSDConfig",
+    "OPSDSteeringConfig",
+    "OPSDTokenKLLoggingConfig",
+    "RolloutCorrectionConfig",
+]
 
 
 @dataclass
@@ -565,6 +576,292 @@ class RolloutCorrectionConfig(BaseConfig):
 
 
 @dataclass
+class OPSDAuditConfig(BaseConfig):
+    """Opt-in, fail-fast numerical audit for OPSD updates."""
+
+    enabled: bool = False
+    output_dir: Optional[str] = None
+    global_steps: list[int] = field(default_factory=lambda: [1, 2, 3])
+    fail_fast: bool = True
+    full_batch_ledger: bool = True
+    reference_forward: bool = True
+    reference_samples_per_rank: int = 1
+    # Strict parity for the production remove-padding path against a compact
+    # no-PAD oracle and synthetic extra-PAD variants.
+    forward_max_abs_error: float = 5e-2
+    forward_mean_abs_error: float = 5e-3
+    # The Transformers dense padded FlashAttention path uses a different BF16
+    # kernel shape. Keep it as an independently logged cross-kernel reference
+    # with explicit, wider bounds; it is not the production PAD invariant.
+    dense_forward_max_abs_error: float = 7.5e-1
+    dense_forward_mean_abs_error: float = 3e-2
+    dense_forward_fail_fast: bool = False
+    # vLLM rollout and FSDP learner use different BF16 kernels. Bound and log
+    # their sampled-token parity separately from same-path PAD invariance.
+    behavior_forward_max_abs_error: float = 7.5e-1
+    behavior_forward_mean_abs_error: float = 3e-2
+    scalar_atol: float = 1e-5
+    scalar_rtol: float = 1e-4
+
+    def __post_init__(self):
+        if any(step <= 0 for step in self.global_steps):
+            raise ValueError(f"opsd.audit.global_steps must be positive, got {self.global_steps}")
+        if self.reference_samples_per_rank <= 0:
+            raise ValueError("opsd.audit.reference_samples_per_rank must be positive")
+        for name in (
+            "forward_max_abs_error",
+            "forward_mean_abs_error",
+            "dense_forward_max_abs_error",
+            "dense_forward_mean_abs_error",
+            "behavior_forward_max_abs_error",
+            "behavior_forward_mean_abs_error",
+            "scalar_atol",
+            "scalar_rtol",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"opsd.audit.{name} must be non-negative")
+
+
+@dataclass
+class OPSDTokenKLLoggingConfig(BaseConfig):
+    """Bounded production ledger for sampled token-level reverse KL.
+
+    The worker logs only positions selected by the explicit response mask. It
+    retains a small number of samples per rank and the largest-absolute sampled
+    reverse-KL positions per retained response so an 8K production run does not
+    emit an unbounded token dump.
+    """
+
+    enabled: bool = False
+    output_dir: Optional[str] = None
+    start_step: int = 1
+    end_step: Optional[int] = None
+    interval_steps: int = 1
+    max_samples_per_rank: int = 1
+    max_tokens_per_sample: int = 128
+
+    def __post_init__(self):
+        if self.start_step <= 0:
+            raise ValueError(
+                f"opsd.token_kl_logging.start_step must be positive, got {self.start_step}"
+            )
+        if self.end_step is not None and self.end_step < self.start_step:
+            raise ValueError(
+                "opsd.token_kl_logging.end_step must be at least start_step, got "
+                f"{self.end_step} < {self.start_step}"
+            )
+        if self.interval_steps <= 0:
+            raise ValueError(
+                "opsd.token_kl_logging.interval_steps must be positive, got "
+                f"{self.interval_steps}"
+            )
+        if self.max_samples_per_rank <= 0:
+            raise ValueError(
+                "opsd.token_kl_logging.max_samples_per_rank must be positive, got "
+                f"{self.max_samples_per_rank}"
+            )
+        if self.max_tokens_per_sample <= 0:
+            raise ValueError(
+                "opsd.token_kl_logging.max_tokens_per_sample must be positive, got "
+                f"{self.max_tokens_per_sample}"
+            )
+
+
+@dataclass
+class OPSDGapDiagnosticsConfig(BaseConfig):
+    """Sequence-level correctness separation for a steered OPSD teacher."""
+
+    enabled: bool = False
+    output_dir: Optional[str] = None
+    interval_steps: int = 1
+    crossfit_enabled: bool = True
+    fold_seed: int = 1234
+    full_sequence_ledger: bool = True
+
+    def __post_init__(self):
+        if self.interval_steps <= 0:
+            raise ValueError(
+                "opsd.steering.gap_diagnostics.interval_steps must be positive, got "
+                f"{self.interval_steps}"
+            )
+        if self.fold_seed < 0:
+            raise ValueError(
+                "opsd.steering.gap_diagnostics.fold_seed must be non-negative, got "
+                f"{self.fold_seed}"
+            )
+
+
+@dataclass
+class OPSDSteeringConfig(BaseConfig):
+    """Configuration for same-prompt steering-vector teacher conditioning."""
+
+    strict_contract: bool = False
+    layer_fractions: str = ""
+    expected_model_path: Optional[str] = None
+    actor_model_path: Optional[str] = None
+    expected_total_layers: Optional[int] = None
+    expected_layer_indices: list[int] = field(default_factory=list)
+    source_mode: str = "caa"
+    # ``same_prompt`` constructs one CAA direction per prompt UID.  The
+    # ``global_batch`` option constructs one direction from every correct and
+    # incorrect rollout in the complete optimizer batch across all DP ranks.
+    caa_scope: str = "same_prompt"
+    correct_rollout_aggregation: str = "all"
+    activation_aggregation: str = "per_rollout"
+    # Policy-gradient steering differentiates a verifier-weighted,
+    # sequence-balanced current-actor objective with respect to a shared
+    # additive activation probe.  Only this explicit formulation is supported
+    # until alternative objectives receive their own audits.
+    gradient_objective: str = "grpo_advantage"
+    gradient_aggregation: str = "per_rollout"
+    scale: float = 1.0
+    normalize: Optional[str] = None
+    apply_positions: str = "all_nonpad"
+    detach_vectors: bool = True
+    gap_diagnostics: OPSDGapDiagnosticsConfig = field(
+        default_factory=OPSDGapDiagnosticsConfig
+    )
+
+    def __post_init__(self):
+        if isinstance(self.gap_diagnostics, dict):
+            object.__setattr__(
+                self,
+                "gap_diagnostics",
+                OPSDGapDiagnosticsConfig(**self.gap_diagnostics),
+            )
+        if self.expected_total_layers is not None and self.expected_total_layers <= 0:
+            raise ValueError(
+                "opsd.steering.expected_total_layers must be positive when set, got "
+                f"{self.expected_total_layers}"
+            )
+        if any(index < 0 for index in self.expected_layer_indices):
+            raise ValueError(
+                "opsd.steering.expected_layer_indices must contain only non-negative indexes"
+            )
+        if len(set(self.expected_layer_indices)) != len(self.expected_layer_indices):
+            raise ValueError("opsd.steering.expected_layer_indices must not contain duplicates")
+        if self.source_mode not in {"caa", "positive", "policy_gradient"}:
+            raise ValueError(
+                "Invalid opsd.steering.source_mode: "
+                f"{self.source_mode}. Must be caa, positive, or policy_gradient"
+            )
+        if self.caa_scope not in {"same_prompt", "global_batch"}:
+            raise ValueError(
+                f"Invalid opsd.steering.caa_scope: {self.caa_scope}. "
+                "Must be same_prompt or global_batch"
+            )
+        if self.source_mode not in {"caa", "policy_gradient"} and self.caa_scope != "same_prompt":
+            raise ValueError(
+                "opsd.steering.caa_scope=global_batch is defined only for "
+                "source_mode=caa or policy_gradient"
+            )
+        if self.correct_rollout_aggregation not in {"first", "all"}:
+            raise ValueError(
+                "Invalid opsd.steering.correct_rollout_aggregation: "
+                f"{self.correct_rollout_aggregation}. Must be first or all"
+            )
+        if self.activation_aggregation not in {"per_rollout", "pooled_tokens"}:
+            raise ValueError(
+                "Invalid opsd.steering.activation_aggregation: "
+                f"{self.activation_aggregation}. Must be per_rollout or pooled_tokens"
+            )
+        if self.gradient_objective != "grpo_advantage":
+            raise ValueError(
+                "Invalid opsd.steering.gradient_objective: "
+                f"{self.gradient_objective}. Must be grpo_advantage"
+            )
+        if self.gradient_aggregation != "per_rollout":
+            raise ValueError(
+                "Invalid opsd.steering.gradient_aggregation: "
+                f"{self.gradient_aggregation}. Must be per_rollout"
+            )
+        if not math.isfinite(self.scale):
+            raise ValueError(f"opsd.steering.scale must be finite, got {self.scale}")
+        if self.normalize not in {None, "unit_norm", "rms"}:
+            raise ValueError(
+                f"Invalid opsd.steering.normalize: {self.normalize}. Must be unit_norm, rms, or null"
+            )
+        if self.apply_positions not in {"all_nonpad", "response_only"}:
+            raise ValueError(
+                "Invalid opsd.steering.apply_positions: "
+                f"{self.apply_positions}. Must be all_nonpad or response_only"
+            )
+        if not self.detach_vectors:
+            raise ValueError(
+                "opsd.steering.detach_vectors must be true; steering sources are a stop-gradient teacher signal"
+            )
+
+
+@dataclass
+class OPSDAdvantageShapingConfig(BaseConfig):
+    """Redistribute verifier-derived response advantage using detached teacher evidence.
+
+    This is deliberately an RLVR objective, not a distillation objective.  The
+    teacher-conditioned branch supplies only a stopped per-token score.  The
+    ordinary student/original-prompt PPO loss remains the only actor objective.
+    """
+
+    enable: bool = False
+    score_source: str = "teacher_minus_student_logprob"
+    scale: float = 1.0
+    normalize: Optional[str] = None
+    clip_z: Optional[float] = None
+    use_distill_mask: bool = True
+    # Reweighting should preserve the verifier-determined update direction by
+    # default.  Experiments may opt into sign flips explicitly.
+    allow_token_sign_flip: bool = False
+    # Optional symmetric cap on the token redistribution, expressed as a
+    # fraction of the rollout's absolute sequence-level GRPO advantage. A
+    # value of 1.0 enforces |delta A_t| <= |A|. ``None`` leaves only the
+    # no-sign-flip bound active.
+    max_delta_fraction: Optional[float] = None
+    # ``None`` means every actual response token selected by the shaping mask.
+    # This is a response-axis cap and can never select prompt tokens.
+    max_response_tokens: Optional[int] = None
+    student_rlvr_backward_scale: float = 1.0
+
+    def __post_init__(self):
+        if self.score_source != "teacher_minus_student_logprob":
+            raise ValueError(
+                "Invalid opsd.advantage_shaping.score_source: "
+                f"{self.score_source}. Only teacher_minus_student_logprob is supported."
+            )
+        valid_normalize = {None, "none", "std", "mean_abs", "range"}
+        if self.normalize not in valid_normalize:
+            raise ValueError(
+                "Invalid opsd.advantage_shaping.normalize: "
+                f"{self.normalize}. Must be one of ['mean_abs', 'none', 'range', 'std'] or None"
+            )
+        if not math.isfinite(self.scale) or self.scale < 0.0:
+            raise ValueError(
+                "opsd.advantage_shaping.scale must be finite and non-negative, "
+                f"got {self.scale}"
+            )
+        if self.clip_z is not None and (not math.isfinite(self.clip_z) or self.clip_z <= 0.0):
+            raise ValueError(
+                "opsd.advantage_shaping.clip_z must be finite and positive when set, "
+                f"got {self.clip_z}"
+            )
+        if self.max_delta_fraction is not None and (
+            not math.isfinite(self.max_delta_fraction) or self.max_delta_fraction <= 0.0
+        ):
+            raise ValueError(
+                "opsd.advantage_shaping.max_delta_fraction must be finite and positive when set, "
+                f"got {self.max_delta_fraction}"
+            )
+        if self.max_response_tokens is not None and self.max_response_tokens <= 0:
+            raise ValueError(
+                "opsd.advantage_shaping.max_response_tokens must be positive when set, "
+                f"got {self.max_response_tokens}"
+            )
+        if not math.isfinite(self.student_rlvr_backward_scale) or self.student_rlvr_backward_scale < 0.0:
+            raise ValueError(
+                "opsd.advantage_shaping.student_rlvr_backward_scale must be finite and non-negative, "
+                f"got {self.student_rlvr_backward_scale}"
+            )
+
+
+@dataclass
 class OPSDConfig(BaseConfig):
     """Configuration for On-Policy Self Distillation (OPSD).
 
@@ -580,6 +877,15 @@ class OPSDConfig(BaseConfig):
 
     enable: bool = False
     mode: str = "opsd"
+    # ``direct_reverse_kl`` uses the baseline-reduced sampled score-function
+    # surrogate. ``negative_kl_advantage`` freezes teacher-minus-current-actor
+    # evidence and sends it through the actor's clipped PPO loss.
+    # ``grpo_advantage_reweighting`` retains the verifier-derived GRPO scalar
+    # and redistributes its token mass with centered teacher evidence.
+    # ``None`` preserves compatibility with configurations that predate the
+    # explicit selector: legacy advantage_shaping.enable=True resolves to GRPO
+    # reweighting, otherwise direct reverse KL is the default.
+    actor_objective: Optional[str] = None
     teacher_source: str = "ground_truth"
     teacher_model: str = "actor"
     teacher_ema_rate: float = 0.05
@@ -587,25 +893,44 @@ class OPSDConfig(BaseConfig):
     ground_truth_field: str = "ground_truth_answer"
     teacher_prompt_style: str = "append_instruction"
     teacher_apply_chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
+    sdpo_conditioning_mode: str = "prompt_append"
+    steering: OPSDSteeringConfig = field(default_factory=OPSDSteeringConfig)
     teacher_prefix: str = "\n\nBelow is the ground truth answer:\n"
     teacher_suffix: str = "\n\nNow solve the problem"
     sdpo_success_prefix: str = "\n\nBelow is a successful previous attempt for this question:\n"
     sdpo_success_suffix: str = "\n\nUse the successful previous attempt as implicit feedback and solve the problem again."
     sdpo_distill_only_failed: bool = True
     sdpo_exclude_self_success: bool = True
-    distill_loss: str = "topk_jsd"
-    topk: int = 16
-    distill_beta: float = 0.5
+    distill_loss: str = "sampled_reverse_kl"
+    # Compatibility sentinels for pre-stabilization configs. These controls are
+    # deliberately rejected when set: the former sparse union-top-k objective
+    # represented opposing-only token mass both explicitly and in the tail
+    # bucket, so it was not a valid shared probability partition. Full JSD is
+    # disabled by the current reverse-KL-only policy, not by a known math bug.
+    topk: Optional[int] = None
+    distill_beta: Optional[float] = None
     distill_token_clip: Optional[float] = None
-    distill_token_clip_tail: bool = True
+    distill_token_clip_tail: Optional[bool] = None
     distill_max_response_tokens: Optional[int] = None
     mix_weight: float = 0.5
-    balance_mode: str = "grad_norm"
+    balance_mode: str = "none"
     balance_param_subset: str = "lm_head"
+    # Only the explicit two-backward implementation is currently supported.
+    # Keep this compatibility field so stale configs fail with a targeted
+    # message instead of silently changing autograd semantics.
     separate_backward: bool = True
     distill_backward_scale: float = 1.0
     rlvr_backward_scale: float = 1.0
     rlvr_warmup_steps: int = 0
+    # Optional supervised update for a separately optimized teacher. The
+    # teacher sees the ground-truth-conditioned prompt and is teacher-forced on
+    # verifier-successful student rollouts. This is an independent coefficient
+    # in addition to the distillation/RLVR mixture.
+    teacher_sft_weight: float = 0.0
+    teacher_sft_target_scope: str = "thinking_and_answer"
+    teacher_sft_success_field: str = "acc"
+    teacher_sft_success_threshold: float = 0.5
+    teacher_sft_think_end_tag: str = "</think>"
     offpolicy_is_mode: str = "sequence"
     offpolicy_is_clip: float = 2.0
     behavior_logprob_source: str = "rollout"
@@ -615,8 +940,53 @@ class OPSDConfig(BaseConfig):
     log_diagnostics: bool = False
     debug_print_interval: int = 0
     debug_num_tokens: int = 8
+    advantage_shaping: OPSDAdvantageShapingConfig = field(default_factory=OPSDAdvantageShapingConfig)
+    audit: OPSDAuditConfig = field(default_factory=OPSDAuditConfig)
+    token_kl_logging: OPSDTokenKLLoggingConfig = field(default_factory=OPSDTokenKLLoggingConfig)
 
     def __post_init__(self):
+        if isinstance(self.steering, dict):
+            object.__setattr__(self, "steering", OPSDSteeringConfig(**self.steering))
+        if isinstance(self.advantage_shaping, dict):
+            object.__setattr__(
+                self,
+                "advantage_shaping",
+                OPSDAdvantageShapingConfig(**self.advantage_shaping),
+            )
+        if isinstance(self.audit, dict):
+            object.__setattr__(self, "audit", OPSDAuditConfig(**self.audit))
+        if isinstance(self.token_kl_logging, dict):
+            object.__setattr__(
+                self,
+                "token_kl_logging",
+                OPSDTokenKLLoggingConfig(**self.token_kl_logging),
+            )
+
+        valid_actor_objectives = {
+            "direct_reverse_kl",
+            "negative_kl_advantage",
+            "grpo_advantage_reweighting",
+        }
+        if self.actor_objective is None:
+            resolved_actor_objective = (
+                "grpo_advantage_reweighting"
+                if self.advantage_shaping.enable
+                else "direct_reverse_kl"
+            )
+            object.__setattr__(self, "actor_objective", resolved_actor_objective)
+        elif self.actor_objective not in valid_actor_objectives:
+            raise ValueError(
+                f"Invalid opsd.actor_objective: {self.actor_objective}. "
+                f"Must be one of {sorted(valid_actor_objectives)}"
+            )
+        if self.advantage_shaping.enable != (
+            self.actor_objective == "grpo_advantage_reweighting"
+        ):
+            raise ValueError(
+                "opsd.advantage_shaping.enable is a compatibility alias and must equal "
+                "(opsd.actor_objective == 'grpo_advantage_reweighting')"
+            )
+
         valid_modes = {"opsd", "opsd_rlvr"}
         if self.mode not in valid_modes:
             raise ValueError(f"Invalid opsd.mode: {self.mode}. Must be one of {sorted(valid_modes)}")
@@ -628,7 +998,136 @@ class OPSDConfig(BaseConfig):
                 f"Must be one of {sorted(valid_teacher_sources)}"
             )
 
-        valid_teacher_models = {"actor", "ema", "fixed"}
+        valid_sdpo_conditioning_modes = {"prompt_append", "steering"}
+        if self.sdpo_conditioning_mode not in valid_sdpo_conditioning_modes:
+            raise ValueError(
+                "Invalid opsd.sdpo_conditioning_mode: "
+                f"{self.sdpo_conditioning_mode}. Must be one of {sorted(valid_sdpo_conditioning_modes)}"
+            )
+        if self.sdpo_conditioning_mode == "steering":
+            if self.teacher_source != "sdpo_success_rollout":
+                raise ValueError(
+                    "opsd.sdpo_conditioning_mode=steering requires "
+                    "opsd.teacher_source=sdpo_success_rollout"
+                )
+            if self.teacher_model != "actor":
+                raise ValueError(
+                    "The production steering-vector path requires teacher_model=actor so the only "
+                    "privileged signal is the detached steering intervention"
+                )
+            if not self.steering.layer_fractions.strip():
+                raise ValueError("opsd.steering.layer_fractions must be set for steering conditioning")
+            if self.teacher_sft_weight != 0.0:
+                raise ValueError("Steering-vector OPSD does not support teacher SFT")
+            if self.sdpo_distill_only_failed:
+                raise ValueError(
+                    "Steering-vector OPSD is outcome-symmetric and requires "
+                    "opsd.sdpo_distill_only_failed=False"
+                )
+            if self.actor_objective in {"direct_reverse_kl", "negative_kl_advantage"}:
+                if self.mode != "opsd":
+                    raise ValueError(
+                        f"Steering actor_objective={self.actor_objective} requires opsd.mode=opsd"
+                    )
+            elif self.actor_objective == "grpo_advantage_reweighting":
+                if self.mode != "opsd_rlvr":
+                    raise ValueError(
+                        "Steering actor_objective=grpo_advantage_reweighting requires "
+                        "opsd.mode=opsd_rlvr"
+                    )
+            if self.steering.strict_contract:
+                strict_mismatches = {}
+                expected_values = {
+                    "correct_rollout_aggregation": "all",
+                    "activation_aggregation": "per_rollout",
+                    "normalize": "unit_norm",
+                    "apply_positions": "response_only",
+                    "detach_vectors": True,
+                    "expected_model_path": "/hf_models/Qwen3-1.7B",
+                    "actor_model_path": "/hf_models/Qwen3-1.7B",
+                    "expected_total_layers": 28,
+                    "expected_layer_indices": [9, 10],
+                }
+                for field_name, expected in expected_values.items():
+                    actual = getattr(self.steering, field_name)
+                    if actual != expected:
+                        strict_mismatches[f"steering.{field_name}"] = (actual, expected)
+                if self.steering.source_mode not in {"caa", "policy_gradient"}:
+                    strict_mismatches["steering.source_mode"] = (
+                        self.steering.source_mode,
+                        "caa or policy_gradient",
+                    )
+                if self.steering.source_mode == "policy_gradient":
+                    if self.steering.caa_scope != "global_batch":
+                        strict_mismatches["steering.caa_scope"] = (
+                            self.steering.caa_scope,
+                            "global_batch",
+                        )
+                    if self.steering.gradient_objective != "grpo_advantage":
+                        strict_mismatches["steering.gradient_objective"] = (
+                            self.steering.gradient_objective,
+                            "grpo_advantage",
+                        )
+                    if self.steering.gradient_aggregation != "per_rollout":
+                        strict_mismatches["steering.gradient_aggregation"] = (
+                            self.steering.gradient_aggregation,
+                            "per_rollout",
+                        )
+                if self.steering.scale <= 0.0:
+                    strict_mismatches["steering.scale"] = (
+                        self.steering.scale,
+                        "finite positive calibration coefficient",
+                    )
+                parent_expected = {
+                    "sdpo_distill_only_failed": (self.sdpo_distill_only_failed, False),
+                    "distill_max_response_tokens": (self.distill_max_response_tokens, None),
+                    "balance_mode": (self.balance_mode, "none"),
+                    "rlvr_backward_scale": (self.rlvr_backward_scale, 0.0),
+                    "rlvr_warmup_steps": (self.rlvr_warmup_steps, 0),
+                }
+                if self.actor_objective == "grpo_advantage_reweighting":
+                    parent_expected.update(
+                        {
+                            "mode": (self.mode, "opsd_rlvr"),
+                            "distill_backward_scale": (self.distill_backward_scale, 0.0),
+                            "mix_weight": (self.mix_weight, 1.0),
+                            "advantage_shaping.enable": (self.advantage_shaping.enable, True),
+                            "advantage_shaping.student_rlvr_backward_scale": (
+                                self.advantage_shaping.student_rlvr_backward_scale,
+                                1.0,
+                            ),
+                            "advantage_shaping.normalize": (
+                                self.advantage_shaping.normalize,
+                                None,
+                            ),
+                            "advantage_shaping.clip_z": (
+                                self.advantage_shaping.clip_z,
+                                None,
+                            ),
+                        }
+                    )
+                else:
+                    parent_expected.update(
+                        {
+                            "mode": (self.mode, "opsd"),
+                            "distill_backward_scale": (self.distill_backward_scale, 1.0),
+                            "advantage_shaping.enable": (self.advantage_shaping.enable, False),
+                        }
+                    )
+                strict_mismatches.update(
+                    {
+                        field_name: values
+                        for field_name, values in parent_expected.items()
+                        if values[0] != values[1]
+                    }
+                )
+                if strict_mismatches:
+                    raise ValueError(
+                        "opsd.steering.strict_contract=True requires the audited outcome-symmetric CAA contract; "
+                        f"mismatches={strict_mismatches}"
+                    )
+
+        valid_teacher_models = {"actor", "ema", "fixed", "separate"}
         if self.teacher_model not in valid_teacher_models:
             raise ValueError(
                 f"Invalid opsd.teacher_model: {self.teacher_model}. "
@@ -638,6 +1137,8 @@ class OPSDConfig(BaseConfig):
             raise ValueError("opsd.teacher_model=ema is only supported with opsd.mode=opsd.")
         if self.teacher_model == "fixed" and self.mode == "opsd_rlvr":
             raise ValueError("opsd.teacher_model=fixed is only supported with opsd.mode=opsd.")
+        if self.teacher_model == "separate" and self.mode != "opsd_rlvr":
+            raise ValueError("opsd.teacher_model=separate requires opsd.mode=opsd_rlvr.")
         if not 0.0 <= self.teacher_ema_rate <= 1.0:
             raise ValueError(
                 f"opsd.teacher_ema_rate must be in [0, 1], got {self.teacher_ema_rate}"
@@ -650,25 +1151,35 @@ class OPSDConfig(BaseConfig):
                 f"{self.teacher_prompt_style}. Must be one of {sorted(valid_teacher_prompt_styles)}"
             )
 
-        valid_distill_losses = {"topk_jsd", "full_jsd", "sampled_reverse_kl"}
-        if self.distill_loss not in valid_distill_losses:
+        if self.distill_loss == "topk_jsd":
             raise ValueError(
-                f"Invalid opsd.distill_loss: {self.distill_loss}. Must be one of {sorted(valid_distill_losses)}"
+                "opsd.distill_loss=topk_jsd is disabled: the legacy union-top-k support "
+                "double-counted opposing-only probability mass in its collapsed tail bucket. "
+                "Use sampled_reverse_kl."
+            )
+        if self.distill_loss == "full_jsd":
+            raise ValueError(
+                "opsd.distill_loss=full_jsd is disabled by the current reverse-KL-only "
+                "stabilization policy. Use sampled_reverse_kl."
+            )
+        if self.distill_loss != "sampled_reverse_kl":
+            raise ValueError(
+                f"Invalid opsd.distill_loss: {self.distill_loss}. Only sampled_reverse_kl is supported."
             )
 
-        if self.distill_loss == "topk_jsd":
-            if self.topk <= 0:
-                raise ValueError(f"opsd.topk must be positive when distill_loss=topk_jsd, got {self.topk}")
-        elif self.topk < 0:
-            raise ValueError(f"opsd.topk must be non-negative, got {self.topk}")
-
-        if not 0.0 <= self.distill_beta <= 1.0:
-            raise ValueError(f"opsd.distill_beta must be in [0, 1], got {self.distill_beta}")
-
-        if self.distill_token_clip is not None and self.distill_token_clip <= 0.0:
+        legacy_distill_controls = {
+            "topk": self.topk,
+            "distill_beta": self.distill_beta,
+            "distill_token_clip": self.distill_token_clip,
+            "distill_token_clip_tail": self.distill_token_clip_tail,
+        }
+        configured_legacy_controls = {
+            name: value for name, value in legacy_distill_controls.items() if value is not None
+        }
+        if configured_legacy_controls:
             raise ValueError(
-                "opsd.distill_token_clip must be positive when set, "
-                f"got {self.distill_token_clip}"
+                "Top-k/JSD-only OPSD controls are disabled with sampled_reverse_kl: "
+                f"{configured_legacy_controls}. Remove these overrides."
             )
 
         if self.distill_max_response_tokens is not None and self.distill_max_response_tokens <= 0:
@@ -685,6 +1196,27 @@ class OPSDConfig(BaseConfig):
 
         if not 0.0 <= self.mix_weight <= 1.0:
             raise ValueError(f"opsd.mix_weight must be in [0, 1], got {self.mix_weight}")
+
+        if self.advantage_shaping.enable:
+            if self.mode != "opsd_rlvr":
+                raise ValueError("opsd.advantage_shaping.enable=True requires opsd.mode=opsd_rlvr")
+            if self.mix_weight != 1.0:
+                raise ValueError("opsd.advantage_shaping.enable=True requires opsd.mix_weight=1.0")
+            if self.balance_mode != "none":
+                raise ValueError("opsd.advantage_shaping.enable=True requires opsd.balance_mode=none")
+            if self.distill_backward_scale != 0.0:
+                raise ValueError(
+                    "opsd.advantage_shaping.enable=True requires opsd.distill_backward_scale=0.0; "
+                    "teacher evidence is score-only and must not create a reverse-KL backward pass"
+                )
+            if self.teacher_model == "actor" and self.rlvr_backward_scale != 0.0:
+                raise ValueError(
+                    "Shared-teacher advantage shaping requires opsd.rlvr_backward_scale=0.0; "
+                    "otherwise the ground-conditioned branch would also train the shared actor"
+                )
+
+        if self.actor_objective == "negative_kl_advantage" and self.mode != "opsd":
+            raise ValueError("opsd.actor_objective=negative_kl_advantage requires opsd.mode=opsd")
 
         if self.distill_backward_scale < 0.0:
             raise ValueError(
@@ -704,10 +1236,53 @@ class OPSDConfig(BaseConfig):
                 f"got {self.rlvr_warmup_steps}"
             )
 
+        if not math.isfinite(self.teacher_sft_weight) or self.teacher_sft_weight < 0.0:
+            raise ValueError(
+                "opsd.teacher_sft_weight must be finite and non-negative, "
+                f"got {self.teacher_sft_weight}"
+            )
+        valid_teacher_sft_scopes = {"thinking_only", "thinking_and_answer"}
+        if self.teacher_sft_target_scope not in valid_teacher_sft_scopes:
+            raise ValueError(
+                "Invalid opsd.teacher_sft_target_scope: "
+                f"{self.teacher_sft_target_scope}. Must be one of {sorted(valid_teacher_sft_scopes)}"
+            )
+        if not self.teacher_sft_success_field.strip():
+            raise ValueError("opsd.teacher_sft_success_field must be non-empty")
+        if not math.isfinite(self.teacher_sft_success_threshold):
+            raise ValueError(
+                "opsd.teacher_sft_success_threshold must be finite, "
+                f"got {self.teacher_sft_success_threshold}"
+            )
+        if not self.teacher_sft_think_end_tag:
+            raise ValueError("opsd.teacher_sft_think_end_tag must be non-empty")
+        if self.teacher_sft_weight > 0.0:
+            if self.mode != "opsd_rlvr":
+                raise ValueError("Teacher SFT requires opsd.mode=opsd_rlvr")
+            if self.teacher_model != "separate":
+                raise ValueError(
+                    "Teacher SFT requires opsd.teacher_model=separate so its gradients cannot silently update the actor"
+                )
+            if self.teacher_source != "ground_truth":
+                raise ValueError(
+                    "Teacher SFT requires opsd.teacher_source=ground_truth so every supervised rollout uses the "
+                    "ground-truth-conditioned prompt"
+                )
+
         valid_balance_modes = {"none", "grad_norm"}
         if self.balance_mode not in valid_balance_modes:
             raise ValueError(
                 f"Invalid opsd.balance_mode: {self.balance_mode}. Must be one of {sorted(valid_balance_modes)}"
+            )
+        if self.teacher_model == "separate" and self.balance_mode == "grad_norm":
+            raise ValueError(
+                "opsd.balance_mode=grad_norm is not supported with a separately optimized teacher; "
+                "use balance_mode=none and control the actor/teacher optimizers independently."
+            )
+        if not self.separate_backward:
+            raise ValueError(
+                "opsd.separate_backward=False is disabled: the stabilized reverse-KL path uses "
+                "explicit branch backward passes. Set separate_backward=True."
             )
 
         valid_balance_subsets = {"lm_head", "last_layer", "all"}

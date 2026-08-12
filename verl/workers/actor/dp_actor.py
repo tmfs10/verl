@@ -117,6 +117,8 @@ class DataParallelPPOActor(BasePPOActor):
         calculate_entropy: bool = False,
         calculate_token_topk: int = 0,
         calculate_token_mrr: bool = False,
+        actor_module: torch.nn.Module | None = None,
+        use_remove_padding: bool | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Returns:
@@ -127,12 +129,14 @@ class DataParallelPPOActor(BasePPOActor):
                 if calculate_sum_pi_squared is False:
                     sum_pi_squared: (bs, response_len)
         """
+        model_module = self.actor_module if actor_module is None else actor_module
+        remove_padding = self.use_remove_padding if use_remove_padding is None else bool(use_remove_padding)
         calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
         sum_pi_squared_checkpointing = self.config.get("sum_pi_squared_checkpointing", False)
         # PrefixGrouper path for shared-prefix optimization
         if self.use_prefix_grouper:
             can_use_pg = (
-                not self.use_remove_padding
+                not remove_padding
                 and not self.use_ulysses_sp
                 and not self.use_fused_kernels
                 and not self.use_dynamic_bsz
@@ -143,7 +147,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 return forward_micro_batch_with_prefix_grouper(
                     micro_batch=micro_batch,
-                    model=self.actor_module,
+                    model=model_module,
                     temperature=temperature,
                     calculate_entropy=calculate_entropy,
                     device_name=self.device_name,
@@ -167,7 +171,7 @@ class DataParallelPPOActor(BasePPOActor):
             if position_ids.dim() == 3:  # qwen2vl mrope
                 position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
 
-            if self.use_remove_padding:
+            if remove_padding:
                 input_ids_rmpad, indices, cu_seqlens, *_ = unpad_input(
                     input_ids.unsqueeze(-1), attention_mask
                 )  # input_ids_rmpad (total_nnz, ...)
@@ -218,7 +222,7 @@ class DataParallelPPOActor(BasePPOActor):
                 # pad and slice the inputs if sp > 1
                 if self.use_ulysses_sp:
                     is_vlm_model = hasattr(
-                        getattr(self.actor_module, "module", self.actor_module).config, "vision_config"
+                        getattr(model_module, "module", model_module).config, "vision_config"
                     )
                     if is_vlm_model:
                         # vlm model's inputs will be sliced after embedding
@@ -247,7 +251,7 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
+                output = model_module(
                     input_ids=input_ids_rmpad,
                     attention_mask=None,
                     position_ids=position_ids_rmpad,
@@ -399,7 +403,7 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
+                output = model_module(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
                     position_ids=position_ids,
@@ -469,14 +473,18 @@ class DataParallelPPOActor(BasePPOActor):
 
         # if grad_norm is not finite, skip the update
         if self.scaler is not None:
+            scale_before = self.scaler.get_scale()
             self.scaler.step(self.actor_optimizer)
             self.scaler.update()
+            self._last_optimizer_step_succeeded = self.scaler.get_scale() >= scale_before
         else:
             if not torch.isfinite(grad_norm):
                 print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}")
                 self.actor_optimizer.zero_grad()
+                self._last_optimizer_step_succeeded = False
             else:
                 self.actor_optimizer.step()
+                self._last_optimizer_step_succeeded = True
 
         # Clear cached weight scales for QAT (weights changed)
         if getattr(self.actor_module, "_qat_fuse_enabled", False):
@@ -493,6 +501,8 @@ class DataParallelPPOActor(BasePPOActor):
         calculate_entropy: bool = False,
         dp_group=None,
         same_micro_num_in_dp: bool = False,
+        actor_module: torch.nn.Module | None = None,
+        use_remove_padding: bool | None = None,
     ) -> dict[str, torch.Tensor]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
@@ -518,8 +528,11 @@ class DataParallelPPOActor(BasePPOActor):
         calculate_token_topk = int(data.meta_info.get("topk_token_ids_k", 0) or 0)
         calculate_token_mrr = bool(data.meta_info.get("calculate_token_mrr", False))
 
-        # set to eval
-        self.actor_module.eval()
+        # Allow recipe workers to reuse the complete, padding-aware log-prob
+        # pathway with a colocated model (for example, an independent OPSD
+        # teacher) instead of maintaining a second forward implementation.
+        model_module = self.actor_module if actor_module is None else actor_module
+        model_module.eval()
 
         micro_batch_size = data.meta_info["micro_batch_size"]
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
@@ -562,6 +575,8 @@ class DataParallelPPOActor(BasePPOActor):
                     calculate_entropy=calculate_entropy,
                     calculate_token_topk=calculate_token_topk,
                     calculate_token_mrr=calculate_token_mrr,
+                    actor_module=model_module,
+                    use_remove_padding=use_remove_padding,
                 )
             log_probs_lst.append(outputs["log_probs"])
             if calculate_entropy:

@@ -1,15 +1,19 @@
+import pytest
 import torch
 
 from recipe.opsd.opsd_loss import (
+    aggregate_token_loss,
     balance_branch_losses,
     build_sparse_topk_state,
     compute_full_generalized_divergence,
+    compute_negative_sampled_reverse_kl_advantages,
     compute_sampled_reverse_kl_surrogate_token_loss,
     compute_sampled_reverse_kl_token_estimate,
     compute_sparse_topk_tail_generalized_divergence,
     compute_sparse_topk_tail_jsd,
     compute_teacher_is_weights,
     resolve_branch_scales_from_grad_norms,
+    shape_advantages_with_centered_teacher_evidence,
 )
 
 
@@ -29,6 +33,23 @@ def _dense_generalized_divergence(student_logits: torch.Tensor, teacher_logits: 
     student_term = (student_probs * (student_log_probs - mixture_log_probs)).sum(dim=-1)
     teacher_term = (teacher_probs * (teacher_log_probs - mixture_log_probs)).sum(dim=-1)
     return ((1.0 - beta) * student_term) + (beta * teacher_term)
+
+
+def test_empty_mask_token_loss_is_graph_connected_and_nonfinite_safe():
+    token_loss = torch.tensor([[float("nan"), float("inf")]], requires_grad=True)
+    mask = torch.zeros_like(token_loss)
+
+    loss = aggregate_token_loss(
+        token_loss,
+        mask,
+        loss_agg_mode="token-mean",
+        global_batch_info={"dp_size": 1, "batch_num_tokens": 0},
+    )
+
+    assert torch.isfinite(loss)
+    assert loss.item() == 0.0
+    loss.backward()
+    torch.testing.assert_close(token_loss.grad, torch.zeros_like(token_loss))
 
 
 def test_sparse_topk_tail_jsd_is_zero_for_identical_logits():
@@ -216,8 +237,59 @@ def test_sampled_reverse_kl_surrogate_detaches_teacher_branch():
     loss.backward()
 
     assert torch.allclose(token_estimate, torch.tensor([[-0.2, 0.2]]), atol=1e-6)
-    assert student_log_probs.grad is not None
+    # The expectation-zero +1 score baseline is intentionally omitted.
+    assert torch.allclose(student_log_probs.grad, torch.tensor([[-0.2, 0.2]]), atol=1e-6)
     assert teacher_log_probs.grad is None
+
+
+def test_sampled_reverse_kl_surrogate_has_zero_empirical_gradient_at_equality():
+    student_log_probs = torch.tensor([[-0.3, -0.7]], requires_grad=True)
+    teacher_log_probs = student_log_probs.detach().clone().requires_grad_(True)
+
+    loss = compute_sampled_reverse_kl_surrogate_token_loss(
+        student_log_probs, teacher_log_probs
+    ).sum()
+    loss.backward()
+
+    assert torch.equal(student_log_probs.grad, torch.zeros_like(student_log_probs))
+    assert teacher_log_probs.grad is None
+
+
+def test_negative_sampled_reverse_kl_advantages_are_fixed_teacher_minus_current_actor():
+    current_actor = torch.tensor([[-0.3, -0.7]], requires_grad=True)
+    teacher = torch.tensor([[-0.1, -0.9]], requires_grad=True)
+
+    advantages = compute_negative_sampled_reverse_kl_advantages(current_actor, teacher)
+
+    torch.testing.assert_close(advantages, torch.tensor([[0.2, -0.2]]))
+    assert advantages.requires_grad is False
+
+
+def test_negative_kl_ppo_and_direct_surrogate_match_at_on_policy_ratio_one():
+    """The two choices differ operationally, not in their on-policy gradient."""
+
+    behavior = torch.tensor([[-0.3, -0.7]], dtype=torch.float32)
+    teacher = torch.tensor([[-0.1, -0.9]], dtype=torch.float32)
+
+    direct_log_probs = behavior.clone().requires_grad_(True)
+    direct_loss = compute_sampled_reverse_kl_surrogate_token_loss(
+        direct_log_probs, teacher
+    ).sum()
+    direct_loss.backward()
+
+    ppo_log_probs = behavior.clone().requires_grad_(True)
+    negative_kl_advantages = compute_negative_sampled_reverse_kl_advantages(
+        behavior, teacher
+    )
+    # At the start of the one-pass on-policy update, ratio=exp(logp-old)=1 and
+    # no PPO clip is active. This is the unclipped PPO token loss.
+    ppo_loss = (
+        -negative_kl_advantages
+        * torch.exp(ppo_log_probs - behavior)
+    ).sum()
+    ppo_loss.backward()
+
+    torch.testing.assert_close(ppo_log_probs.grad, direct_log_probs.grad)
 
 
 def test_compute_teacher_is_weights_sequence_mode():
@@ -255,6 +327,42 @@ def test_compute_teacher_is_weights_sequence_mode_clamps_long_log_ratio_sum():
     assert metrics["opsd/is_weight_mean"] > 0.0
 
 
+def test_compute_teacher_is_weights_sequence_mode_cancels_before_clipping():
+    teacher_old = torch.tensor([[30.0, -30.0]], dtype=torch.float32)
+    student_behavior = torch.zeros_like(teacher_old)
+    response_mask = torch.ones_like(teacher_old)
+
+    weights, _ = compute_teacher_is_weights(
+        teacher_old_log_probs=teacher_old,
+        student_behavior_log_probs=student_behavior,
+        response_mask=response_mask,
+        mode="sequence",
+        clip=10.0,
+    )
+
+    assert torch.equal(weights, torch.ones_like(weights))
+
+
+def test_compute_teacher_is_weights_token_mode_is_per_token_and_masks_padding():
+    teacher_old = torch.tensor([[0.4, -0.2, 9.0]], dtype=torch.float32)
+    student_behavior = torch.tensor([[0.0, 0.3, -9.0]], dtype=torch.float32)
+    response_mask = torch.tensor([[1.0, 1.0, 0.0]], dtype=torch.float32)
+
+    weights, metrics = compute_teacher_is_weights(
+        teacher_old_log_probs=teacher_old,
+        student_behavior_log_probs=student_behavior,
+        response_mask=response_mask,
+        mode="token",
+        clip=2.0,
+    )
+
+    expected = torch.tensor([[torch.exp(torch.tensor(0.4)), torch.exp(torch.tensor(-0.5)), 0.0]])
+    torch.testing.assert_close(weights, expected)
+    assert weights[0, 0] != weights[0, 1]
+    assert weights[0, 2].item() == 0.0
+    assert metrics["opsd/is_weight_max"] == pytest.approx(expected[0, 0].item())
+
+
 class _TinyActor(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -265,12 +373,12 @@ def test_balance_branch_losses_equalizes_gradient_scales():
     actor = _TinyActor()
     input_tensor = torch.tensor([[1.0, -1.0]])
 
-    jsd_loss = actor.lm_head(input_tensor).pow(2).sum()
+    distill_loss = actor.lm_head(input_tensor).pow(2).sum()
     rlvr_loss = 10.0 * actor.lm_head(input_tensor).abs().sum()
 
     total_loss, metrics = balance_branch_losses(
         actor,
-        jsd_loss,
+        distill_loss,
         rlvr_loss,
         mix_weight=0.5,
         balance_mode="grad_norm",
@@ -278,21 +386,227 @@ def test_balance_branch_losses_equalizes_gradient_scales():
     )
 
     assert total_loss.requires_grad
-    assert metrics["opsd/jsd_grad_norm"] > 0
+    assert metrics["opsd/distill_grad_norm"] > 0
     assert metrics["opsd/rlvr_grad_norm"] > 0
 
 
 def test_resolve_branch_scales_from_grad_norms_uses_geometric_mean_target():
-    jsd_grad_norm = torch.tensor(4.0)
+    distill_grad_norm = torch.tensor(4.0)
     rlvr_grad_norm = torch.tensor(1.0)
 
-    jsd_scale, rlvr_scale, metrics = resolve_branch_scales_from_grad_norms(
+    distill_scale, rlvr_scale, metrics = resolve_branch_scales_from_grad_norms(
         mix_weight=0.5,
-        jsd_grad_norm=jsd_grad_norm,
+        distill_grad_norm=distill_grad_norm,
         rlvr_grad_norm=rlvr_grad_norm,
     )
 
-    assert torch.allclose(jsd_scale, torch.tensor(0.5), atol=1e-6)
+    assert torch.allclose(distill_scale, torch.tensor(0.5), atol=1e-6)
     assert torch.allclose(rlvr_scale, torch.tensor(2.0), atol=1e-6)
-    assert metrics["opsd/jsd_scale"] == jsd_scale.item()
+    assert metrics["opsd/distill_scale"] == distill_scale.item()
     assert metrics["opsd/rlvr_scale"] == rlvr_scale.item()
+
+
+def test_resolve_branch_scales_falls_back_when_a_branch_norm_is_zero():
+    distill_scale, rlvr_scale, metrics = resolve_branch_scales_from_grad_norms(
+        mix_weight=0.5,
+        distill_grad_norm=torch.tensor(0.0),
+        rlvr_grad_norm=torch.tensor(2.0),
+    )
+
+    assert distill_scale.item() == 1.0
+    assert rlvr_scale.item() == 1.0
+    assert metrics["opsd/grad_norm_fallback"] == 1.0
+
+
+def test_advantage_shaping_preserves_sequence_total_and_never_changes_pad_tokens():
+    advantages = torch.tensor([[2.0, 2.0, 2.0, 0.0, 0.0], [-1.0, -1.0, 7.0, 8.0, 9.0]])
+    evidence = torch.tensor([[3.0, 1.0, -2.0, 100.0, -100.0], [0.0, 2.0, 4.0, 6.0, 8.0]])
+    response_mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 0, 0, 0]], dtype=torch.float32)
+
+    shaped, metrics = shape_advantages_with_centered_teacher_evidence(
+        advantages,
+        evidence,
+        response_mask,
+        normalize="std",
+        allow_token_sign_flip=False,
+    )
+
+    torch.testing.assert_close(
+        (shaped * response_mask).sum(dim=-1),
+        (advantages * response_mask).sum(dim=-1),
+        atol=1e-6,
+        rtol=0.0,
+    )
+    assert torch.equal(shaped[~response_mask.bool()], advantages[~response_mask.bool()])
+    assert torch.all(shaped[0, :3] >= 0)
+    assert torch.all(shaped[1, :2] <= 0)
+    assert metrics["opsd/advantage_shaping_pad_delta_max"] == 0.0
+    assert metrics["opsd/advantage_shaping_prompt_token_count"] == 0.0
+    assert metrics["opsd/advantage_shaping_pad_token_count"] == 0.0
+    assert metrics["opsd/advantage_shaping_total_error_max"] < 1e-6
+
+
+def test_advantage_shaping_symmetric_delta_cap_uses_one_mass_preserving_scale():
+    advantages = torch.full((1, 3), 2.0)
+    evidence = torch.tensor([[-0.6, -0.6, 1.2]])
+    response_mask = torch.ones_like(advantages)
+
+    shaped, metrics = shape_advantages_with_centered_teacher_evidence(
+        advantages,
+        evidence,
+        response_mask,
+        normalize=None,
+        clip_z=None,
+        max_delta_fraction=1.0,
+        allow_token_sign_flip=False,
+    )
+
+    delta = shaped - advantages
+    torch.testing.assert_close(delta.sum(dim=-1), torch.zeros(1), atol=1e-6, rtol=0.0)
+    assert delta.abs().max().item() <= 2.0 + 1e-6
+    assert metrics["opsd/advantage_shaping_delta_fraction_abs_max"] <= 1.0 + 1e-6
+    assert metrics["opsd/advantage_shaping_delta_cap_active_rate"] == 1.0
+    assert metrics["opsd/advantage_shaping_sign_bound_active_rate"] == 0.0
+
+
+def test_advantage_shaping_corrects_long_response_float32_mass_residual():
+    torch.manual_seed(7)
+    response_length = 8192
+    advantages = torch.tensor([[2.345678], [-1.765432]], dtype=torch.float32).expand(
+        2, response_length
+    ).clone()
+    evidence = torch.randn_like(advantages)
+    response_mask = torch.ones_like(advantages)
+
+    shaped, metrics = shape_advantages_with_centered_teacher_evidence(
+        advantages,
+        evidence,
+        response_mask,
+        normalize="std",
+        clip_z=3.0,
+        allow_token_sign_flip=False,
+    )
+
+    represented_delta = (
+        (shaped.double() - advantages.double()) * response_mask.double()
+    ).sum(dim=-1)
+    assert metrics["opsd/advantage_shaping_pre_correction_error_max"] > 1e-6
+    assert metrics["opsd/advantage_shaping_correction_abs_max"] > 1e-6
+    assert metrics["opsd/advantage_shaping_response_total_error_max"] <= (
+        metrics["opsd/advantage_shaping_conservation_roundoff_bound_max"] + 1e-10
+    )
+    assert metrics["opsd/advantage_shaping_conservation_roundoff_excess_max"] <= 1e-10
+    assert metrics["opsd/advantage_shaping_neg_to_pos_rate"] == 0.0
+    assert metrics["opsd/advantage_shaping_pos_to_neg_rate"] == 0.0
+
+
+def test_advantage_shaping_long_response_correction_preserves_delta_cap():
+    torch.manual_seed(11)
+    response_length = 8192
+    advantages = torch.tensor([[0.7245674], [-2.4748666]], dtype=torch.float32).expand(
+        2, response_length
+    ).clone()
+    evidence = torch.randn_like(advantages) * 0.4
+    response_mask = torch.ones_like(advantages)
+
+    shaped, metrics = shape_advantages_with_centered_teacher_evidence(
+        advantages,
+        evidence,
+        response_mask,
+        normalize=None,
+        clip_z=None,
+        max_delta_fraction=1.0,
+        allow_token_sign_flip=False,
+    )
+
+    represented_delta = (shaped.double() - advantages.double()).sum(dim=-1)
+    delta_fraction = (shaped - advantages).abs() / advantages.abs()
+    assert metrics["opsd/advantage_shaping_response_total_error_max"] <= (
+        metrics["opsd/advantage_shaping_conservation_roundoff_bound_max"] + 1e-10
+    )
+    assert metrics["opsd/advantage_shaping_conservation_roundoff_excess_max"] <= 1e-10
+    assert delta_fraction.max().item() <= 1.0 + 1e-5
+    assert metrics["opsd/advantage_shaping_delta_fraction_abs_max"] <= 1.0 + 1e-5
+
+
+def test_advantage_shaping_delta_cap_allows_inactive_rows():
+    advantages = torch.tensor([[1.0, 1.0, 1.0], [0.5, 0.5, 0.5]])
+    evidence = torch.tensor([[1.0, 0.0, -1.0], [3.0, 2.0, 1.0]])
+    response_mask = torch.ones_like(advantages)
+    shaping_mask = torch.tensor([[1, 1, 1], [0, 0, 0]], dtype=torch.float32)
+
+    shaped, _ = shape_advantages_with_centered_teacher_evidence(
+        advantages,
+        evidence,
+        response_mask,
+        shaping_mask=shaping_mask,
+        normalize=None,
+        clip_z=None,
+        max_delta_fraction=1.0,
+        allow_token_sign_flip=False,
+    )
+
+    assert torch.equal(shaped[1], advantages[1])
+    torch.testing.assert_close(shaped[0].sum(), advantages[0].sum())
+
+
+def test_advantage_shaping_changes_only_explicit_response_submask():
+    advantages = torch.ones((1, 5))
+    evidence = torch.tensor([[10.0, 0.0, -10.0, 5.0, -5.0]], requires_grad=True)
+    response_mask = torch.ones_like(advantages)
+    shaping_mask = torch.tensor([[1, 1, 0, 0, 0]], dtype=torch.float32)
+
+    shaped, metrics = shape_advantages_with_centered_teacher_evidence(
+        advantages,
+        evidence,
+        response_mask,
+        shaping_mask=shaping_mask,
+        allow_token_sign_flip=False,
+    )
+
+    assert shaped.requires_grad is False
+    assert not torch.equal(shaped[:, :2], advantages[:, :2])
+    assert torch.equal(shaped[:, 2:], advantages[:, 2:])
+    torch.testing.assert_close(shaped[:, :2].sum(), advantages[:, :2].sum())
+    assert metrics["opsd/advantage_shaping_outside_mask_delta_max"] == 0.0
+
+
+def test_advantage_shaping_rejects_mask_that_selects_padding():
+    advantages = torch.ones((1, 3))
+    evidence = torch.zeros_like(advantages)
+    response_mask = torch.tensor([[1, 1, 0]], dtype=torch.float32)
+    shaping_mask = torch.tensor([[1, 1, 1]], dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="subset of the actual response-token mask"):
+        shape_advantages_with_centered_teacher_evidence(
+            advantages,
+            evidence,
+            response_mask,
+            shaping_mask=shaping_mask,
+        )
+
+
+def test_advantage_shaping_rejects_prompt_axis_shape():
+    advantages = torch.ones((1, 3))
+    evidence = torch.zeros_like(advantages)
+    response_mask_with_prompt = torch.ones((1, 7))
+
+    with pytest.raises(ValueError, match="matching shapes"):
+        shape_advantages_with_centered_teacher_evidence(
+            advantages,
+            evidence,
+            response_mask_with_prompt,
+        )
+
+
+def test_advantage_shaping_rejects_non_sequence_level_advantages():
+    advantages = torch.tensor([[1.0, 0.5, 1.0]])
+    evidence = torch.tensor([[2.0, 1.0, 0.0]])
+    response_mask = torch.ones_like(advantages)
+
+    with pytest.raises(ValueError, match="sequence-level advantage"):
+        shape_advantages_with_centered_teacher_evidence(
+            advantages,
+            evidence,
+            response_mask,
+        )

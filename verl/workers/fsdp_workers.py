@@ -1035,7 +1035,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
             lr = self.actor_lr_scheduler.get_last_lr()[0]
             metrics["actor/lr"] = lr.item() if torch.is_tensor(lr) else lr
-            self.actor_lr_scheduler.step()
+            actor_optimizer_stepped = getattr(self.actor, "_actor_optimizer_stepped", True)
+            metrics["actor/optimizer_step_skipped"] = float(not actor_optimizer_stepped)
+            if actor_optimizer_stepped:
+                self.actor_lr_scheduler.step()
 
             # TODO: here, we should return all metrics
             output = DataProto(meta_info={"metrics": metrics})

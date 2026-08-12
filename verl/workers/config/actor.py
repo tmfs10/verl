@@ -223,7 +223,7 @@ class ActorConfig(BaseConfig):
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
 
-        valid_opsd_teacher_models = {"actor", "ema", "fixed"}
+        valid_opsd_teacher_models = {"actor", "ema", "fixed", "separate"}
         if self.opsd_teacher_model not in valid_opsd_teacher_models:
             raise ValueError(
                 f"Invalid opsd_teacher_model: {self.opsd_teacher_model}. "
