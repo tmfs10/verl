@@ -111,6 +111,81 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # Synchronous self-critique and intermediate Monte Carlo value supervision.
+  intermediate_mc_value:
+
+    # Structured configuration target.
+    _target_: verl.trainer.config.IntermediateMCValueConfig
+
+    # Enable the dedicated synchronous trainer path.
+    enable: false
+
+    # Closed recipe selector: scalar_random or beta_variance.
+    recipe: scalar_random
+
+    # VeRL-native actor objective. DPPO-Binary-TV is the feature default.
+    actor_loss_mode: dppo_tv
+
+    # Number of independent critiques sampled for each solution.
+    num_critiques: 4
+
+    # Number of continuation suffixes sampled for every selected mark.
+    continuations_per_mark: 1
+
+    # Maximum selected marks in one configured variance scope; zero disables continuations.
+    max_marks: 1
+
+    # Completed critic update calls before actor training begins.
+    critic_warmup_updates: 30
+
+    # Critique token cap; null inherits data.max_response_length.
+    critique_max_response_length: null
+
+    # Inclusive lower fraction for eligible nonterminal marks.
+    mark_start_fraction: 0.05
+
+    # Inclusive upper fraction for eligible nonterminal marks.
+    mark_end_fraction: 0.90
+
+    # Minimum token distance between marks in one rollout.
+    min_mark_gap: 32
+
+    # Variance selection scope: rollout, prompt, or batch.
+    variance_scope: rollout
+
+    # Per-slot chance to choose a random eligible variance candidate.
+    variance_random_probability: 0.05
+
+    # Base seed used by stable mark-selection hashes.
+    selection_seed: 0
+
+    # Maximum scalar environment reward.
+    max_reward: 1.0
+
+    # Scalar critic loss: mse or bce.
+    scalar_loss: mse
+
+    # PPO-style normalized value clipping epsilon.
+    value_clip_epsilon: 0.2
+
+    # Open-interval target transform for Beta likelihood.
+    beta_target_epsilon: 1.0e-4
+
+    # Epsilon used when critique rewards have zero population variance.
+    critique_normalization_epsilon: 1.0e-8
+
+    # Exact instruction appended after the original question and solution.
+    critique_prompt: |-
+      You have been given above a question, the thought process, and the resulting
+      solution. The solution may or may not be correct. Analyze the thought process
+      and solution and at the end output your judgement on (a) whether the solution
+      is correct or not (b) what parts of the thought process were correct or led to
+      correct directions (c) what part of the thought process were dead-ends or
+      incorrect or didn't later enable moving in the correct direction.
+
+    # Optional structural JSONL audit directory used by smoke verification.
+    audit_output_dir: null
+
 # config for the trainer
 trainer:
 

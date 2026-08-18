@@ -378,6 +378,14 @@ class TaskRunner:
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
 
+        intermediate_mc_enabled = bool(
+            OmegaConf.select(config, "algorithm.intermediate_mc_value.enable", default=False)
+        )
+        if intermediate_mc_enabled:
+            from verl.trainer.ppo.ray_trainer_intermediate_mc import validate_intermediate_mc_runtime_config
+
+            validate_intermediate_mc_runtime_config(config)
+
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
 
@@ -406,6 +414,20 @@ class TaskRunner:
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        if intermediate_mc_enabled:
+            critic_tokenizer_path = copy_to_local(
+                config.critic.model.tokenizer_path,
+                use_shm=config.critic.model.get("use_shm", False),
+            )
+            critic_tokenizer = hf_tokenizer(
+                critic_tokenizer_path,
+                trust_remote_code=config.critic.model.get("trust_remote_code", False),
+            )
+            validate_intermediate_mc_runtime_config(
+                config,
+                actor_tokenizer=tokenizer,
+                critic_tokenizer=critic_tokenizer,
+            )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
@@ -435,6 +457,11 @@ class TaskRunner:
         val_reward_fn = load_reward_manager(val_reward_config, tokenizer, num_examine=1, **val_reward_kwargs)
 
         trainer_cls = RayPPOTrainer
+        if intermediate_mc_enabled:
+            from verl.trainer.ppo.ray_trainer_intermediate_mc import IntermediateMCRayPPOTrainer
+
+            trainer_cls = IntermediateMCRayPPOTrainer
+            print("Using synchronous IntermediateMCRayPPOTrainer")
         if bool(config.data.get("use_dataset_responses", False)):
             from verl.trainer.ppo.ray_trainer_off_policy import RayTrainerOffPolicy
 

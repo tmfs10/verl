@@ -21,6 +21,8 @@ from verl.base_config import BaseConfig
 __all__ = [
     "AlgoConfig",
     "FilterGroupsConfig",
+    "INTERMEDIATE_MC_CRITIQUE_PROMPT",
+    "IntermediateMCValueConfig",
     "KLControlConfig",
     "OPSDAdvantageShapingConfig",
     "OPSDAuditConfig",
@@ -29,6 +31,112 @@ __all__ = [
     "OPSDTokenKLLoggingConfig",
     "RolloutCorrectionConfig",
 ]
+
+
+INTERMEDIATE_MC_CRITIQUE_PROMPT = """You have been given above a question, the thought process, and the resulting
+solution. The solution may or may not be correct. Analyze the thought process
+and solution and at the end output your judgement on (a) whether the solution
+is correct or not (b) what parts of the thought process were correct or led to
+correct directions (c) what part of the thought process were dead-ends or
+incorrect or didn't later enable moving in the correct direction."""
+
+
+@dataclass
+class IntermediateMCValueConfig(BaseConfig):
+    """Synchronous self-critique and continuation supervision for PPO.
+
+    The two recipes are deliberately closed rather than independently combining
+    critic heads and selectors. This keeps checkpoint and numerical contracts
+    explicit and prevents stale EMA configurations from being accepted.
+    """
+
+    enable: bool = False
+    recipe: str = "scalar_random"
+    actor_loss_mode: str = "dppo_tv"
+    num_critiques: int = 4
+    continuations_per_mark: int = 1
+    max_marks: int = 1
+    critic_warmup_updates: int = 30
+    critique_max_response_length: Optional[int] = None
+    mark_start_fraction: float = 0.05
+    mark_end_fraction: float = 0.90
+    min_mark_gap: int = 32
+    variance_scope: str = "rollout"
+    variance_random_probability: float = 0.05
+    selection_seed: int = 0
+    max_reward: float = 1.0
+    scalar_loss: str = "mse"
+    value_clip_epsilon: float = 0.2
+    beta_target_epsilon: float = 1e-4
+    critique_normalization_epsilon: float = 1e-8
+    critique_prompt: str = INTERMEDIATE_MC_CRITIQUE_PROMPT
+    audit_output_dir: Optional[str] = None
+
+    @property
+    def critic_head(self) -> str:
+        return "scalar" if self.recipe == "scalar_random" else "beta"
+
+    @property
+    def mark_selector(self) -> str:
+        return "random" if self.recipe == "scalar_random" else "variance"
+
+    @property
+    def num_critic_labels(self) -> int:
+        return 1 if self.critic_head == "scalar" else 2
+
+    def __post_init__(self):
+        if self.recipe not in {"scalar_random", "beta_variance"}:
+            raise ValueError(
+                "algorithm.intermediate_mc_value.recipe must be scalar_random or beta_variance; "
+                f"EMA and arbitrary head/selector combinations are unsupported, got {self.recipe!r}"
+            )
+        if not isinstance(self.actor_loss_mode, str) or not self.actor_loss_mode.strip():
+            raise ValueError("algorithm.intermediate_mc_value.actor_loss_mode must be non-empty")
+        positive_ints = {
+            "num_critiques": self.num_critiques,
+            "continuations_per_mark": self.continuations_per_mark,
+            "min_mark_gap": self.min_mark_gap,
+        }
+        for name, value in positive_ints.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"algorithm.intermediate_mc_value.{name} must be a positive integer")
+        if not isinstance(self.max_marks, int) or isinstance(self.max_marks, bool) or self.max_marks < 0:
+            raise ValueError("algorithm.intermediate_mc_value.max_marks must be a non-negative integer")
+        if (
+            not isinstance(self.critic_warmup_updates, int)
+            or isinstance(self.critic_warmup_updates, bool)
+            or self.critic_warmup_updates < 0
+        ):
+            raise ValueError("algorithm.intermediate_mc_value.critic_warmup_updates must be non-negative")
+        if self.critique_max_response_length is not None:
+            if (
+                not isinstance(self.critique_max_response_length, int)
+                or isinstance(self.critique_max_response_length, bool)
+                or self.critique_max_response_length <= 0
+            ):
+                raise ValueError(
+                    "algorithm.intermediate_mc_value.critique_max_response_length must be positive or null"
+                )
+        if not isinstance(self.selection_seed, int) or isinstance(self.selection_seed, bool):
+            raise ValueError("algorithm.intermediate_mc_value.selection_seed must be an integer")
+        if not 0.0 <= self.mark_start_fraction <= self.mark_end_fraction <= 1.0:
+            raise ValueError("mark fractions must satisfy 0 <= start <= end <= 1")
+        if self.variance_scope not in {"rollout", "prompt", "batch"}:
+            raise ValueError("variance_scope must be rollout, prompt, or batch")
+        if not 0.0 <= self.variance_random_probability <= 1.0:
+            raise ValueError("variance_random_probability must be in [0, 1]")
+        if isinstance(self.max_reward, bool) or not math.isfinite(self.max_reward) or self.max_reward <= 0.0:
+            raise ValueError("max_reward must be finite and positive")
+        if self.scalar_loss not in {"mse", "bce"}:
+            raise ValueError("scalar_loss must be mse or bce")
+        if not math.isfinite(self.value_clip_epsilon) or self.value_clip_epsilon < 0.0:
+            raise ValueError("value_clip_epsilon must be finite and non-negative")
+        if not 0.0 < self.beta_target_epsilon < 0.5:
+            raise ValueError("beta_target_epsilon must be in (0, 0.5)")
+        if not math.isfinite(self.critique_normalization_epsilon) or self.critique_normalization_epsilon <= 0:
+            raise ValueError("critique_normalization_epsilon must be finite and positive")
+        if self.critique_prompt != INTERMEDIATE_MC_CRITIQUE_PROMPT:
+            raise ValueError("critique_prompt must exactly match the intermediate MC critique instruction")
 
 
 @dataclass
@@ -1364,6 +1472,7 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    intermediate_mc_value: IntermediateMCValueConfig = field(default_factory=IntermediateMCValueConfig)
     opsd: OPSDConfig = field(default_factory=OPSDConfig)
     # GDPO (Group reward-Decoupled Normalization Policy Optimization) settings.
     # gdpo_reward_keys: keys in non_tensor_batch (from compute_score's return dict) that

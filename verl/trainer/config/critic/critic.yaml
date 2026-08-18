@@ -82,6 +82,27 @@ cliprange_value: 0.5
 # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
 loss_agg_mode: ${oc.select:actor_rollout_ref.actor.loss_agg_mode,token-mean}
 
+# Feature-gated conditioned critic contract.
+intermediate_mc_value:
+
+  # Whether the conditioned critic path is enabled.
+  enable: ${oc.select:algorithm.intermediate_mc_value.enable,false}
+
+  # Closed recipe name used to determine the head width.
+  recipe: ${oc.select:algorithm.intermediate_mc_value.recipe,scalar_random}
+
+  # Maximum reward used to scale the critic mean.
+  max_reward: ${oc.select:algorithm.intermediate_mc_value.max_reward,1.0}
+
+  # Scalar critic target loss.
+  scalar_loss: ${oc.select:algorithm.intermediate_mc_value.scalar_loss,mse}
+
+  # PPO-style value clipping epsilon.
+  value_clip_epsilon: ${oc.select:algorithm.intermediate_mc_value.value_clip_epsilon,0.2}
+
+  # Open-interval transform used for Beta targets.
+  beta_target_epsilon: ${oc.select:algorithm.intermediate_mc_value.beta_target_epsilon,1.0e-4}
+
 # checkpoint configs
 checkpoint:
 
@@ -178,4 +199,3 @@ profiler:
 
       # Stack trace depth for memory allocations
       stack_depth: ${oc.select:global_profiler.global_tool_config.torch_memory.stack_depth,32}
-      

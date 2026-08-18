@@ -1423,6 +1423,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+        self._save_additional_trainer_state(local_global_step_folder)
 
         # latest checkpointed iteration tracker (for atomic usage)
         if (
@@ -1439,6 +1440,15 @@ class RayPPOTrainer(OneLoggerInstrumented):
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
+
+    def _save_additional_trainer_state(self, checkpoint_folder: str) -> None:
+        """Hook for feature trainers that own driver-side checkpoint state."""
+
+    def _validate_additional_trainer_state(self, checkpoint_folder: str) -> None:
+        """Validate feature state before any model checkpoint is loaded."""
+
+    def _load_additional_trainer_state(self, checkpoint_folder: str) -> None:
+        """Restore feature state after native model and dataloader state."""
 
     def _validate_expected_resume_step(self, actual_step: int) -> None:
         """Fail closed when a chained job discovers an unexpected checkpoint."""
@@ -1514,6 +1524,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 "trainer.load_dataloader_state_on_resume=true but the requested "
                 f"checkpoint has no dataloader state: {dataloader_local_path}"
             )
+        self._validate_additional_trainer_state(global_step_folder)
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
@@ -1541,6 +1552,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 "Resume dataloader state restored: "
                 f"global_step={self.global_steps} state={dataloader_local_path}"
             )
+        self._load_additional_trainer_state(global_step_folder)
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""

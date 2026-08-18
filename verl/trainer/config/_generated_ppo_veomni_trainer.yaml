@@ -236,6 +236,7 @@ actor_rollout_ref:
       _target_: verl.workers.config.MultiTurnConfig
       enable: false
       max_assistant_turns: null
+      per_turn_response_length: null
       tool_config_path: null
       max_user_turns: null
       max_parallel_calls: 1
@@ -349,6 +350,7 @@ data:
   train_max_samples: -1
   val_max_samples: -1
   prompt_key: prompt
+  solution_key: ground_truth_answer
   reward_fn_key: data_source
   max_prompt_length: 512
   max_response_length: 512
@@ -381,6 +383,19 @@ data:
     path: null
     name: null
   apply_chat_template_kwargs: {}
+  train_apply_chat_template_kwargs: null
+  val_apply_chat_template_kwargs: null
+  dynamic_masked_solution: true
+  min_masked_fraction: null
+  max_masked_fraction: null
+  masked_solution_selection_mode: random_fraction
+  mask_seed: null
+  masked_solution_token: <|fim_middle|>
+  masked_solution_placeholders:
+  - '{solution}'
+  - '{masked_solution}'
+  masked_solution_focus_tail_percent: null
+  masked_solution_focus_min_tokens: null
 critic:
   optim:
     _target_: verl.workers.config.VeOmniOptimizerConfig
@@ -444,6 +459,13 @@ critic:
   data_loader_seed: ${oc.select:actor_rollout_ref.actor.data_loader_seed,null}
   cliprange_value: 0.5
   loss_agg_mode: ${oc.select:actor_rollout_ref.actor.loss_agg_mode,token-mean}
+  intermediate_mc_value:
+    enable: ${oc.select:algorithm.intermediate_mc_value.enable,false}
+    recipe: ${oc.select:algorithm.intermediate_mc_value.recipe,scalar_random}
+    max_reward: ${oc.select:algorithm.intermediate_mc_value.max_reward,1.0}
+    scalar_loss: ${oc.select:algorithm.intermediate_mc_value.scalar_loss,mse}
+    value_clip_epsilon: ${oc.select:algorithm.intermediate_mc_value.value_clip_epsilon,0.2}
+    beta_target_epsilon: ${oc.select:algorithm.intermediate_mc_value.beta_target_epsilon,1.0e-4}
   checkpoint:
     _target_: verl.trainer.config.CheckpointConfig
     save_contents:
@@ -523,6 +545,8 @@ sandbox_fusion:
   memory_limit_mb: null
 reward:
   num_workers: 8
+  reward_kwargs: {}
+  val_reward_kwargs: {}
   custom_reward_function:
     path: null
     name: compute_score
@@ -534,6 +558,7 @@ reward:
       _target_: verl.trainer.config.config.ModuleConfig
       path: null
       name: custom_reward_manager
+  val_reward_manager: null
   reward_model:
     enable: false
     enable_resource_pool: false
@@ -593,10 +618,47 @@ algorithm:
   pf_ppo:
     reweight_method: pow
     weight_pow: 2.0
+  intermediate_mc_value:
+    _target_: verl.trainer.config.IntermediateMCValueConfig
+    enable: false
+    recipe: scalar_random
+    actor_loss_mode: dppo_tv
+    num_critiques: 4
+    continuations_per_mark: 1
+    max_marks: 1
+    critic_warmup_updates: 30
+    critique_max_response_length: null
+    mark_start_fraction: 0.05
+    mark_end_fraction: 0.9
+    min_mark_gap: 32
+    variance_scope: rollout
+    variance_random_probability: 0.05
+    selection_seed: 0
+    max_reward: 1.0
+    scalar_loss: mse
+    value_clip_epsilon: 0.2
+    beta_target_epsilon: 0.0001
+    critique_normalization_epsilon: 1.0e-08
+    critique_prompt: 'You have been given above a question, the thought process, and
+      the resulting
+
+      solution. The solution may or may not be correct. Analyze the thought process
+
+      and solution and at the end output your judgement on (a) whether the solution
+
+      is correct or not (b) what parts of the thought process were correct or led
+      to
+
+      correct directions (c) what part of the thought process were dead-ends or
+
+      incorrect or didn''t later enable moving in the correct direction.'
+    audit_output_dir: null
 trainer:
   balance_batch: true
   total_epochs: 30
   total_training_steps: null
+  expected_resume_step: null
+  load_dataloader_state_on_resume: true
   project_name: verl_examples
   experiment_name: gsm8k
   logger:
@@ -608,6 +670,8 @@ trainer:
   nnodes: 1
   n_gpus_per_node: 8
   save_freq: -1
+  checkpoint_must_save_by: null
+  checkpoint_save_duration: 60
   esi_redundant_time: 0
   resume_mode: auto
   resume_from_path: null

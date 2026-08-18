@@ -1440,7 +1440,15 @@ class CriticWorker(Worker, DistProfilerExtension):
         if self.ulysses_sequence_parallel_size > 1 and hasattr(critic_model_config, "vision_config"):
             critic_model_config.vision_config._attn_implementation = "eager"
 
-        critic_model_config.num_labels = 1
+        intermediate_mc_config = self.config.get("intermediate_mc_value", {})
+        intermediate_mc_enabled = bool(intermediate_mc_config.get("enable", False))
+        if intermediate_mc_enabled:
+            recipe = intermediate_mc_config.get("recipe")
+            if recipe not in {"scalar_random", "beta_variance"}:
+                raise ValueError(f"unsupported intermediate MC critic recipe {recipe!r}")
+            critic_model_config.num_labels = 1 if recipe == "scalar_random" else 2
+        else:
+            critic_model_config.num_labels = 1
         # patch for kimi-vl
         if getattr(critic_model_config, "model_type", None) == "kimi_vl":
             critic_model_config.text_config.topk_method = "greedy"
@@ -1470,6 +1478,17 @@ class CriticWorker(Worker, DistProfilerExtension):
                 critic_model_config,
                 config.model.get("trust_remote_code", False),
             )
+            if intermediate_mc_enabled and recipe == "beta_variance" and hasattr(critic_module, "v_head"):
+                summary = getattr(critic_module.v_head, "summary", None)
+                if not isinstance(summary, torch.nn.Linear):
+                    raise RuntimeError("Beta intermediate MC requires a linear token value head with two outputs")
+                critic_module.v_head.summary = torch.nn.Linear(
+                    summary.in_features,
+                    2,
+                    bias=summary.bias is not None,
+                    device=summary.weight.device,
+                    dtype=summary.weight.dtype,
+                )
 
             use_remove_padding = config.model.get("use_remove_padding", False)
 
@@ -1645,7 +1664,10 @@ class CriticWorker(Worker, DistProfilerExtension):
         # This is used to import external_lib into the huggingface systems
         import_external_libs(self.config.model.get("external_lib", None))
 
-        from verl.workers.critic import DataParallelPPOCritic
+        if bool(self.config.get("intermediate_mc_value", {}).get("enable", False)):
+            from verl.workers.critic.intermediate_mc_critic import DataParallelIntermediateMCCritic as CriticClass
+        else:
+            from verl.workers.critic import DataParallelPPOCritic as CriticClass
 
         self.critic_module, self.critic_optimizer, self.critic_lr_scheduler = self._build_critic_model_optimizer(
             self.config
@@ -1658,7 +1680,7 @@ class CriticWorker(Worker, DistProfilerExtension):
             offload_fsdp_optimizer(optimizer=self.critic_optimizer)
             log_gpu_memory_usage("After offload critic optimizer during init", logger=logger)
 
-        self.critic = DataParallelPPOCritic(
+        self.critic = CriticClass(
             config=self.config, critic_module=self.critic_module, critic_optimizer=self.critic_optimizer
         )
 
@@ -1684,8 +1706,15 @@ class CriticWorker(Worker, DistProfilerExtension):
         # perform forward computation
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on critic.compute_values
-            values = self.critic.compute_values(data=data)
-            output = DataProto.from_dict(tensors={"values": values})
+            computed = self.critic.compute_values(data=data)
+            if isinstance(computed, tuple):
+                values, variances = computed
+                tensors = {"values": values}
+                if variances is not None:
+                    tensors["variances"] = variances
+                output = DataProto.from_dict(tensors=tensors)
+            else:
+                output = DataProto.from_dict(tensors={"values": computed})
 
         output = output.to("cpu")
         if self._is_offload_param:

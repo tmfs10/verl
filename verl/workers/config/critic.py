@@ -14,7 +14,7 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from omegaconf import MISSING
 
@@ -86,6 +86,7 @@ class CriticConfig(BaseConfig):
     model_config: HFModelConfig = None
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
+    intermediate_mc_value: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         """Validate critic configuration parameters."""
