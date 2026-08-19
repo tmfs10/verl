@@ -39,6 +39,7 @@ from smoke_tests.intermediate_mc_value.topology.matrix import (
 from smoke_tests.intermediate_mc_value.topology.submit_oci_iad import (
     _extra_args,
     _replace_ssh_tunnel_host,
+    _replace_verl_container,
     build_command,
 )
 
@@ -137,11 +138,19 @@ ssh_tunnel:
   user: siddjain
 
 account: nemotron_reason_code
+
+containers:
+  verl: /containers/missing-verl.sqsh
 """
     target = "draco-oci-login-02.draco-oci-iad.nvidia.com"
     updated, original = _replace_ssh_tunnel_host(source, target)
     assert original == "draco-oci-login-01.draco-oci-iad.nvidia.com"
     assert updated == source.replace(original, target)
+
+    container = "/containers/verl-vllm-0.12.sqsh"
+    updated, original_container = _replace_verl_container(updated, container)
+    assert original_container == "/containers/missing-verl.sqsh"
+    assert updated == source.replace(original, target).replace(original_container, container)
 
 
 def test_memory_aggressive_profile_cannot_be_bulk_launched() -> None:

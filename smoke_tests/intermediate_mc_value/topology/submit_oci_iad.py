@@ -38,6 +38,7 @@ VAL_DATA = "/data/rl/mathgen/comp_math_verl.jsonl"
 TRAIN_ROWS = 29427
 TRAIN_SHA256 = "f79a42fe155218db2f1927ee903afd101929724f2d0516352bdbb91cdb139178"
 SSH_ALIAS = "iad-2"
+VERL_CONTAINER = "/lustre/fsw/portfolios/llmservice/users/siddjain/containers/verl_vllm012_flashattn_20260321.sqsh"
 
 
 def _resolve_ssh_hostname(alias: str) -> str:
@@ -64,12 +65,23 @@ def _replace_ssh_tunnel_host(config_text: str, target_host: str) -> tuple[str, s
     return updated, original_host
 
 
+def _replace_verl_container(config_text: str, target_container: str) -> tuple[str, str]:
+    pattern = re.compile(r"(?m)^(  verl:\s*)([^#\s]+)(\s*(?:#.*)?)$")
+    matches = pattern.findall(config_text)
+    if len(matches) != 1:
+        raise ValueError(f"expected exactly one active VeRL container in oci-iad.yaml, found {len(matches)}")
+    original_container = matches[0][1]
+    updated = pattern.sub(lambda match: f"{match.group(1)}{target_container}{match.group(3)}", config_text, count=1)
+    return updated, original_container
+
+
 def _prepare_execution_config(source_dir: Path, local_run_dir: Path) -> Path:
     source = source_dir.expanduser().resolve() / "oci-iad.yaml"
     if not source.is_file():
         raise FileNotFoundError(f"missing authoritative OCI-IAD config: {source}")
     target_host = _resolve_ssh_hostname(SSH_ALIAS)
     updated, original_host = _replace_ssh_tunnel_host(source.read_text(encoding="utf-8"), target_host)
+    updated, original_container = _replace_verl_container(updated, VERL_CONTAINER)
     destination_dir = local_run_dir / "cluster_config"
     destination_dir.mkdir(parents=True, exist_ok=True)
     destination = destination_dir / source.name
@@ -82,6 +94,8 @@ def _prepare_execution_config(source_dir: Path, local_run_dir: Path) -> Path:
                 "source_host": original_host,
                 "ssh_alias": SSH_ALIAS,
                 "resolved_host": target_host,
+                "source_verl_container": original_container,
+                "execution_verl_container": VERL_CONTAINER,
                 "execution_config_sha256": _sha256(destination),
             },
             indent=2,
