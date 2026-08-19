@@ -1945,7 +1945,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             gen_batch_output = self.intermediate_mc_controller._generate_sequences_with_lifecycle(
                                 gen_batch_output,
                                 profile_rollout=curr_step_profile,
-                                wake_up_replicas=False,
+                                restore_rollout=False,
                             )
                             intermediate_mc_records = self.intermediate_mc_controller.extract_generation_records(
                                 gen_batch_output

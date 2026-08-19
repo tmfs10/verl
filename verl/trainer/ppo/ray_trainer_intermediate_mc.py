@@ -63,6 +63,20 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import marked_timer
 
 
+def _add_exception_note(error: BaseException, note: str) -> None:
+    """Retain secondary failures on Python versions before BaseException.add_note."""
+
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    notes = getattr(error, "__notes__", None)
+    if notes is None:
+        notes = []
+        error.__notes__ = notes
+    notes.append(note)
+
+
 def _tokenizer_fingerprint(tokenizer) -> str:
     payload = {
         "vocab": sorted((str(token), int(index)) for token, index in tokenizer.get_vocab().items()),
@@ -802,7 +816,7 @@ class IntermediateMCValueController:
             output = self._generate_sequences_with_lifecycle(
                 request,
                 profile_rollout=profile_rollout,
-                wake_up_replicas=True,
+                restore_rollout=True,
             )
             records = self.extract_generation_records(output)
         expected = {bundle.rollout_id for bundle in bundles if bundle.marks}
@@ -824,15 +838,19 @@ class IntermediateMCValueController:
         request: DataProto,
         *,
         profile_rollout: bool,
-        wake_up_replicas: bool,
+        restore_rollout: bool,
     ) -> DataProto:
         """Run one blocking feature rollout and independently attempt every cleanup."""
 
         primary_error: BaseException | None = None
         profile_cleanup_required = False
         try:
-            if wake_up_replicas:
-                self.trainer.checkpoint_manager.wake_up_replicas()
+            if restore_rollout:
+                # HYBRID rollout servers intentionally reject a direct wake-up:
+                # VeRL restores them through the native weight-sync lifecycle.
+                # The actor has not been updated yet, so this is an exact refresh
+                # of the behavior policy used for the solution rollout.
+                self.trainer.checkpoint_manager.update_weights(self.trainer.global_steps)
             if profile_rollout:
                 # Mark cleanup required before entry because a multi-replica
                 # gather can partially succeed and then raise.
@@ -860,11 +878,11 @@ class IntermediateMCValueController:
             if cleanup_errors:
                 if primary_error is not None:
                     for label, error in cleanup_errors:
-                        primary_error.add_note(f"{label} also failed: {error!r}")
+                        _add_exception_note(primary_error, f"{label} also failed: {error!r}")
                 else:
                     _, first_error = cleanup_errors[0]
                     for label, error in cleanup_errors[1:]:
-                        first_error.add_note(f"{label} also failed: {error!r}")
+                        _add_exception_note(first_error, f"{label} also failed: {error!r}")
                     raise first_error
 
     def _make_reward_batch(

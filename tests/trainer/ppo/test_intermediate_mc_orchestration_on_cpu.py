@@ -34,6 +34,7 @@ from verl.trainer.ppo.intermediate_mc_value import build_critic_context, build_u
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.ray_trainer_intermediate_mc import (
     IntermediateMCValueController,
+    _add_exception_note,
     _Bundle,
     configured_optimizer_rows,
     validate_intermediate_mc_runtime_config,
@@ -742,8 +743,9 @@ def test_deferred_continuation_stage_profiles_and_cleans_up_on_generation_failur
         raise RuntimeError("injected variance generation failure")
 
     controller.trainer = SimpleNamespace(
+        global_steps=1,
         checkpoint_manager=SimpleNamespace(
-            wake_up_replicas=lambda: events.append("wake"),
+            update_weights=lambda _global_steps: events.append("restore"),
             sleep_replicas=lambda: events.append("sleep"),
         ),
         async_rollout_manager=SimpleNamespace(
@@ -762,16 +764,16 @@ def test_deferred_continuation_stage_profiles_and_cleans_up_on_generation_failur
             {},
             profile_rollout=True,
         )
-    assert events == ["wake", "start_profile", "generate", "sleep", "stop_profile"]
+    assert events == ["restore", "start_profile", "generate", "sleep", "stop_profile"]
 
 
 @pytest.mark.parametrize(
-    ("wake_up", "failure", "expected_events"),
+    ("restore_rollout", "failure", "expected_events"),
     [
-        (True, "wake", ["wake", "sleep"]),
-        (True, "start_profile", ["wake", "start_profile", "sleep", "stop_profile"]),
-        (True, "sleep", ["wake", "start_profile", "generate", "sleep", "stop_profile"]),
-        (True, "stop_profile", ["wake", "start_profile", "generate", "sleep", "stop_profile"]),
+        (True, "restore", ["restore", "sleep"]),
+        (True, "start_profile", ["restore", "start_profile", "sleep", "stop_profile"]),
+        (True, "sleep", ["restore", "start_profile", "generate", "sleep", "stop_profile"]),
+        (True, "stop_profile", ["restore", "start_profile", "generate", "sleep", "stop_profile"]),
         (False, "start_profile", ["start_profile", "sleep", "stop_profile"]),
         (False, "generate", ["start_profile", "generate", "sleep", "stop_profile"]),
         (False, "sleep", ["start_profile", "generate", "sleep", "stop_profile"]),
@@ -779,7 +781,7 @@ def test_deferred_continuation_stage_profiles_and_cleans_up_on_generation_failur
     ],
 )
 def test_blocking_rollout_lifecycle_attempts_independent_cleanup(
-    wake_up: bool,
+    restore_rollout: bool,
     failure: str,
     expected_events: list[str],
 ) -> None:
@@ -796,8 +798,9 @@ def test_blocking_rollout_lifecycle_attempts_independent_cleanup(
         return run
 
     controller.trainer = SimpleNamespace(
+        global_steps=7,
         checkpoint_manager=SimpleNamespace(
-            wake_up_replicas=operation("wake"),
+            update_weights=operation("restore"),
             sleep_replicas=operation("sleep"),
         ),
         async_rollout_manager=SimpleNamespace(
@@ -810,14 +813,14 @@ def test_blocking_rollout_lifecycle_attempts_independent_cleanup(
         controller._generate_sequences_with_lifecycle(
             DataProto(),
             profile_rollout=True,
-            wake_up_replicas=wake_up,
+            restore_rollout=restore_rollout,
         )
     assert events == expected_events
 
 
-@pytest.mark.parametrize(("wake_up", "primary_failure"), [(True, "start_profile"), (False, "generate")])
+@pytest.mark.parametrize(("restore_rollout", "primary_failure"), [(True, "start_profile"), (False, "generate")])
 def test_blocking_rollout_lifecycle_retains_every_simultaneous_cleanup_failure(
-    wake_up: bool,
+    restore_rollout: bool,
     primary_failure: str,
 ) -> None:
     controller = _controller()
@@ -834,8 +837,9 @@ def test_blocking_rollout_lifecycle_retains_every_simultaneous_cleanup_failure(
         return run
 
     controller.trainer = SimpleNamespace(
+        global_steps=7,
         checkpoint_manager=SimpleNamespace(
-            wake_up_replicas=operation("wake"),
+            update_weights=operation("restore"),
             sleep_replicas=operation("sleep"),
         ),
         async_rollout_manager=SimpleNamespace(
@@ -848,13 +852,13 @@ def test_blocking_rollout_lifecycle_retains_every_simultaneous_cleanup_failure(
         controller._generate_sequences_with_lifecycle(
             DataProto(),
             profile_rollout=True,
-            wake_up_replicas=wake_up,
+            restore_rollout=restore_rollout,
         )
 
     notes = error_info.value.__notes__
     assert any("rollout sleep cleanup" in note and "injected sleep failure" in note for note in notes)
     assert any("rollout profile cleanup" in note and "injected stop_profile failure" in note for note in notes)
-    expected_events = ["wake"] if wake_up else []
+    expected_events = ["restore"] if restore_rollout else []
     expected_events.append("start_profile")
     if primary_failure == "generate":
         expected_events.append("generate")
@@ -883,9 +887,15 @@ def test_blocking_rollout_lifecycle_retains_secondary_cleanup_failure_without_pr
         controller._generate_sequences_with_lifecycle(
             DataProto(),
             profile_rollout=True,
-            wake_up_replicas=False,
+            restore_rollout=False,
         )
     assert any(
         "rollout profile cleanup" in note and "injected stop_profile failure" in note
         for note in error_info.value.__notes__
     )
+
+
+def test_exception_notes_fall_back_on_python_310_style_errors() -> None:
+    error = SimpleNamespace()
+    _add_exception_note(error, "secondary failure")
+    assert error.__notes__ == ["secondary failure"]
