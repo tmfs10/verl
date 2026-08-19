@@ -1,25 +1,43 @@
 # Copyright 2026 NVIDIA Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
-"""Blocking VeRL trainer for self-critique and intermediate MC value labels."""
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Native-RayPPO integration for synchronous intermediate Monte Carlo values."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
-import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 import torch
 from omegaconf import OmegaConf, open_dict
-from tqdm import tqdm
 from transformers import AutoConfig
 
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor
-from verl.trainer.config import IntermediateMCValueConfig
+from verl.experimental.agent_loop.intermediate_mc_agent_loop import (
+    INTERMEDIATE_MC_AGENT_NAME,
+    INTERMEDIATE_MC_CHILD_FIELD,
+    ContinuationGeneration,
+    CritiqueGeneration,
+    IntermediateMCGenerationRecord,
+)
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.trainer.config import INTERMEDIATE_MC_CRITIQUE_PROMPT, IntermediateMCValueConfig
+from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.intermediate_mc_value import (
     CRITIQUE_DELIMITER,
     SOLUTION_DELIMITER,
@@ -30,39 +48,16 @@ from verl.trainer.ppo.intermediate_mc_value import (
     candidate_bounds,
     critique_accuracy_reward,
     critique_group_advantages,
-    masked_whiten,
-    select_random_marks,
+    initial_state_target,
     select_variance_marks,
     stable_rng,
-    token_gae,
     validate_reward,
 )
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import compute_reward
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.metric import reduce_metrics
 from verl.utils.model import compute_position_id_with_mask
-from verl.utils.tracking import Tracking
-
-
-@dataclass
-class _Bundle:
-    order: int
-    dataset_index: object
-    rollout_id: str
-    prompt_group_id: str
-    source_row: int
-    prompt_ids: list[int]
-    solution_ids: list[int]
-    terminal_reward: float
-    critique_rows: list[DataProto] = field(default_factory=list)
-    critique_ids: list[list[int]] = field(default_factory=list)
-    contexts: list[CriticContext] = field(default_factory=list)
-    critic_values: list[list[float]] = field(default_factory=list)
-    critic_variances: list[list[float]] = field(default_factory=list)
-    marks: list[int] = field(default_factory=list)
-    per_mark_targets: dict[int, float] = field(default_factory=dict)
-    dense_targets: dict[int, float] = field(default_factory=dict)
+from verl.utils.profiler import marked_timer
 
 
 def _tokenizer_fingerprint(tokenizer) -> str:
@@ -76,8 +71,35 @@ def _tokenizer_fingerprint(tokenizer) -> str:
     return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
-def validate_intermediate_mc_runtime_config(config, actor_tokenizer=None, critic_tokenizer=None) -> None:
-    """Fail closed before allocating workers for unsupported combinations."""
+def _positive_model_limit(model_path: str, config, *, role: str) -> int:
+    model_config = AutoConfig.from_pretrained(
+        model_path,
+        trust_remote_code=config.model.get("trust_remote_code", False),
+    )
+    if _is_moe_model(model_config):
+        raise ValueError(f"intermediate MC initially supports only dense {role} models")
+    override = config.model.get("override_config", {})
+    limit = override.get("max_position_embeddings", getattr(model_config, "max_position_embeddings", None))
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError(f"{role} model must declare a positive max_position_embeddings")
+    return int(limit)
+
+
+def _is_moe_model(model_config) -> bool:
+    for name in ("num_experts", "num_local_experts", "n_routed_experts"):
+        value = getattr(model_config, name, None)
+        if isinstance(value, int) and value > 1:
+            return True
+    return getattr(model_config, "moe_intermediate_size", None) is not None
+
+
+def validate_intermediate_mc_runtime_config(
+    config,
+    actor_tokenizer=None,
+    critic_tokenizer=None,
+    actor_model_path: str | None = None,
+) -> None:
+    """Fail closed before worker allocation for unsupported combinations."""
 
     feature = omega_conf_to_dataclass(
         config.algorithm.intermediate_mc_value,
@@ -86,330 +108,340 @@ def validate_intermediate_mc_runtime_config(config, actor_tokenizer=None, critic
     if not feature.enable:
         return
     if config.trainer.get("use_legacy_worker_impl", "auto") == "disable":
-        raise ValueError("intermediate MC currently supports only the legacy FSDP/FSDP2 workers")
+        raise ValueError("intermediate MC currently supports only VeRL's legacy FSDP/FSDP2 workers")
     if config.actor_rollout_ref.actor.strategy not in {"fsdp", "fsdp2"}:
         raise ValueError("intermediate MC actor strategy must be fsdp or fsdp2")
     if config.critic.strategy not in {"fsdp", "fsdp2"}:
         raise ValueError("intermediate MC critic strategy must be fsdp or fsdp2")
+    if config.actor_rollout_ref.rollout.name != "vllm":
+        raise ValueError("intermediate MC initially supports only the dense vLLM rollout engine")
     if config.critic.get("enable", None) is False:
         raise ValueError("intermediate MC requires critic.enable=true")
-    if config.algorithm.adv_estimator not in {"gae", "GAE"}:
+    if str(config.algorithm.adv_estimator).lower() != "gae":
         raise ValueError("intermediate MC requires algorithm.adv_estimator=gae")
+    if float(config.algorithm.gamma) != 1.0:
+        raise ValueError("intermediate MC raw terminal-reward targets require algorithm.gamma=1")
+    warmup = config.trainer.critic_warmup
+    if isinstance(warmup, bool) or not isinstance(warmup, int) or warmup < 0:
+        raise ValueError("trainer.critic_warmup must be a non-negative integer")
     from verl.trainer.ppo.core_algos import get_policy_loss_fn
 
-    get_policy_loss_fn(feature.actor_loss_mode)
+    get_policy_loss_fn(config.actor_rollout_ref.actor.policy_loss.loss_mode)
     if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
         raise ValueError("intermediate MC does not support actor KL or KL-in-reward")
     rollout_correction = config.algorithm.get("rollout_correction", None)
-    if rollout_correction is not None and (
-        rollout_correction.get("rollout_is", None) is not None
-        or rollout_correction.get("rollout_rs", None) is not None
-        or rollout_correction.get("bypass_mode", False)
-    ):
-        raise ValueError("intermediate MC uses recorded behavior log probabilities and rejects rollout correction")
-    if config.trainer.critic_warmup != 0:
-        raise ValueError("set trainer.critic_warmup=0; intermediate_mc_value owns its critic-update warmup")
-    if float(config.actor_rollout_ref.rollout.temperature) != 1.0:
-        raise ValueError("all intermediate MC solution, critique, and continuation generation requires temperature=1.0")
-    if float(config.actor_rollout_ref.rollout.val_kwargs.temperature) != 1.0:
-        raise ValueError("intermediate MC validation generation requires temperature=1.0")
-    if bool(config.actor_rollout_ref.rollout.multi_turn.enable):
-        raise ValueError("intermediate MC supports only text-only single-turn rollouts")
-    if bool(config.actor_rollout_ref.rollout.get("skip_rollout", False)):
-        raise ValueError("intermediate MC cannot use precomputed or skipped rollouts")
-    if bool(config.actor_rollout_ref.rollout.get("enable_rollout_routing_replay", False)):
-        raise ValueError("intermediate MC does not support rollout routing replay")
-    if bool(config.reward.reward_model.get("launch_reward_fn_async", False)):
-        raise ValueError("intermediate MC reward evaluation is an iteration barrier and cannot launch asynchronously")
-    if bool(config.reward.reward_model.get("enable", False)):
-        raise ValueError(
-            "intermediate MC currently requires a synchronous environment reward function, not a reward model"
+    if rollout_correction is not None and any(
+        (
+            rollout_correction.get("rollout_is", None) is not None,
+            rollout_correction.get("rollout_rs", None) is not None,
+            bool(rollout_correction.get("bypass_mode", False)),
         )
+    ):
+        raise ValueError("intermediate MC rejects rollout correction and uses recorded behavior log probabilities")
+    rollout = config.actor_rollout_ref.rollout
+    if float(rollout.temperature) != 1.0 or float(rollout.val_kwargs.temperature) != 1.0:
+        raise ValueError("all intermediate MC generation, including validation, requires temperature=1.0")
+    if rollout.max_model_len is None or int(rollout.max_model_len) <= 0:
+        raise ValueError("intermediate MC requires an explicit positive actor_rollout_ref.rollout.max_model_len")
+    if str(rollout.get("logprobs_mode", "")) != "processed_logprobs":
+        raise ValueError("intermediate MC requires rollout.logprobs_mode=processed_logprobs")
+    if int(config.data.max_prompt_length) + int(config.data.max_response_length) > int(rollout.max_model_len):
+        raise ValueError("configured prompt plus response lengths exceed rollout.max_model_len")
+    if bool(rollout.multi_turn.enable):
+        raise ValueError("intermediate MC supports only text-only single-turn rollouts")
+    if bool(rollout.get("skip_rollout", False)):
+        raise ValueError("intermediate MC cannot use precomputed or skipped rollouts")
+    if bool(rollout.get("enable_rollout_routing_replay", False)):
+        raise ValueError("intermediate MC does not support rollout routing replay")
+    router_replay = config.actor_rollout_ref.actor.get("router_replay", {})
+    if str(router_replay.get("mode", "none")).lower() not in {"none", "disabled"}:
+        raise ValueError("intermediate MC does not support actor router replay")
+    if bool(config.actor_rollout_ref.actor.get("use_prefix_grouper", False)):
+        raise ValueError("intermediate MC does not yet support actor prefix grouping")
+    if bool(config.reward.reward_model.get("launch_reward_fn_async", False)):
+        raise ValueError("intermediate MC reward evaluation is a blocking iteration barrier")
+    if bool(config.reward.reward_model.get("enable", False)):
+        raise ValueError("intermediate MC requires a synchronous environment reward function, not a reward model")
     reward_loop_keys = ("reward_loop_source", "reward_loop_module_path", "reward_loop_class_name")
     if any(config.reward.reward_model.get(key, None) is not None for key in reward_loop_keys):
         raise ValueError("intermediate MC does not support rollout-time reward loops")
     if config.data.get("use_dataset_responses", False):
         raise ValueError("intermediate MC does not support off-policy dataset responses")
     if OmegaConf.select(config, "algorithm.opsd.enable", default=False):
-        raise ValueError("intermediate MC and OPSD cannot be enabled in the same trainer")
+        raise ValueError("intermediate MC and OPSD cannot be enabled together")
+    cliprange = float(config.critic.cliprange_value)
+    if not math.isfinite(cliprange) or not 0.0 <= cliprange <= feature.max_reward:
+        raise ValueError("critic.cliprange_value must be finite and in [0, max_reward]")
     if actor_tokenizer is not None and critic_tokenizer is not None:
         if _tokenizer_fingerprint(actor_tokenizer) != _tokenizer_fingerprint(critic_tokenizer):
             raise ValueError("actor and critic tokenizers must have identical vocabularies and special-token IDs")
+    if actor_model_path is not None:
+        actor_hf_config = AutoConfig.from_pretrained(
+            actor_model_path,
+            trust_remote_code=config.actor_rollout_ref.model.get("trust_remote_code", False),
+        )
+        if _is_moe_model(actor_hf_config):
+            raise ValueError("intermediate MC initially supports only dense actor models")
+        actor_override = config.actor_rollout_ref.model.get("override_config", {})
+        actor_limit = actor_override.get(
+            "max_position_embeddings",
+            getattr(actor_hf_config, "max_position_embeddings", None),
+        )
+        if isinstance(actor_limit, int) and int(rollout.max_model_len) > actor_limit:
+            raise ValueError("rollout.max_model_len exceeds the actor model's effective context limit")
 
     with open_dict(config):
         config.critic.enable = True
         config.actor_rollout_ref.rollout.calculate_log_probs = True
         config.actor_rollout_ref.actor.use_rollout_log_probs = True
-        config.actor_rollout_ref.actor.policy_loss.loss_mode = feature.actor_loss_mode
 
 
-class IntermediateMCRayPPOTrainer(RayPPOTrainer):
-    """A strict iteration-barrier implementation; no payload overlaps another."""
+@dataclass
+class _Bundle:
+    order: int
+    dataset_index: object
+    rollout_id: str
+    prompt_group_id: str
+    source_row: int
+    prompt_ids: list[int]
+    solution_ids: list[int]
+    solution_log_probs: list[float]
+    terminal_reward: float
+    critique_ids: list[list[int]] = field(default_factory=list)
+    critique_log_probs: list[list[float]] = field(default_factory=list)
+    contexts: list[CriticContext] = field(default_factory=list)
+    critic_values: list[list[float] | None] = field(default_factory=list)
+    critic_variances: list[list[float] | None] = field(default_factory=list)
+    marks: list[int] = field(default_factory=list)
+    continuations: list[ContinuationGeneration] = field(default_factory=list)
+    failed_continuations: list[tuple[int, int]] = field(default_factory=list)
+    per_mark_targets: dict[int, float] = field(default_factory=dict)
+    dense_targets: dict[int, float] = field(default_factory=dict)
 
-    STATE_FILENAME = "intermediate_mc_value_state.json"
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+class IntermediateMCValueController:
+    """Feature controller called from VeRL's unmodified trainer lifecycle."""
+
+    def __init__(self, trainer):
+        self.trainer = trainer
+        self.config = trainer.config
+        self.tokenizer = trainer.tokenizer
         self.feature = omega_conf_to_dataclass(
             self.config.algorithm.intermediate_mc_value,
             dataclass_type=IntermediateMCValueConfig,
         )
         if not self.feature.enable:
-            raise ValueError("IntermediateMCRayPPOTrainer requires intermediate_mc_value.enable=true")
-        if self.processor is not None:
-            raise ValueError("intermediate MC currently supports text-only models and datasets")
-        if self.reward_fn is None:
+            raise ValueError("IntermediateMCValueController requires enable=true")
+        if trainer.processor is not None:
+            raise ValueError("intermediate MC currently supports only text-only models and datasets")
+        if trainer.reward_fn is None:
             raise ValueError("intermediate MC requires a synchronous environment reward function")
-        self.critic_update_count = 0
-        self._critic_delimiter_ids = self._encode_boundary(CRITIQUE_DELIMITER)
-        self._solution_delimiter_ids = self._encode_boundary(SOLUTION_DELIMITER)
-        self._critique_instruction_ids = self._encode_boundary("\n\n" + self.feature.critique_prompt)
-        critic_path = os.path.expanduser(self.config.critic.model.path)
-        critic_hf_config = AutoConfig.from_pretrained(
-            critic_path,
-            trust_remote_code=self.config.critic.model.get("trust_remote_code", False),
+        self.critique_delimiter_ids = self._encode(CRITIQUE_DELIMITER)
+        self.solution_delimiter_ids = self._encode(SOLUTION_DELIMITER)
+        self.critique_instruction_ids = self._encode("\n\n" + INTERMEDIATE_MC_CRITIQUE_PROMPT)
+        self.critic_context_limit = _positive_model_limit(
+            os.path.expanduser(self.config.critic.model.path),
+            self.config.critic,
+            role="critic",
         )
-        self._critic_context_limit = int(getattr(critic_hf_config, "max_position_embeddings", 0) or 0)
-        if self._critic_context_limit <= 0:
-            raise ValueError("critic model must declare a positive max_position_embeddings")
-        self._tokenizer_fingerprint = _tokenizer_fingerprint(self.tokenizer)
-        self._audit_path = None
+        self.audit_path = None
         if self.feature.audit_output_dir:
             audit_dir = os.path.abspath(os.path.expanduser(self.feature.audit_output_dir))
             os.makedirs(audit_dir, exist_ok=True)
-            self._audit_path = os.path.join(audit_dir, "intermediate_mc_value.jsonl")
+            self.audit_path = os.path.join(audit_dir, "intermediate_mc_value.jsonl")
 
-    def _encode_boundary(self, text: str) -> list[int]:
-        result = self.tokenizer.encode(text, add_special_tokens=False)
+    def _encode(self, text: str) -> list[int]:
+        result = [int(token) for token in self.tokenizer.encode(text, add_special_tokens=False)]
         if not result:
-            raise ValueError(f"boundary must tokenize to a non-empty sequence: {text!r}")
-        return [int(token) for token in result]
-
-    def _pad_token_id(self) -> int:
-        pad_token_id = self.tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = self.tokenizer.eos_token_id
-        if pad_token_id is None:
-            raise ValueError("intermediate MC requires the tokenizer to define a pad or EOS token")
-        return int(pad_token_id)
-
-    def _contract(self) -> dict[str, object]:
-        feature_contract = asdict(self.feature)
-        feature_contract.pop("_target_", None)
-        feature_contract.pop("enable", None)
-        feature_contract.pop("audit_output_dir", None)
-        return {
-            "version": 1,
-            "feature": feature_contract,
-            "gamma": float(self.config.algorithm.gamma),
-            "gae_lambda": float(self.config.algorithm.lam),
-            "tokenizer_fingerprint": self._tokenizer_fingerprint,
-        }
-
-    def _save_additional_trainer_state(self, checkpoint_folder: str) -> None:
-        state = {"critic_update_count": self.critic_update_count, "contract": self._contract()}
-        state_path = os.path.join(checkpoint_folder, self.STATE_FILENAME)
-        temporary_path = f"{state_path}.tmp"
-        with open(temporary_path, "w", encoding="utf-8") as handle:
-            json.dump(state, handle, sort_keys=True, indent=2)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary_path, state_path)
-
-    def _read_feature_state(self, checkpoint_folder: str) -> dict[str, object]:
-        state_path = os.path.join(checkpoint_folder, self.STATE_FILENAME)
-        if not os.path.exists(state_path):
-            raise FileNotFoundError(f"intermediate MC checkpoint is missing {state_path}")
-        with open(state_path, encoding="utf-8") as handle:
-            state = json.load(handle)
-        if not isinstance(state, dict):
-            raise ValueError(f"invalid intermediate MC checkpoint state in {state_path}")
-        return state
-
-    def _validate_additional_trainer_state(self, checkpoint_folder: str) -> None:
-        state = self._read_feature_state(checkpoint_folder)
-        if state.get("contract") != self._contract():
-            raise RuntimeError(
-                "intermediate MC checkpoint contract does not match the current recipe/tokenizer/loss configuration"
-            )
-        count = state.get("critic_update_count")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            raise ValueError("checkpoint critic_update_count must be a non-negative integer")
-
-    def _load_additional_trainer_state(self, checkpoint_folder: str) -> None:
-        state = self._read_feature_state(checkpoint_folder)
-        self.critic_update_count = int(state["critic_update_count"])
+            raise ValueError(f"intermediate MC boundary tokenized empty: {text!r}")
+        return result
 
     def _audit(self, event: str, **payload: object) -> None:
-        if self._audit_path is None:
+        if self.audit_path is None:
             return
-        record = {"event": event, "global_step": self.global_steps, **payload}
-        with open(self._audit_path, "a", encoding="utf-8") as handle:
+        record = {"event": event, "global_step": self.trainer.global_steps, **payload}
+        with open(self.audit_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+
+    def _pad_token_id(self) -> int:
+        token_id = self.tokenizer.pad_token_id
+        if token_id is None:
+            token_id = self.tokenizer.eos_token_id
+        if token_id is None:
+            raise ValueError("intermediate MC requires a tokenizer pad or EOS token")
+        return int(token_id)
+
+    @staticmethod
+    def _object_array(values: list[Any]) -> np.ndarray:
+        result = np.empty(len(values), dtype=object)
+        result[:] = values
+        return result
 
     @staticmethod
     def _valid_prompt_ids(batch: DataProto, row: int) -> list[int]:
         prompt_width = batch.batch["prompts"].shape[1]
-        prompt_mask = batch.batch["attention_mask"][row, :prompt_width].bool()
-        return [int(token) for token in batch.batch["prompts"][row][prompt_mask].tolist()]
+        mask = batch.batch["attention_mask"][row, :prompt_width].bool()
+        result = [int(token) for token in batch.batch["prompts"][row][mask].tolist()]
+        if not result:
+            raise ValueError("intermediate MC prompt must contain at least one token")
+        return result
 
     @staticmethod
-    def _valid_response_ids(batch: DataProto, row: int, cap: int | None = None) -> list[int]:
+    def _valid_solution(batch: DataProto, row: int) -> tuple[list[int], list[float]]:
         mask = batch.batch["response_mask"][row].bool()
-        valid_count = int(mask.sum().item())
-        if valid_count == 0 or not torch.all(mask[:valid_count]) or torch.any(mask[valid_count:]):
+        length = int(mask.sum().item())
+        if length <= 0 or not torch.all(mask[:length]) or torch.any(mask[length:]):
             raise ValueError("intermediate MC requires a non-empty contiguous single-turn response mask")
-        tokens = [int(token) for token in batch.batch["responses"][row][mask].tolist()]
-        return tokens if cap is None else tokens[:cap]
+        if "rollout_log_probs" not in batch.batch:
+            raise RuntimeError("intermediate MC requires sampling-time processed rollout_log_probs")
+        tokens = [int(token) for token in batch.batch["responses"][row, :length].tolist()]
+        log_probs = [float(value) for value in batch.batch["rollout_log_probs"][row, :length].tolist()]
+        if len(log_probs) != len(tokens) or not all(math.isfinite(value) for value in log_probs):
+            raise RuntimeError("solution behavior log probabilities are missing or non-finite")
+        return tokens, log_probs
 
-    def _secondary_request_batch(
+    def prepare_generation_batch(self, batch: DataProto) -> None:
+        """Select the composite agent loop and attach compact per-rollout controls."""
+
+        group_values = batch.non_tensor_batch.get("prompt_group_id", batch.non_tensor_batch.get("uid"))
+        if group_values is None:
+            group_values = np.arange(len(batch), dtype=object)
+        counts: dict[str, int] = {}
+        rollout_ids: list[str] = []
+        for value in group_values:
+            key = str(value)
+            index = counts.get(key, 0)
+            counts[key] = index + 1
+            rollout_ids.append(f"{key}:{index}")
+        warmup = self.trainer.global_steps <= int(self.config.trainer.critic_warmup)
+        batch.non_tensor_batch["agent_name"] = np.array([INTERMEDIATE_MC_AGENT_NAME] * len(batch), dtype=object)
+        batch.non_tensor_batch["intermediate_mc_stage"] = np.array(["solution"] * len(batch), dtype=object)
+        batch.non_tensor_batch["intermediate_mc_rollout_id"] = np.array(rollout_ids, dtype=object)
+        batch.non_tensor_batch["intermediate_mc_warmup"] = np.array([warmup] * len(batch), dtype=object)
+        batch.non_tensor_batch["intermediate_mc_global_step"] = np.array(
+            [self.trainer.global_steps] * len(batch), dtype=object
+        )
+        batch.non_tensor_batch["intermediate_mc_critic_context_limit"] = np.array(
+            [self.critic_context_limit] * len(batch), dtype=object
+        )
+
+    @staticmethod
+    def _coerce_critique(value: Any) -> CritiqueGeneration:
+        if isinstance(value, CritiqueGeneration):
+            return value
+        if isinstance(value, dict):
+            return CritiqueGeneration(tuple(value["token_ids"]), tuple(value["log_probs"]))
+        raise TypeError(f"invalid critique child record {type(value)!r}")
+
+    @classmethod
+    def _coerce_record(cls, value: Any) -> IntermediateMCGenerationRecord:
+        if isinstance(value, IntermediateMCGenerationRecord):
+            return value
+        if not isinstance(value, dict):
+            raise TypeError(f"invalid intermediate MC child record {type(value)!r}")
+        continuations = tuple(
+            item
+            if isinstance(item, ContinuationGeneration)
+            else ContinuationGeneration(int(item["mark"]), int(item["sample_index"]), tuple(item["token_ids"]))
+            for item in value["continuations"]
+        )
+        return IntermediateMCGenerationRecord(
+            rollout_id=str(value["rollout_id"]),
+            critiques=tuple(cls._coerce_critique(item) for item in value["critiques"]),
+            selected_marks=tuple(int(mark) for mark in value["selected_marks"]),
+            continuations=continuations,
+            failed_continuations=tuple(tuple(map(int, item)) for item in value["failed_continuations"]),
+            selector_diagnostics=tuple(dict(item) for item in value["selector_diagnostics"]),
+        )
+
+    def extract_generation_records(self, output: DataProto) -> dict[str, IntermediateMCGenerationRecord]:
+        raw = output.non_tensor_batch.pop(INTERMEDIATE_MC_CHILD_FIELD, None)
+        if raw is None or len(raw) != len(output):
+            raise RuntimeError("composite rollout did not return one intermediate MC child record per solution")
+        records: dict[str, IntermediateMCGenerationRecord] = {}
+        for value in raw:
+            record = self._coerce_record(value)
+            if record.rollout_id in records:
+                raise RuntimeError(f"duplicate intermediate MC rollout id {record.rollout_id!r}")
+            records[record.rollout_id] = record
+        return records
+
+    def _build_bundles(
         self,
         source: DataProto,
-        source_rows: list[int],
-        prompt_overrides: list[list[int]],
-    ) -> DataProto:
-        if len(source_rows) != len(prompt_overrides) or not source_rows:
-            raise ValueError("secondary request rows and prompt overrides must be equal and non-empty")
-        non_tensors = {
-            key: np.take(values, source_rows, axis=0).copy() for key, values in source.non_tensor_batch.items()
-        }
-        overrides = np.empty(len(prompt_overrides), dtype=object)
-        overrides[:] = [list(tokens) for tokens in prompt_overrides]
-        non_tensors["prompt_ids_override"] = overrides
-        non_tensors["agent_name"] = np.array(["single_turn_agent"] * len(overrides), dtype=object)
-        request = DataProto.from_dict(non_tensors=non_tensors, meta_info={"global_steps": self.global_steps})
-        return request
-
-    def _generate_rows_with_isolation(
-        self,
-        request: DataProto,
-        *,
-        allow_all_failures: bool = False,
-    ) -> list[DataProto | None]:
-        try:
-            output = self.async_rollout_manager.generate_sequences(request)
-            if len(output) != len(request):
-                raise RuntimeError(f"secondary generation returned {len(output)} rows for a request of {len(request)}")
-            return [output[index : index + 1] for index in range(len(output))]
-        except Exception as batch_error:
-            self._audit("secondary_generation_batch_failure", error=repr(batch_error), rows=len(request))
-            rows: list[DataProto | None] = []
-            for index in range(len(request)):
-                try:
-                    output = self.async_rollout_manager.generate_sequences(request[index : index + 1])
-                    if len(output) != 1:
-                        raise RuntimeError(f"isolated secondary generation returned {len(output)} rows")
-                    rows.append(output[0:1])
-                except Exception as row_error:
-                    self._audit("secondary_generation_row_failure", row=index, error=repr(row_error))
-                    rows.append(None)
-            if all(row is None for row in rows) and not allow_all_failures:
-                raise RuntimeError("all secondary generation rows failed during isolated retry") from batch_error
-            return rows
-
-    def _truncate_generated_row(self, row: DataProto | None, cap: int) -> DataProto | None:
-        if row is None or cap <= 0:
-            return None
-        if "rollout_log_probs" not in row.batch:
-            raise RuntimeError("intermediate MC requires sampling-time rollout_log_probs")
-        if not torch.any(row.batch["response_mask"][0].bool()):
-            return None
-        valid_tokens = self._valid_response_ids(row, 0, cap=cap)
-        response_width = row.batch["responses"].shape[1]
-        prompt_width = row.batch["prompts"].shape[1]
-        keep = min(len(valid_tokens), cap, response_width)
-        pad_token_id = self._pad_token_id()
-        row.batch["responses"][0, keep:] = pad_token_id
-        row.batch["response_mask"][0, keep:] = 0
-        row.batch["rollout_log_probs"][0, keep:] = 0.0
-        response_attention = torch.zeros(response_width, dtype=row.batch["attention_mask"].dtype)
-        response_attention[:keep] = 1
-        row.batch["attention_mask"][0, prompt_width:] = response_attention
-        row.batch["input_ids"] = torch.cat([row.batch["prompts"], row.batch["responses"]], dim=1)
-        row.batch["position_ids"] = compute_position_id_with_mask(row.batch["attention_mask"])
-        return row
-
-    def _solution_rewards(self, batch: DataProto) -> list[float]:
-        reward_tensor, _ = compute_reward(batch, self.reward_fn, actor_wg=self.actor_rollout_wg)
-        raw = reward_tensor.sum(dim=-1).detach().cpu().tolist()
-        if len(raw) != len(batch):
-            raise RuntimeError(f"reward function returned {len(raw)} rows for a solution batch of {len(batch)}")
-        return [validate_reward(value, self.feature.max_reward) for value in raw]
-
-    def _make_reward_batch(
-        self,
-        source: DataProto,
-        source_rows: list[int],
-        prompt_ids: list[list[int]],
-        response_ids: list[list[int]],
-    ) -> DataProto:
-        prompt_width = int(self.config.actor_rollout_ref.rollout.prompt_length)
-        response_width = int(self.config.actor_rollout_ref.rollout.response_length)
-        if any(len(tokens) > prompt_width for tokens in prompt_ids):
-            raise ValueError("continuation reward prompt exceeds rollout.prompt_length")
-        if any(not tokens or len(tokens) > response_width for tokens in response_ids):
-            raise ValueError("full continuation response must fit rollout.response_length")
-        batch_size = len(source_rows)
-        pad_id = self._pad_token_id()
-        prompts = torch.full((batch_size, prompt_width), pad_id, dtype=torch.long)
-        responses = torch.full((batch_size, response_width), pad_id, dtype=torch.long)
-        prompt_mask = torch.zeros((batch_size, prompt_width), dtype=torch.long)
-        response_mask = torch.zeros((batch_size, response_width), dtype=torch.long)
-        for row, (prompt, response) in enumerate(zip(prompt_ids, response_ids, strict=True)):
-            prompts[row, -len(prompt) :] = torch.tensor(prompt, dtype=torch.long)
-            prompt_mask[row, -len(prompt) :] = 1
-            responses[row, : len(response)] = torch.tensor(response, dtype=torch.long)
-            response_mask[row, : len(response)] = 1
-        attention_mask = torch.cat([prompt_mask, response_mask], dim=1)
-        tensors = {
-            "prompts": prompts,
-            "responses": responses,
-            "response_mask": response_mask,
-            "input_ids": torch.cat([prompts, responses], dim=1),
-            "attention_mask": attention_mask,
-            "position_ids": compute_position_id_with_mask(attention_mask),
-        }
-        non_tensors = {
-            key: np.take(values, source_rows, axis=0).copy() for key, values in source.non_tensor_batch.items()
-        }
-        return DataProto.from_dict(tensors=tensors, non_tensors=non_tensors)
-
-    def _continuation_rewards_with_isolation(
-        self,
-        reward_batch: DataProto,
-    ) -> list[float | None]:
-        try:
-            reward_tensor, _ = compute_reward(reward_batch, self.reward_fn, actor_wg=self.actor_rollout_wg)
-            raw = reward_tensor.sum(dim=-1).detach().cpu().tolist()
-        except Exception as batch_error:
-            self._audit("continuation_reward_batch_failure", error=repr(batch_error), rows=len(reward_batch))
-            results: list[float | None] = []
-            for index in range(len(reward_batch)):
-                try:
-                    reward_tensor, _ = compute_reward(
-                        reward_batch[index : index + 1],
-                        self.reward_fn,
-                        actor_wg=self.actor_rollout_wg,
-                    )
-                except Exception as row_error:
-                    self._audit("continuation_reward_row_failure", row=index, error=repr(row_error))
-                    results.append(None)
-                else:
-                    results.append(validate_reward(reward_tensor.sum().item(), self.feature.max_reward))
-            return results
-        if len(raw) != len(reward_batch):
-            raise RuntimeError(
-                f"continuation reward function returned {len(raw)} rows for a batch of {len(reward_batch)}"
+        records: dict[str, IntermediateMCGenerationRecord],
+        terminal_rewards: list[float],
+    ) -> list[_Bundle]:
+        if len(source) != len(terminal_rewards):
+            raise RuntimeError("solution reward count does not match rollout count")
+        dataset_values = source.non_tensor_batch.get("index", np.arange(len(source), dtype=object))
+        group_values = source.non_tensor_batch.get("prompt_group_id", np.arange(len(source), dtype=object))
+        rollout_values = source.non_tensor_batch.get("intermediate_mc_rollout_id")
+        if rollout_values is None:
+            raise RuntimeError("rollout ids were lost before intermediate MC construction")
+        bundles: list[_Bundle] = []
+        for row, reward in enumerate(terminal_rewards):
+            rollout_id = str(rollout_values[row])
+            record = records.get(rollout_id)
+            if record is None:
+                raise RuntimeError(f"missing composite child record for rollout {rollout_id!r}")
+            if len(record.critiques) != self.feature.num_critiques:
+                raise RuntimeError(
+                    f"rollout {rollout_id!r} has {len(record.critiques)} critiques; "
+                    f"expected {self.feature.num_critiques}"
+                )
+            prompt_ids = self._valid_prompt_ids(source, row)
+            solution_ids, solution_log_probs = self._valid_solution(source, row)
+            critique_ids = [[int(token) for token in item.token_ids] for item in record.critiques]
+            critique_log_probs = [[float(value) for value in item.log_probs] for item in record.critiques]
+            if any(
+                not tokens or len(tokens) != len(log_probs) or not all(math.isfinite(value) for value in log_probs)
+                for tokens, log_probs in zip(critique_ids, critique_log_probs, strict=True)
+            ):
+                raise RuntimeError(f"rollout {rollout_id!r} contains an invalid critique child")
+            contexts = [
+                build_critic_context(
+                    prompt_ids,
+                    tokens,
+                    solution_ids,
+                    critique_delimiter_ids=self.critique_delimiter_ids,
+                    solution_delimiter_ids=self.solution_delimiter_ids,
+                )
+                for tokens in critique_ids
+            ]
+            if any(len(context.token_ids) > self.critic_context_limit for context in contexts):
+                raise ValueError("conditioned critic sequence exceeds its effective context limit")
+            marks = sorted(int(mark) for mark in record.selected_marks)
+            if self.feature.mark_selector == "variance" and marks:
+                raise RuntimeError("variance marks must be selected only after critic inference")
+            bundle = _Bundle(
+                order=row,
+                dataset_index=dataset_values[row],
+                rollout_id=rollout_id,
+                prompt_group_id=str(group_values[row]),
+                source_row=row,
+                prompt_ids=prompt_ids,
+                solution_ids=solution_ids,
+                solution_log_probs=solution_log_probs,
+                terminal_reward=validate_reward(reward, self.feature.max_reward),
+                critique_ids=critique_ids,
+                critique_log_probs=critique_log_probs,
+                contexts=contexts,
+                critic_values=[None] * self.feature.num_critiques,
+                critic_variances=[None] * self.feature.num_critiques,
+                marks=marks,
+                continuations=list(record.continuations),
+                failed_continuations=list(record.failed_continuations),
             )
-        return [validate_reward(value, self.feature.max_reward) for value in raw]
+            for diagnostic in record.selector_diagnostics:
+                self._audit("mark_selection", rollout_id=rollout_id, **diagnostic)
+            bundles.append(bundle)
+        if set(records) != {bundle.rollout_id for bundle in bundles}:
+            raise RuntimeError("composite rollout returned extra or missing child records")
+        return bundles
 
-    def _make_critic_batch(self, bundles: list[_Bundle]) -> tuple[DataProto, list[tuple[int, int]]]:
+    def _make_critic_batch(self, bundles: list[_Bundle]) -> DataProto:
         contexts = [context for bundle in bundles for context in bundle.contexts]
-        mapping = [
-            (bundle_index, critique_index)
-            for bundle_index, bundle in enumerate(bundles)
-            for critique_index in range(len(bundle.contexts))
-        ]
         max_sequence = max(len(context.token_ids) for context in contexts)
         max_positions = max(len(context.value_positions) for context in contexts)
         pad_id = self._pad_token_id()
@@ -417,13 +449,20 @@ class IntermediateMCRayPPOTrainer(RayPPOTrainer):
         attention_mask = torch.zeros((len(contexts), max_sequence), dtype=torch.long)
         positions = torch.zeros((len(contexts), max_positions), dtype=torch.long)
         position_mask = torch.zeros((len(contexts), max_positions), dtype=torch.float32)
-        for row, context in enumerate(contexts):
-            length = len(context.token_ids)
-            value_count = len(context.value_positions)
-            input_ids[row, :length] = torch.tensor(context.token_ids, dtype=torch.long)
-            attention_mask[row, :length] = 1
-            positions[row, :value_count] = torch.tensor(context.value_positions, dtype=torch.long)
-            position_mask[row, :value_count] = 1.0
+        bundle_indices: list[int] = []
+        critique_indices: list[int] = []
+        row = 0
+        for bundle_index, bundle in enumerate(bundles):
+            for critique_index, context in enumerate(bundle.contexts):
+                length = len(context.token_ids)
+                value_count = len(context.value_positions)
+                input_ids[row, :length] = torch.tensor(context.token_ids, dtype=torch.long)
+                attention_mask[row, :length] = 1
+                positions[row, :value_count] = torch.tensor(context.value_positions, dtype=torch.long)
+                position_mask[row, :value_count] = 1.0
+                bundle_indices.append(bundle_index)
+                critique_indices.append(critique_index)
+                row += 1
         tensors = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -434,7 +473,13 @@ class IntermediateMCRayPPOTrainer(RayPPOTrainer):
             "critic_target_mask": torch.zeros_like(position_mask),
             "critic_old_values": torch.zeros_like(position_mask),
         }
-        batch = DataProto.from_dict(tensors=tensors)
+        batch = DataProto.from_dict(
+            tensors=tensors,
+            non_tensors={
+                "intermediate_mc_bundle_index": np.array(bundle_indices, dtype=np.int64),
+                "intermediate_mc_critique_index": np.array(critique_indices, dtype=np.int64),
+            },
+        )
         batch.meta_info.update(
             {
                 "global_token_num": attention_mask.sum(dim=-1).tolist(),
@@ -443,81 +488,64 @@ class IntermediateMCRayPPOTrainer(RayPPOTrainer):
                 "use_dynamic_bsz": self.config.critic.use_dynamic_bsz,
             }
         )
-        return batch, mapping
+        return batch
 
-    def _score_contexts(
-        self,
-        critic_batch: DataProto,
-        mapping: list[tuple[int, int]],
-        bundles: list[_Bundle],
-    ) -> None:
-        inference_batch, pad_size = pad_dataproto_to_divisor(critic_batch, self.critic_wg.world_size)
-        output = self.critic_wg.compute_values(inference_batch)
+    def _global_minibatch_size(self, role: str) -> int:
+        rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+        if role == "actor":
+            return int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * rollout_n
+        return int(self.config.critic.ppo_mini_batch_size) * rollout_n
+
+    def _validate_optimizer_batch(self, batch: DataProto, *, role: str, worker_group) -> None:
+        dp_size = self.trainer._get_dp_size(worker_group, role)
+        global_minibatch = self._global_minibatch_size(role)
+        if len(batch) % dp_size != 0:
+            raise ValueError(
+                f"intermediate MC {role} rows ({len(batch)}) must be divisible by {role} DP size ({dp_size}); "
+                "optimizer padding is forbidden"
+            )
+        if len(batch) % global_minibatch != 0:
+            raise ValueError(
+                f"intermediate MC {role} rows ({len(batch)}) must be divisible by global PPO minibatch "
+                f"size ({global_minibatch}); optimizer padding is forbidden"
+            )
+
+    def _score_contexts(self, critic_batch: DataProto, bundles: list[_Bundle]) -> None:
+        dp_size = self.trainer._get_dp_size(self.trainer.critic_wg, "critic")
+        inference_batch, pad_size = pad_dataproto_to_divisor(critic_batch, dp_size)
+        output = self.trainer._compute_values(inference_batch)
+        if pad_size:
+            output = unpad_dataproto(output, pad_size=pad_size)
         values = output.batch["values"].detach().cpu()
         variances = output.batch.get("variances")
         if variances is not None:
             variances = variances.detach().cpu()
-        if pad_size:
-            values = values[:-pad_size]
-            if variances is not None:
-                variances = variances[:-pad_size]
-        expected_shape = critic_batch.batch["critic_position_mask"].shape
-        if tuple(values.shape) != tuple(expected_shape) or not torch.isfinite(values).all():
+        expected = critic_batch.batch["critic_position_mask"].shape
+        if tuple(values.shape) != tuple(expected) or not torch.isfinite(values).all():
             raise RuntimeError(
-                f"critic returned invalid values: expected finite {tuple(expected_shape)}, got {tuple(values.shape)}"
+                f"critic returned invalid values: expected finite {tuple(expected)}, got {tuple(values.shape)}"
             )
-        if self.feature.recipe == "beta_variance":
-            if variances is None or tuple(variances.shape) != tuple(expected_shape):
-                raise RuntimeError("beta_variance critic must return one variance for every requested value")
+        if self.feature.critic_head == "beta":
+            if variances is None or tuple(variances.shape) != tuple(expected):
+                raise RuntimeError("Beta critic must return one variance for every requested value")
             if not torch.isfinite(variances).all() or torch.any(variances < 0):
-                raise RuntimeError("beta_variance critic returned invalid variances")
+                raise RuntimeError("Beta critic returned invalid variances")
         elif variances is not None:
-            raise RuntimeError("scalar_random critic unexpectedly returned variances")
+            raise RuntimeError("scalar critic unexpectedly returned variances")
         critic_batch.batch["critic_old_values"] = values.clone()
-        for row, (bundle_index, critique_index) in enumerate(mapping):
-            position_count = len(bundles[bundle_index].contexts[critique_index].value_positions)
-            bundles[bundle_index].critic_values.append(values[row, :position_count].tolist())
+        bundle_indices = critic_batch.non_tensor_batch["intermediate_mc_bundle_index"]
+        critique_indices = critic_batch.non_tensor_batch["intermediate_mc_critique_index"]
+        for row, (bundle_index, critique_index) in enumerate(zip(bundle_indices, critique_indices, strict=True)):
+            bundle = bundles[int(bundle_index)]
+            critique_index = int(critique_index)
+            count = len(bundle.contexts[critique_index].value_positions)
+            bundle.critic_values[critique_index] = values[row, :count].tolist()
             if variances is not None:
-                bundles[bundle_index].critic_variances.append(variances[row, :position_count].tolist())
+                bundle.critic_variances[critique_index] = variances[row, :count].tolist()
+        if any(any(values is None for values in bundle.critic_values) for bundle in bundles):
+            raise RuntimeError("critic scoring did not cover every critique-conditioned context")
 
-    def _set_warmup_targets(
-        self,
-        critic_batch: DataProto,
-        mapping: list[tuple[int, int]],
-        bundles: list[_Bundle],
-    ) -> None:
-        for row, (bundle_index, _) in enumerate(mapping):
-            terminal = len(bundles[bundle_index].solution_ids)
-            critic_batch.batch["critic_targets"][row, terminal] = bundles[bundle_index].terminal_reward
-            critic_batch.batch["critic_target_mask"][row, terminal] = 1.0
-
-    def _select_marks(self, bundles: list[_Bundle]) -> None:
-        if self.feature.mark_selector == "random":
-            for bundle in bundles:
-                rng = stable_rng(
-                    self.feature.selection_seed,
-                    self.global_steps,
-                    bundle.dataset_index,
-                    bundle.order,
-                )
-                bundle.marks = select_random_marks(
-                    len(bundle.solution_ids),
-                    k=self.feature.max_marks,
-                    min_gap=self.feature.min_mark_gap,
-                    start_fraction=self.feature.mark_start_fraction,
-                    end_fraction=self.feature.mark_end_fraction,
-                    rng=rng,
-                )
-                for token in bundle.marks:
-                    self._audit(
-                        "mark_selection",
-                        rollout_id=bundle.rollout_id,
-                        token=token,
-                        reason="random",
-                        scope=bundle.rollout_id,
-                    )
-            return
-
+    def _select_variance_marks(self, bundles: list[_Bundle]) -> None:
         scopes: dict[str, list[_Bundle]] = {}
         for bundle in bundles:
             if self.feature.variance_scope == "rollout":
@@ -531,9 +559,12 @@ class IntermediateMCRayPPOTrainer(RayPPOTrainer):
         for scope, scope_bundles in scopes.items():
             candidates: list[VarianceCandidate] = []
             for bundle in scope_bundles:
-                if len(bundle.critic_variances) != self.feature.num_critiques:
-                    raise RuntimeError("beta_variance selection requires one variance stream per critique")
-                averaged = [sum(values) / len(values) for values in zip(*bundle.critic_variances, strict=True)]
+                if any(values is None for values in bundle.critic_variances):
+                    raise RuntimeError("variance selection requires every critique variance stream")
+                averaged = [
+                    sum(values) / len(values)
+                    for values in zip(*(value for value in bundle.critic_variances if value is not None), strict=True)
+                ]
                 low, high = candidate_bounds(
                     len(bundle.solution_ids),
                     self.feature.mark_start_fraction,
@@ -541,19 +572,20 @@ class IntermediateMCRayPPOTrainer(RayPPOTrainer):
                 )
                 for token in range(low, high + 1):
                     candidates.append(VarianceCandidate(bundle.order, bundle.rollout_id, token, averaged[token]))
-            rng = stable_rng(self.feature.selection_seed, self.global_steps, scope)
+            rng = stable_rng(self.feature.selection_seed, self.trainer.global_steps, scope)
             selections = select_variance_marks(
                 candidates,
-                k=self.feature.max_marks,
+                k=self.feature.resolved_max_marks,
                 min_gap=self.feature.min_mark_gap,
                 random_probability=self.feature.variance_random_probability,
                 rng=rng,
             )
             for selection in selections:
-                by_rollout[selection.candidate.rollout_id].marks.append(selection.candidate.token)
+                bundle = by_rollout[selection.candidate.rollout_id]
+                bundle.marks.append(selection.candidate.token)
                 self._audit(
                     "mark_selection",
-                    rollout_id=selection.candidate.rollout_id,
+                    rollout_id=bundle.rollout_id,
                     token=selection.candidate.token,
                     variance=selection.candidate.variance,
                     reason=selection.reason,
@@ -563,93 +595,160 @@ class IntermediateMCRayPPOTrainer(RayPPOTrainer):
         for bundle in bundles:
             bundle.marks.sort()
 
-    def _run_continuations(self, source: DataProto, bundles: list[_Bundle]) -> None:
-        requests: list[tuple[int, int, int]] = []
-        source_rows: list[int] = []
-        prompt_overrides: list[list[int]] = []
-        for bundle_index, bundle in enumerate(bundles):
-            for mark in bundle.marks:
-                for sample_index in range(self.feature.continuations_per_mark):
-                    requests.append((bundle_index, mark, sample_index))
-                    source_rows.append(bundle.source_row)
-                    prompt_overrides.append([*bundle.prompt_ids, *bundle.solution_ids[:mark]])
-        if not requests:
-            self.checkpoint_manager.sleep_replicas()
-            return
-        try:
-            request_batch = self._secondary_request_batch(source, source_rows, prompt_overrides)
-            generated_rows = self._generate_rows_with_isolation(request_batch, allow_all_failures=True)
-        finally:
-            self.checkpoint_manager.sleep_replicas()
-
-        reward_source_rows: list[int] = []
-        reward_prompts: list[list[int]] = []
-        reward_responses: list[list[int]] = []
-        successful_requests: list[tuple[int, int, int]] = []
-        for request, generated in zip(requests, generated_rows, strict=True):
-            bundle_index, mark, sample_index = request
-            remaining = int(self.config.actor_rollout_ref.rollout.response_length) - mark
-            generated = self._truncate_generated_row(generated, remaining)
-            if generated is None:
-                self._audit(
-                    "continuation_failure",
-                    rollout_id=bundles[bundle_index].rollout_id,
-                    mark=mark,
-                    sample=sample_index,
-                    reason="generation",
-                )
-                continue
-            suffix = self._valid_response_ids(generated, 0, cap=remaining)
-            full_response = [*bundles[bundle_index].solution_ids[:mark], *suffix]
-            reward_source_rows.append(bundles[bundle_index].source_row)
-            reward_prompts.append(bundles[bundle_index].prompt_ids)
-            reward_responses.append(full_response)
-            successful_requests.append(request)
-        if not successful_requests:
-            return
-        reward_batch = self._make_reward_batch(
-            source,
-            reward_source_rows,
-            reward_prompts,
-            reward_responses,
+    def _make_variance_request(self, source: DataProto, bundles: list[_Bundle]) -> DataProto | None:
+        selected = [bundle for bundle in bundles if bundle.marks]
+        if not selected:
+            return None
+        rows = [bundle.source_row for bundle in selected]
+        non_tensors = {
+            key: np.take(values, rows, axis=0).copy()
+            for key, values in source.non_tensor_batch.items()
+            if key != INTERMEDIATE_MC_CHILD_FIELD
+        }
+        non_tensors["agent_name"] = np.array([INTERMEDIATE_MC_AGENT_NAME] * len(selected), dtype=object)
+        non_tensors["intermediate_mc_stage"] = np.array(["continuations"] * len(selected), dtype=object)
+        non_tensors["intermediate_mc_rollout_id"] = np.array([bundle.rollout_id for bundle in selected], dtype=object)
+        non_tensors["intermediate_mc_critic_context_limit"] = np.array(
+            [self.critic_context_limit] * len(selected), dtype=object
         )
-        rewards = self._continuation_rewards_with_isolation(reward_batch)
-        by_bundle_mark: dict[tuple[int, int], list[float]] = {}
-        for request, reward in zip(successful_requests, rewards, strict=True):
-            bundle_index, mark, sample_index = request
-            if reward is None:
+        non_tensors["intermediate_mc_parent_prompt_ids"] = self._object_array(
+            [bundle.prompt_ids for bundle in selected]
+        )
+        non_tensors["intermediate_mc_parent_solution_ids"] = self._object_array(
+            [bundle.solution_ids for bundle in selected]
+        )
+        non_tensors["intermediate_mc_parent_solution_log_probs"] = self._object_array(
+            [bundle.solution_log_probs for bundle in selected]
+        )
+        non_tensors["intermediate_mc_selected_marks"] = self._object_array([bundle.marks for bundle in selected])
+        return DataProto.from_dict(
+            non_tensors=non_tensors,
+            meta_info={"global_steps": self.trainer.global_steps},
+        )
+
+    def _generate_variance_continuations(
+        self,
+        source: DataProto,
+        bundles: list[_Bundle],
+        timing_raw: dict[str, float],
+    ) -> None:
+        request = self._make_variance_request(source, bundles)
+        if request is None:
+            return
+        self.trainer.checkpoint_manager.wake_up_replicas()
+        try:
+            with marked_timer("intermediate_mc_continuations", timing_raw, color="red"):
+                output = self.trainer.async_rollout_manager.generate_sequences(request)
+                records = self.extract_generation_records(output)
+        finally:
+            self.trainer.checkpoint_manager.sleep_replicas()
+        expected = {bundle.rollout_id for bundle in bundles if bundle.marks}
+        if set(records) != expected:
+            raise RuntimeError("variance continuation stage returned an unexpected rollout-id set")
+        for bundle in bundles:
+            if not bundle.marks:
+                continue
+            record = records[bundle.rollout_id]
+            if record.critiques:
+                raise RuntimeError("variance continuation stage unexpectedly regenerated critiques")
+            if list(record.selected_marks) != bundle.marks:
+                raise RuntimeError("variance continuation stage changed the selected marks")
+            bundle.continuations = list(record.continuations)
+            bundle.failed_continuations = list(record.failed_continuations)
+
+    def _make_reward_batch(
+        self,
+        source: DataProto,
+        rows: list[int],
+        prompts: list[list[int]],
+        responses: list[list[int]],
+    ) -> DataProto:
+        prompt_width = int(self.config.actor_rollout_ref.rollout.prompt_length)
+        response_width = int(self.config.actor_rollout_ref.rollout.response_length)
+        if any(len(tokens) > prompt_width for tokens in prompts):
+            raise ValueError("continuation reward prompt exceeds rollout.prompt_length")
+        if any(not tokens or len(tokens) > response_width for tokens in responses):
+            raise ValueError("completed continuation must fit rollout.response_length")
+        pad_id = self._pad_token_id()
+        prompt_tensor = torch.full((len(rows), prompt_width), pad_id, dtype=torch.long)
+        response_tensor = torch.full((len(rows), response_width), pad_id, dtype=torch.long)
+        prompt_mask = torch.zeros((len(rows), prompt_width), dtype=torch.long)
+        response_mask = torch.zeros((len(rows), response_width), dtype=torch.long)
+        for row, (prompt, response) in enumerate(zip(prompts, responses, strict=True)):
+            prompt_tensor[row, -len(prompt) :] = torch.tensor(prompt, dtype=torch.long)
+            prompt_mask[row, -len(prompt) :] = 1
+            response_tensor[row, : len(response)] = torch.tensor(response, dtype=torch.long)
+            response_mask[row, : len(response)] = 1
+        attention_mask = torch.cat([prompt_mask, response_mask], dim=1)
+        non_tensors = {
+            key: np.take(values, rows, axis=0).copy()
+            for key, values in source.non_tensor_batch.items()
+            if key != INTERMEDIATE_MC_CHILD_FIELD
+        }
+        return DataProto.from_dict(
+            tensors={
+                "prompts": prompt_tensor,
+                "responses": response_tensor,
+                "response_mask": response_mask,
+                "input_ids": torch.cat([prompt_tensor, response_tensor], dim=1),
+                "attention_mask": attention_mask,
+                "position_ids": compute_position_id_with_mask(attention_mask),
+            },
+            non_tensors=non_tensors,
+        )
+
+    def _evaluate_continuations(self, source: DataProto, bundles: list[_Bundle]) -> None:
+        rows: list[int] = []
+        prompts: list[list[int]] = []
+        responses: list[list[int]] = []
+        mapping: list[tuple[int, int, int]] = []
+        for bundle_index, bundle in enumerate(bundles):
+            for continuation in bundle.continuations:
+                if continuation.mark not in bundle.marks:
+                    raise RuntimeError("continuation record refers to an unselected mark")
+                full_response = [*bundle.solution_ids[: continuation.mark], *continuation.token_ids]
+                rows.append(bundle.source_row)
+                prompts.append(bundle.prompt_ids)
+                responses.append(full_response)
+                mapping.append((bundle_index, continuation.mark, continuation.sample_index))
+        rewards_by_mark: dict[tuple[int, int], list[float]] = {}
+        if mapping:
+            reward_batch = self._make_reward_batch(source, rows, prompts, responses)
+            reward_tensor, _ = compute_reward(
+                reward_batch,
+                self.trainer.reward_fn,
+                actor_wg=self.trainer.actor_rollout_wg,
+            )
+            raw_rewards = reward_tensor.sum(dim=-1).detach().cpu().tolist()
+            if len(raw_rewards) != len(mapping):
+                raise RuntimeError("continuation reward count does not match successful generations")
+            for (bundle_index, mark, sample_index), raw_reward in zip(mapping, raw_rewards, strict=True):
+                reward = validate_reward(raw_reward, self.feature.max_reward)
+                rewards_by_mark.setdefault((bundle_index, mark), []).append(reward)
                 self._audit(
-                    "continuation_failure",
+                    "continuation",
                     rollout_id=bundles[bundle_index].rollout_id,
                     mark=mark,
                     sample=sample_index,
-                    reason="reward",
+                    reward=reward,
                 )
-                continue
-            by_bundle_mark.setdefault((bundle_index, mark), []).append(reward)
-            self._audit(
-                "continuation",
-                rollout_id=bundles[bundle_index].rollout_id,
-                mark=mark,
-                sample=sample_index,
-                reward=reward,
-            )
         for bundle_index, bundle in enumerate(bundles):
             mark_rewards = {
-                mark: by_bundle_mark[(bundle_index, mark)]
+                mark: rewards_by_mark[(bundle_index, mark)]
                 for mark in bundle.marks
-                if (bundle_index, mark) in by_bundle_mark
+                if (bundle_index, mark) in rewards_by_mark
             }
             bundle.per_mark_targets, bundle.dense_targets = aggregate_mark_targets(mark_rewards)
 
-    def _set_training_targets(
-        self,
-        critic_batch: DataProto,
-        mapping: list[tuple[int, int]],
-        bundles: list[_Bundle],
-    ) -> None:
-        for row, (bundle_index, _) in enumerate(mapping):
-            bundle = bundles[bundle_index]
+    def _set_critic_targets(self, critic_batch: DataProto, bundles: list[_Bundle]) -> None:
+        bundle_indices = critic_batch.non_tensor_batch["intermediate_mc_bundle_index"]
+        for row, raw_bundle_index in enumerate(bundle_indices):
+            bundle = bundles[int(raw_bundle_index)]
+            critic_batch.batch["critic_targets"][row, 0] = initial_state_target(
+                bundle.terminal_reward,
+                bundle.per_mark_targets,
+            )
+            critic_batch.batch["critic_target_mask"][row, 0] = 1.0
             for token, target in bundle.dense_targets.items():
                 critic_batch.batch["critic_targets"][row, token] = target
                 critic_batch.batch["critic_target_mask"][row, token] = 1.0
@@ -663,335 +762,212 @@ class IntermediateMCRayPPOTrainer(RayPPOTrainer):
                 selected_marks=bundle.marks,
                 surviving_marks=sorted(bundle.per_mark_targets),
                 dense_token_labels=len(bundle.dense_targets),
+                initial_state_target=initial_state_target(bundle.terminal_reward, bundle.per_mark_targets),
                 terminal_token=len(bundle.solution_ids),
             )
 
-    def _solution_advantages(self, bundles: list[_Bundle], response_width: int) -> torch.Tensor:
-        advantages = torch.zeros((len(bundles), response_width), dtype=torch.float32)
-        mask = torch.zeros_like(advantages)
+    def _add_solution_gae(self, source: DataProto, bundles: list[_Bundle]) -> None:
+        response_width = source.batch["responses"].shape[1]
+        values = torch.zeros((len(bundles), response_width), dtype=torch.float32)
+        rewards = torch.zeros_like(values)
         for row, bundle in enumerate(bundles):
-            averaged_values = [sum(values) / len(values) for values in zip(*bundle.critic_values, strict=True)]
-            action_advantages = token_gae(
-                averaged_values,
-                bundle.terminal_reward,
-                gamma=float(self.config.algorithm.gamma),
-                gae_lambda=float(self.config.algorithm.lam),
-            )
-            length = len(action_advantages)
-            advantages[row, :length] = torch.tensor(action_advantages)
-            mask[row, :length] = 1.0
-        return masked_whiten(advantages, mask)
+            streams = [stream for stream in bundle.critic_values if stream is not None]
+            averaged = [sum(items) / len(items) for items in zip(*streams, strict=True)]
+            token_count = len(bundle.solution_ids)
+            values[row, :token_count] = torch.tensor(averaged[:token_count], dtype=torch.float32)
+            rewards[row, token_count - 1] = bundle.terminal_reward
+        advantages, returns = core_algos.compute_gae_advantage_return(
+            token_level_rewards=rewards,
+            values=values,
+            response_mask=source.batch["response_mask"].float(),
+            gamma=float(self.config.algorithm.gamma),
+            lam=float(self.config.algorithm.lam),
+        )
+        source.batch["values"] = values
+        source.batch["token_level_rewards"] = rewards
+        source.batch["advantages"] = advantages
+        source.batch["returns"] = returns
 
-    def _critique_advantages(self, bundles: list[_Bundle], response_width: int) -> torch.Tensor:
-        result = torch.zeros((len(bundles) * self.feature.num_critiques, response_width), dtype=torch.float32)
-        row = 0
-        for bundle in bundles:
-            rewards: list[float] = []
-            points = [len(bundle.solution_ids), *sorted(bundle.per_mark_targets)]
-            targets = [
-                bundle.terminal_reward,
-                *(bundle.per_mark_targets[mark] for mark in sorted(bundle.per_mark_targets)),
-            ]
-            for critique_values in bundle.critic_values:
-                predictions = [critique_values[point] for point in points]
-                rewards.append(critique_accuracy_reward(predictions, targets, max_reward=self.feature.max_reward))
-            normalized = critique_group_advantages(
-                rewards,
-                self.feature.critique_normalization_epsilon,
-            )
-            for critique_row, advantage in zip(bundle.critique_rows, normalized, strict=True):
-                mask = critique_row.batch["response_mask"][0].float()
-                result[row] = advantage * mask
-                row += 1
-            self._audit(
-                "critique_credit",
-                rollout_id=bundle.rollout_id,
-                rewards=rewards,
-                advantages=normalized,
-                points=points,
-                targets=targets,
-            )
-        return result
-
-    @staticmethod
-    def _actor_keys() -> list[str]:
-        return [
-            "prompts",
-            "responses",
-            "response_mask",
-            "input_ids",
-            "attention_mask",
-            "position_ids",
-            "rollout_log_probs",
+    def _critique_advantages(self, bundle: _Bundle) -> list[float]:
+        points = [len(bundle.solution_ids), *sorted(bundle.per_mark_targets)]
+        targets = [
+            bundle.terminal_reward,
+            *(bundle.per_mark_targets[mark] for mark in sorted(bundle.per_mark_targets)),
         ]
+        rewards = [
+            critique_accuracy_reward(
+                [float(values[point]) for point in points],
+                targets,
+                max_reward=self.feature.max_reward,
+            )
+            for values in bundle.critic_values
+            if values is not None
+        ]
+        advantages = critique_group_advantages(rewards, self.feature.critique_normalization_epsilon)
+        self._audit(
+            "critique_credit",
+            rollout_id=bundle.rollout_id,
+            rewards=rewards,
+            advantages=advantages,
+            points=points,
+            targets=targets,
+        )
+        return advantages
 
     def _make_actor_batch(self, source: DataProto, bundles: list[_Bundle]) -> DataProto:
-        solution_rows = source.select_idxs([bundle.source_row for bundle in bundles]).select(
-            batch_keys=self._actor_keys(), non_tensor_batch_keys=[], meta_info_keys=[]
+        rows: list[tuple[list[int], int, list[float], list[float], str]] = []
+        for bundle in bundles:
+            solution_advantages = source.batch["advantages"][bundle.source_row, : len(bundle.solution_ids)].tolist()
+            solution_full = [*bundle.prompt_ids, *bundle.solution_ids]
+            rows.append(
+                (
+                    solution_full,
+                    len(bundle.prompt_ids),
+                    bundle.solution_log_probs,
+                    [float(value) for value in solution_advantages],
+                    "solution",
+                )
+            )
+            critique_advantages = self._critique_advantages(bundle)
+            critique_prompt = [*bundle.prompt_ids, *bundle.solution_ids, *self.critique_instruction_ids]
+            for critique_ids, log_probs, advantage in zip(
+                bundle.critique_ids,
+                bundle.critique_log_probs,
+                critique_advantages,
+                strict=True,
+            ):
+                rows.append(
+                    (
+                        [*critique_prompt, *critique_ids],
+                        len(critique_prompt),
+                        log_probs,
+                        [float(advantage)] * len(critique_ids),
+                        "critique",
+                    )
+                )
+        max_sequence = max(len(full) for full, *_ in rows)
+        if max_sequence > int(self.config.actor_rollout_ref.rollout.max_model_len):
+            raise ValueError("packed actor sequence exceeds the actor's effective context limit")
+        response_width = max_sequence - 1
+        pad_id = self._pad_token_id()
+        prompts = torch.full((len(rows), 1), pad_id, dtype=torch.long)
+        responses = torch.full((len(rows), response_width), pad_id, dtype=torch.long)
+        response_mask = torch.zeros((len(rows), response_width), dtype=torch.long)
+        attention_mask = torch.zeros((len(rows), max_sequence), dtype=torch.long)
+        old_log_probs = torch.zeros((len(rows), response_width), dtype=torch.float32)
+        rollout_log_probs = torch.zeros_like(old_log_probs)
+        advantages = torch.zeros_like(old_log_probs)
+        kinds: list[str] = []
+        for row, (full, train_start, behavior, row_advantages, kind) in enumerate(rows):
+            if len(full) < 2 or train_start <= 0:
+                raise ValueError("packed actor sequence needs one real prompt token and non-empty context")
+            if len(behavior) != len(row_advantages) or train_start + len(behavior) != len(full):
+                raise RuntimeError("packed actor behavior/advantage alignment is inconsistent")
+            prompts[row, 0] = full[0]
+            responses[row, : len(full) - 1] = torch.tensor(full[1:], dtype=torch.long)
+            attention_mask[row, : len(full)] = 1
+            offset = train_start - 1
+            stop = offset + len(behavior)
+            response_mask[row, offset:stop] = 1
+            old_log_probs[row, offset:stop] = torch.tensor(behavior, dtype=torch.float32)
+            rollout_log_probs[row, offset:stop] = torch.tensor(behavior, dtype=torch.float32)
+            advantages[row, offset:stop] = torch.tensor(row_advantages, dtype=torch.float32)
+            kinds.append(kind)
+        input_ids = torch.cat([prompts, responses], dim=1)
+        actor_batch = DataProto.from_dict(
+            tensors={
+                "prompts": prompts,
+                "responses": responses,
+                "response_mask": response_mask,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": compute_position_id_with_mask(attention_mask),
+                "old_log_probs": old_log_probs,
+                "rollout_log_probs": rollout_log_probs,
+                "advantages": advantages,
+            },
+            non_tensors={"intermediate_mc_actor_kind": np.array(kinds, dtype=object)},
         )
-        critique_batch = DataProto.concat(
-            [
-                row.select(batch_keys=self._actor_keys(), non_tensor_batch_keys=[], meta_info_keys=[])
-                for bundle in bundles
-                for row in bundle.critique_rows
-            ]
-        )
-        response_width = solution_rows.batch["responses"].shape[1]
-        solution_rows.batch["advantages"] = self._solution_advantages(bundles, response_width)
-        critique_batch.batch["advantages"] = self._critique_advantages(bundles, response_width)
-        solution_rows.batch["old_log_probs"] = solution_rows.batch["rollout_log_probs"].clone()
-        critique_batch.batch["old_log_probs"] = critique_batch.batch["rollout_log_probs"].clone()
-        actor_batch = DataProto.concat([solution_rows, critique_batch])
         actor_batch.meta_info.update(
             {
                 "temperature": 1.0,
-                "global_token_num": actor_batch.batch["attention_mask"].sum(dim=-1).tolist(),
+                "global_token_num": attention_mask.sum(dim=-1).tolist(),
             }
         )
-        global_minibatch = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * int(
-            self.config.actor_rollout_ref.rollout.n
-        )
-        actor_batch, pad_size = pad_dataproto_to_divisor(actor_batch, global_minibatch)
-        if pad_size:
-            actor_batch.batch["response_mask"][-pad_size:] = 0
-            actor_batch.batch["advantages"][-pad_size:] = 0
         self._audit(
             "actor_batch",
             solutions=len(bundles),
             critiques=len(bundles) * self.feature.num_critiques,
             continuations=0,
-            padding=pad_size,
+            padding=0,
         )
         return actor_batch
 
-    def _pad_critic_batch(self, critic_batch: DataProto) -> DataProto:
-        global_minibatch = int(self.config.critic.ppo_mini_batch_size) * int(self.config.actor_rollout_ref.rollout.n)
-        critic_batch, pad_size = pad_dataproto_to_divisor(critic_batch, global_minibatch)
-        if pad_size:
-            critic_batch.batch["critic_target_mask"][-pad_size:] = 0
-        critic_batch.meta_info["global_token_num"] = critic_batch.batch["attention_mask"].sum(dim=-1).tolist()
-        return critic_batch
+    def run_update(
+        self,
+        source: DataProto,
+        records: dict[str, IntermediateMCGenerationRecord],
+        reward_tensor: torch.Tensor,
+        metrics: dict[str, Any],
+        timing_raw: dict[str, float],
+    ) -> bool:
+        terminal_rewards = [
+            validate_reward(value, self.feature.max_reward)
+            for value in reward_tensor.sum(dim=-1).detach().cpu().tolist()
+        ]
+        bundles = self._build_bundles(source, records, terminal_rewards)
+        critic_batch = self._make_critic_batch(bundles)
+        self._validate_optimizer_batch(critic_batch, role="critic", worker_group=self.trainer.critic_wg)
+        if self.config.trainer.balance_batch:
+            self.trainer._balance_batch(
+                critic_batch,
+                metrics=metrics,
+                logging_prefix="critic_global_seqlen",
+                worker_group=self.trainer.critic_wg,
+                role="critic",
+            )
+        with marked_timer("values", timing_raw, color="cyan"):
+            self._score_contexts(critic_batch, bundles)
+        in_warmup = self.trainer.global_steps <= int(self.config.trainer.critic_warmup)
+        if not in_warmup:
+            if self.feature.mark_selector == "variance":
+                self._select_variance_marks(bundles)
+                self._generate_variance_continuations(source, bundles, timing_raw)
+            self._evaluate_continuations(source, bundles)
+        else:
+            self._audit("warmup", continuations=0)
+        self._set_critic_targets(critic_batch, bundles)
+        with marked_timer("update_critic", timing_raw, color="pink"):
+            critic_output = self.trainer._update_critic(critic_batch)
+        metrics.update(reduce_metrics(critic_output.meta_info["metrics"]))
+        self._add_solution_gae(source, bundles)
 
-    def _build_bundles_and_critiques(self, source: DataProto, rewards: list[float]) -> list[_Bundle]:
-        request_rows: list[int] = []
-        prompt_overrides: list[list[int]] = []
-        provisional: list[_Bundle] = []
-        rollout_n = int(self.config.actor_rollout_ref.rollout.n)
-        critique_cap_config = self.feature.critique_max_response_length
-        critique_cap = int(critique_cap_config or self.config.actor_rollout_ref.rollout.response_length)
-        prompt_limit = int(self.config.actor_rollout_ref.rollout.prompt_length)
-        for row, reward in enumerate(rewards):
-            prompt_ids = self._valid_prompt_ids(source, row)
-            solution_ids = self._valid_response_ids(source, row)
-            critique_prompt = [*prompt_ids, *solution_ids, *self._critique_instruction_ids]
-            if len(critique_prompt) > prompt_limit:
-                raise ValueError(
-                    "self-critique prompt exceeds actor_rollout_ref.rollout.prompt_length: "
-                    f"actual={len(critique_prompt)} limit={prompt_limit}"
+        actor_updated = False
+        if not in_warmup:
+            actor_batch = self._make_actor_batch(source, bundles)
+            self._validate_optimizer_batch(actor_batch, role="actor", worker_group=self.trainer.actor_rollout_wg)
+            if self.config.trainer.balance_batch:
+                self.trainer._balance_batch(
+                    actor_batch,
+                    metrics=metrics,
+                    logging_prefix="actor_global_seqlen",
+                    worker_group=self.trainer.actor_rollout_wg,
+                    role="actor",
                 )
-            fixed_context = (
-                len(prompt_ids)
-                + len(self._critic_delimiter_ids)
-                + len(self._solution_delimiter_ids)
-                + len(solution_ids)
-            )
-            effective_cap = min(critique_cap, self._critic_context_limit - fixed_context)
-            if effective_cap <= 0:
-                raise ValueError("self-critique has no capacity in the critic context window")
-            dataset_values = source.non_tensor_batch.get("index", np.arange(len(source), dtype=object))
-            group_values = source.non_tensor_batch.get("prompt_group_id", np.arange(len(source), dtype=object))
-            rollout_values = source.non_tensor_batch.get("intermediate_mc_rollout_id")
-            rollout_id = (
-                str(rollout_values[row]) if rollout_values is not None else f"{group_values[row]}:{row % rollout_n}"
-            )
-            bundle = _Bundle(
-                order=row,
-                dataset_index=dataset_values[row],
-                rollout_id=rollout_id,
-                prompt_group_id=str(group_values[row]),
-                source_row=row,
-                prompt_ids=prompt_ids,
-                solution_ids=solution_ids,
-                terminal_reward=reward,
-            )
-            provisional.append(bundle)
-            for _ in range(self.feature.num_critiques):
-                request_rows.append(row)
-                prompt_overrides.append(critique_prompt)
-        request_batch = self._secondary_request_batch(source, request_rows, prompt_overrides)
-        generated = self._generate_rows_with_isolation(request_batch)
-        bundles: list[_Bundle] = []
-        offset = 0
-        for bundle in provisional:
-            fixed_context = (
-                len(bundle.prompt_ids)
-                + len(self._critic_delimiter_ids)
-                + len(self._solution_delimiter_ids)
-                + len(bundle.solution_ids)
-            )
-            cap = min(critique_cap, self._critic_context_limit - fixed_context)
-            rows = [
-                self._truncate_generated_row(generated[offset + index], cap)
-                for index in range(self.feature.num_critiques)
-            ]
-            offset += self.feature.num_critiques
-            if any(row is None for row in rows):
-                self._audit("bundle_dropped", rollout_id=bundle.rollout_id, reason="incomplete_critiques")
-                continue
-            bundle.critique_rows = [row for row in rows if row is not None]
-            bundle.critique_ids = [self._valid_response_ids(row, 0, cap=cap) for row in bundle.critique_rows]
-            bundle.contexts = [
-                build_critic_context(
-                    bundle.prompt_ids,
-                    critique_ids,
-                    bundle.solution_ids,
-                    critique_delimiter_ids=self._critic_delimiter_ids,
-                    solution_delimiter_ids=self._solution_delimiter_ids,
-                )
-                for critique_ids in bundle.critique_ids
-            ]
-            self._audit(
-                "bundle",
-                rollout_id=bundle.rollout_id,
-                solution_tokens=len(bundle.solution_ids),
-                critique_tokens=[len(tokens) for tokens in bundle.critique_ids],
-                value_positions=len(bundle.contexts[0].value_positions),
-            )
-            bundles.append(bundle)
-        if not bundles:
-            raise RuntimeError("no complete solution/critique bundles remain in this synchronous iteration")
-        return bundles
+            with marked_timer("update_actor", timing_raw, color="red"):
+                actor_output = self.trainer._update_actor(actor_batch)
+            metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+            actor_updated = True
 
-    def fit(self):
-        logger = Tracking(
-            project_name=self.config.trainer.project_name,
-            experiment_name=self.config.trainer.experiment_name,
-            default_backend=self.config.trainer.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
+        metrics.update(
+            {
+                "intermediate_mc/warmup": float(in_warmup),
+                "intermediate_mc/bundles": len(bundles),
+                "intermediate_mc/critiques": len(bundles) * self.feature.num_critiques,
+                "intermediate_mc/critique_advantage_zero": float(self.feature.num_critiques == 1),
+                "intermediate_mc/selected_marks": sum(len(bundle.marks) for bundle in bundles),
+                "intermediate_mc/surviving_marks": sum(len(bundle.per_mark_targets) for bundle in bundles),
+                "intermediate_mc/failed_continuations": sum(len(bundle.failed_continuations) for bundle in bundles),
+            }
         )
-        self.global_steps = 0
-        self.training_start_time = time.time()
-        self._load_checkpoint()
-        if self._completed_training_resume():
-            return
-        self.checkpoint_manager.update_weights(self.global_steps)
-        if self.config.trainer.get("val_before_train", True):
-            metrics = self._validate()
-            logger.log(data=metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
-
-        current_epoch = self.global_steps // len(self.train_dataloader)
-        progress = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
-        self.global_steps += 1
-        for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
-                is_last_step = self.global_steps >= self.total_training_steps
-                metrics: dict[str, float] = {}
-                batch = DataProto.from_single_dict(batch_dict)
-                group_ids = np.array(
-                    [f"step-{self.global_steps}:prompt-{row}" for row in range(len(batch))],
-                    dtype=object,
-                )
-                batch.non_tensor_batch["uid"] = group_ids.copy()
-                batch.non_tensor_batch["prompt_group_id"] = group_ids
-                gen_batch = self._get_gen_batch(batch)
-                gen_batch.non_tensor_batch["agent_name"] = np.array(
-                    ["single_turn_agent"] * len(gen_batch),
-                    dtype=object,
-                )
-                gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n,
-                    interleave=True,
-                )
-                try:
-                    source = self.async_rollout_manager.generate_sequences(gen_batch)
-                    if "response_mask" not in source.batch:
-                        raise RuntimeError("single-turn rollout did not return response_mask")
-                    if "rollout_log_probs" not in source.batch:
-                        raise RuntimeError("single-turn rollout did not return sampling-time rollout_log_probs")
-                    repeated = batch.repeat(
-                        repeat_times=self.config.actor_rollout_ref.rollout.n,
-                        interleave=True,
-                    )
-                    self._drop_overlapping_non_tensor_keys(source, repeated)
-                    source = repeated.union(source)
-                    rollout_n = int(self.config.actor_rollout_ref.rollout.n)
-                    source.non_tensor_batch["intermediate_mc_rollout_id"] = np.array(
-                        [
-                            f"{source.non_tensor_batch['prompt_group_id'][row]}:{row % rollout_n}"
-                            for row in range(len(source))
-                        ],
-                        dtype=object,
-                    )
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(source, metrics=metrics)
-                    rewards = self._solution_rewards(source)
-                    bundles = self._build_bundles_and_critiques(source, rewards)
-                finally:
-                    self.checkpoint_manager.sleep_replicas()
-
-                critic_batch, mapping = self._make_critic_batch(bundles)
-                self._score_contexts(critic_batch, mapping, bundles)
-                in_warmup = self.critic_update_count < self.feature.critic_warmup_updates
-                if in_warmup:
-                    self._set_warmup_targets(critic_batch, mapping, bundles)
-                    self._audit("warmup", critic_update_count=self.critic_update_count, continuations=0)
-                else:
-                    self._select_marks(bundles)
-                    if any(bundle.marks for bundle in bundles):
-                        self.checkpoint_manager.wake_up_replicas()
-                        self._run_continuations(source, bundles)
-                    self._set_training_targets(critic_batch, mapping, bundles)
-
-                critic_output = self._update_critic(self._pad_critic_batch(critic_batch))
-                self.critic_update_count += 1
-                metrics.update(reduce_metrics(critic_output.meta_info["metrics"]))
-                metrics.update(
-                    {
-                        "intermediate_mc/critic_update_count": self.critic_update_count,
-                        "intermediate_mc/warmup": float(in_warmup),
-                        "intermediate_mc/bundles": len(bundles),
-                        "intermediate_mc/critiques": len(bundles) * self.feature.num_critiques,
-                        "intermediate_mc/selected_marks": sum(len(bundle.marks) for bundle in bundles),
-                        "intermediate_mc/surviving_marks": sum(len(bundle.per_mark_targets) for bundle in bundles),
-                    }
-                )
-
-                if not in_warmup:
-                    actor_batch = self._make_actor_batch(source, bundles)
-                    actor_output = self._update_actor(actor_batch)
-                    metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
-
-                save_due = self.config.trainer.save_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.save_freq == 0
-                )
-                if save_due:
-                    self._save_checkpoint()
-
-                if in_warmup:
-                    self.checkpoint_manager.wake_up_replicas()
-                else:
-                    self.checkpoint_manager.update_weights(self.global_steps)
-
-                if self.config.trainer.test_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
-                ):
-                    metrics.update(self._validate())
-
-                metrics.update(
-                    {
-                        "training/global_step": self.global_steps,
-                        "training/epoch": epoch,
-                    }
-                )
-                logger.log(data=metrics, step=self.global_steps)
-                progress.update(1)
-                self.global_steps += 1
-
-                if is_last_step:
-                    progress.close()
-                    return
-                if hasattr(self.train_dataset, "on_batch_end"):
-                    self.train_dataset.on_batch_end(batch=source)
+        return actor_updated

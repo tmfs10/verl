@@ -522,10 +522,9 @@ critic:
   loss_agg_mode: ${oc.select:actor_rollout_ref.actor.loss_agg_mode,token-mean}
   intermediate_mc_value:
     enable: ${oc.select:algorithm.intermediate_mc_value.enable,false}
-    recipe: ${oc.select:algorithm.intermediate_mc_value.recipe,scalar_random}
+    critic_head: ${oc.select:algorithm.intermediate_mc_value.critic_head,scalar}
     max_reward: ${oc.select:algorithm.intermediate_mc_value.max_reward,1.0}
     scalar_loss: ${oc.select:algorithm.intermediate_mc_value.scalar_loss,mse}
-    value_clip_epsilon: ${oc.select:algorithm.intermediate_mc_value.value_clip_epsilon,0.2}
     beta_target_epsilon: ${oc.select:algorithm.intermediate_mc_value.beta_target_epsilon,1.0e-4}
   checkpoint:
     _target_: verl.trainer.config.CheckpointConfig
@@ -686,22 +685,25 @@ algorithm:
   intermediate_mc_value:
     _target_: verl.trainer.config.IntermediateMCValueConfig
     enable: false
-    recipe: scalar_random
-    actor_loss_mode: dppo_tv
+    critic_head: scalar
+    mark_selector: random
     num_critiques: 4
     continuations_per_mark: 1
-    max_marks: 1
-    critic_warmup_updates: 30
+    max_marks: null
     critique_max_response_length: null
     mark_start_fraction: 0.05
     mark_end_fraction: 0.9
     min_mark_gap: 32
+    ema_alpha: 0.1
+    ema_baseline_token: 32
+    ema_floor: 0.0001
+    ema_ratio_up: 2.0
+    ema_ratio_down: 0.5
     variance_scope: rollout
     variance_random_probability: 0.05
     selection_seed: 0
     max_reward: 1.0
     scalar_loss: mse
-    value_clip_epsilon: 0.2
     beta_target_epsilon: 0.0001
     critique_normalization_epsilon: 1.0e-08
     critique_prompt: 'You have been given above a question, the thought process, and

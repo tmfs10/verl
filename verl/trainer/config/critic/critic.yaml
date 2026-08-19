@@ -88,17 +88,14 @@ intermediate_mc_value:
   # Whether the conditioned critic path is enabled.
   enable: ${oc.select:algorithm.intermediate_mc_value.enable,false}
 
-  # Closed recipe name used to determine the head width.
-  recipe: ${oc.select:algorithm.intermediate_mc_value.recipe,scalar_random}
+  # Critic head used to determine the token-value output width.
+  critic_head: ${oc.select:algorithm.intermediate_mc_value.critic_head,scalar}
 
   # Maximum reward used to scale the critic mean.
   max_reward: ${oc.select:algorithm.intermediate_mc_value.max_reward,1.0}
 
   # Scalar critic target loss.
   scalar_loss: ${oc.select:algorithm.intermediate_mc_value.scalar_loss,mse}
-
-  # PPO-style value clipping epsilon.
-  value_clip_epsilon: ${oc.select:algorithm.intermediate_mc_value.value_clip_epsilon,0.2}
 
   # Open-interval transform used for Beta targets.
   beta_target_epsilon: ${oc.select:algorithm.intermediate_mc_value.beta_target_epsilon,1.0e-4}

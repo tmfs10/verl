@@ -51,6 +51,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     process_validation_metrics,
 )
+from verl.trainer.ppo.one_logger_integration import OneLoggerInstrumented
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async, extract_reward
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils import tensordict_utils as tu
@@ -68,7 +69,6 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.torch_functional import masked_mean
-from verl.trainer.ppo.one_logger_integration import OneLoggerInstrumented
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import FSDPEngineConfig
 from verl.workers.reward_manager.conditional import _select_low_confidence_token_indices
@@ -212,14 +212,10 @@ def _compute_longest_success_penalty_reward_metrics(
             float(len(successful_group_indices)) / float(len(first_indices)) if first_indices else 0.0
         ),
         "reward/longest_success_penalty/successful_groups_within_margin_fraction": (
-            float(within_margin_count) / float(len(successful_group_indices))
-            if successful_group_indices
-            else 0.0
+            float(within_margin_count) / float(len(successful_group_indices)) if successful_group_indices else 0.0
         ),
         "reward/longest_success_penalty/successful_groups_penalized_fraction": (
-            float(penalized_group_count) / float(len(successful_group_indices))
-            if successful_group_indices
-            else 0.0
+            float(penalized_group_count) / float(len(successful_group_indices)) if successful_group_indices else 0.0
         ),
         "reward/longest_success_penalty/mean_min_success_tokens": (
             float(np.mean(successful_group_mins)) if successful_group_mins else 0.0
@@ -414,7 +410,7 @@ def _to_jsonable(value: Any) -> Any:
     """Recursively normalize numpy-backed rollout metadata for JSONL dumps."""
     if isinstance(value, dict):
         return {k: _to_jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_to_jsonable(v) for v in value]
     if isinstance(value, np.ndarray):
         return [_to_jsonable(v) for v in value.tolist()]
@@ -537,6 +533,12 @@ class RayPPOTrainer(OneLoggerInstrumented):
         self.use_legacy_worker_impl = config.trainer.get("use_legacy_worker_impl", "auto")
         self._enable_rollout_logprobs_for_generation_dumps()
 
+        self.intermediate_mc_controller = None
+        if bool(OmegaConf.select(self.config, "algorithm.intermediate_mc_value.enable", default=False)):
+            from verl.trainer.ppo.ray_trainer_intermediate_mc import IntermediateMCValueController
+
+            self.intermediate_mc_controller = IntermediateMCValueController(self)
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
@@ -551,9 +553,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
         with open_dict(self.config):
             self.config.actor_rollout_ref.rollout.calculate_log_probs = True
-        print(
-            "Enabled actor_rollout_ref.rollout.calculate_log_probs because generation dump JSONLs are configured."
-        )
+        print("Enabled actor_rollout_ref.rollout.calculate_log_probs because generation dump JSONLs are configured.")
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -749,17 +749,20 @@ class RayPPOTrainer(OneLoggerInstrumented):
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         # Keep algorithm-side supervision fields on the driver batch so post-generation
         # updates (for example OPSD teacher construction) can still access them.
-        reward_keys = set(
-            {
-                "data_source",
-                "reward_model",
-                "extra_info",
-                "uid",
-                "prompt_group_id",
-                "ground_truth_answer",
-                "problem",
-            }
-        ) & batch.non_tensor_batch.keys()
+        reward_keys = (
+            set(
+                {
+                    "data_source",
+                    "reward_model",
+                    "extra_info",
+                    "uid",
+                    "prompt_group_id",
+                    "ground_truth_answer",
+                    "problem",
+                }
+            )
+            & batch.non_tensor_batch.keys()
+        )
         opsd_ground_truth_field = OmegaConf.select(self.config, "algorithm.opsd.ground_truth_field")
         if OmegaConf.select(self.config, "algorithm.opsd.enable") and opsd_ground_truth_field:
             ground_truth_root = str(opsd_ground_truth_field).split(".", 1)[0]
@@ -868,10 +871,14 @@ class RayPPOTrainer(OneLoggerInstrumented):
         prompt_key = self.config.data.get("prompt_key", "prompt")
         solution_key = self.config.data.get("solution_key", "ground_truth_answer")
         reward_tail_percent = float(self.config.reward.reward_kwargs.low_confidence_tail_percent)
-        reward_min_tokens = int(OmegaConf.select(self.config, "reward.reward_kwargs.low_confidence_min_tokens", default=1))
+        reward_min_tokens = int(
+            OmegaConf.select(self.config, "reward.reward_kwargs.low_confidence_min_tokens", default=1)
+        )
 
         prompt_messages = list(batch.non_tensor_batch[prompt_key])
-        solution_values = list(batch.non_tensor_batch.get(solution_key, np.array([None] * len(prompt_messages), dtype=object)))
+        solution_values = list(
+            batch.non_tensor_batch.get(solution_key, np.array([None] * len(prompt_messages), dtype=object))
+        )
         sample_indices = list(batch.non_tensor_batch.get("index", np.arange(len(prompt_messages), dtype=object)))
 
         selected_rows: list[int] = []
@@ -880,7 +887,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
         sample_examples: list[dict[str, Any]] = []
         sample_items: list[Any] = []
 
-        for row_idx, (messages, solution_text, item_key) in enumerate(zip(prompt_messages, solution_values, sample_indices, strict=False)):
+        for row_idx, (messages, solution_text, item_key) in enumerate(
+            zip(prompt_messages, solution_values, sample_indices, strict=False)
+        ):
             example = {
                 prompt_key: messages,
                 solution_key: solution_text,
@@ -893,7 +902,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
             prompt_template, _, _ = dataset._build_prompt_template_with_sentinel(example, item=item_key)
             sentinel = dataset._masked_solution_sentinel(item_key)
             prompt_prefix_text = prompt_template.replace(sentinel, "")
-            prefix_token_ids = normalize_token_ids(self.tokenizer(prompt_prefix_text, add_special_tokens=False)["input_ids"])
+            prefix_token_ids = normalize_token_ids(
+                self.tokenizer(prompt_prefix_text, add_special_tokens=False)["input_ids"]
+            )
             gt_token_ids = normalize_token_ids(self.tokenizer(solution_text, add_special_tokens=False)["input_ids"])
             if not prefix_token_ids or not gt_token_ids:
                 continue
@@ -922,7 +933,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
         gt_len = gt_ids.size(1)
         seq_concat = torch.cat([prompt_ids, gt_ids], dim=-1)
-        delta_pos = torch.arange(1, gt_len + 1, device=device, dtype=torch.long).unsqueeze(0).expand(prompt_ids.size(0), -1)
+        delta_pos = (
+            torch.arange(1, gt_len + 1, device=device, dtype=torch.long).unsqueeze(0).expand(prompt_ids.size(0), -1)
+        )
         gt_position_ids = prompt_pos[:, -1:] + delta_pos
         position_ids = torch.cat([prompt_pos, gt_position_ids], dim=-1)
         attention_mask = torch.cat([prompt_attn, gt_mask], dim=-1)
@@ -936,7 +949,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 "position_ids": position_ids,
             },
         )
-        prompt_only_batch_padded, pad_size = pad_dataproto_to_divisor(prompt_only_batch, self.actor_rollout_wg.world_size)
+        prompt_only_batch_padded, pad_size = pad_dataproto_to_divisor(
+            prompt_only_batch, self.actor_rollout_wg.world_size
+        )
         prompt_only_output = self.actor_rollout_wg.compute_log_prob(prompt_only_batch_padded)
         prompt_only_log_probs = unpad_dataproto(prompt_only_output, pad_size=pad_size).batch["old_log_probs"]
 
@@ -1156,7 +1171,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
         for data_source, var2metric2val in data_src2var2metric2val.items():
             core_var = "acc" if "acc" in var2metric2val else "reward"
             for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys() if "@" in name], default=1)
+                n_max = max(
+                    [int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys() if "@" in name], default=1
+                )
                 for metric_name, metric_val in metric2val.items():
                     metric_sec = _validation_metric_section(
                         var_name=var_name, core_var=core_var, metric_name=metric_name, n_max=n_max
@@ -1349,8 +1366,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
         disable_agent_reward_loop = bool(getattr(self.reward_fn, "disable_async_reward_loop", False))
         enable_agent_reward_loop = (
-            (not self.use_rm or self.config.reward.reward_model.enable_resource_pool) and not disable_agent_reward_loop
-        )
+            not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        ) and not disable_agent_reward_loop
 
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
@@ -1423,7 +1440,6 @@ class RayPPOTrainer(OneLoggerInstrumented):
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
-        self._save_additional_trainer_state(local_global_step_folder)
 
         # latest checkpointed iteration tracker (for atomic usage)
         if (
@@ -1440,15 +1456,6 @@ class RayPPOTrainer(OneLoggerInstrumented):
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
-
-    def _save_additional_trainer_state(self, checkpoint_folder: str) -> None:
-        """Hook for feature trainers that own driver-side checkpoint state."""
-
-    def _validate_additional_trainer_state(self, checkpoint_folder: str) -> None:
-        """Validate feature state before any model checkpoint is loaded."""
-
-    def _load_additional_trainer_state(self, checkpoint_folder: str) -> None:
-        """Restore feature state after native model and dataloader state."""
 
     def _validate_expected_resume_step(self, actual_step: int) -> None:
         """Fail closed when a chained job discovers an unexpected checkpoint."""
@@ -1513,9 +1520,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
         # Validate the requested dataloader-resume contract before mutating any
         # model state. A segmented production run must never silently restart
         # its data cursor when the caller explicitly requested restoration.
-        load_dataloader_state = OmegaConf.select(
-            self.config, "trainer.load_dataloader_state_on_resume", default=True
-        )
+        load_dataloader_state = OmegaConf.select(self.config, "trainer.load_dataloader_state_on_resume", default=True)
         if not isinstance(load_dataloader_state, bool):
             raise ValueError("trainer.load_dataloader_state_on_resume must be true or false")
         dataloader_local_path = os.path.join(global_step_folder, "data.pt")
@@ -1524,7 +1529,6 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 "trainer.load_dataloader_state_on_resume=true but the requested "
                 f"checkpoint has no dataloader state: {dataloader_local_path}"
             )
-        self._validate_additional_trainer_state(global_step_folder)
 
         actor_path = os.path.join(global_step_folder, "actor")
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
@@ -1548,11 +1552,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
         else:
             dataloader_state_dict = torch.load(dataloader_local_path, weights_only=False)
             self.train_dataloader.load_state_dict(dataloader_state_dict)
-            print(
-                "Resume dataloader state restored: "
-                f"global_step={self.global_steps} state={dataloader_local_path}"
-            )
-        self._load_additional_trainer_state(global_step_folder)
+            print(f"Resume dataloader state restored: global_step={self.global_steps} state={dataloader_local_path}")
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1592,7 +1592,15 @@ class RayPPOTrainer(OneLoggerInstrumented):
             dp_rank_mapping = worker_group._dispatch_info[role]
         return max(dp_rank_mapping) + 1
 
-    def _balance_batch(self, batch: DataProto, metrics, logging_prefix="global_seqlen", keep_minibatch=False):
+    def _balance_batch(
+        self,
+        batch: DataProto,
+        metrics,
+        logging_prefix="global_seqlen",
+        keep_minibatch=False,
+        worker_group=None,
+        role="actor",
+    ):
         """Reorder the data on single controller such that each dp rank gets similar total tokens.
 
         When use_prefix_grouper is enabled, uses group-level balancing to keep samples with
@@ -1604,7 +1612,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
         workload_lst = calculate_workload(global_seqlen_lst)
         # Get dp_size from dispatch info to correctly balance across data parallel ranks
         # Note: world_size may include tensor/pipeline parallel dimensions, but we only want DP
-        dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
+        worker_group = self.actor_rollout_wg if worker_group is None else worker_group
+        dp_size = self._get_dp_size(worker_group, role)
 
         # Use group-level balancing for PrefixGrouper to keep same-uid samples together
         if getattr(self, "use_prefix_grouper", False) and "uid" in batch.non_tensor_batch:
@@ -1633,7 +1642,10 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
         elif keep_minibatch:
             # Decouple the DP balancing and mini-batching.
-            minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
+            if role == "critic":
+                minibatch_size = self.config.critic.get("ppo_mini_batch_size")
+            else:
+                minibatch_size = self.config.actor_rollout_ref.actor.get("ppo_mini_batch_size")
             minibatch_num = len(workload_lst) // minibatch_size
             global_partition_lst = [[] for _ in range(dp_size)]
             for i in range(minibatch_num):
@@ -1904,6 +1916,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 gen_batch_output = gen_batch.repeat(
                     repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                 )
+                intermediate_mc_records = None
+                if self.intermediate_mc_controller is not None:
+                    self.intermediate_mc_controller.prepare_generation_batch(gen_batch_output)
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1911,10 +1926,21 @@ class RayPPOTrainer(OneLoggerInstrumented):
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                        self.checkpoint_manager.sleep_replicas()
-                        if curr_step_profile:
-                            self.async_rollout_manager.stop_profile()
+                        if self.intermediate_mc_controller is not None:
+                            try:
+                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                            finally:
+                                self.checkpoint_manager.sleep_replicas()
+                                if curr_step_profile:
+                                    self.async_rollout_manager.stop_profile()
+                            intermediate_mc_records = self.intermediate_mc_controller.extract_generation_records(
+                                gen_batch_output
+                            )
+                        else:
+                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                            self.checkpoint_manager.sleep_replicas()
+                            if curr_step_profile:
+                                self.async_rollout_manager.stop_profile()
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
@@ -1939,7 +1965,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                                 )
                                 reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
                             else:
-                            # compute reward model score on batch
+                                # compute reward model score on batch
                                 if self.use_rm and "rm_scores" not in batch.batch.keys():
                                     rm_scores = self._compute_reward_colocate(batch)
                                     batch = batch.union(rm_scores)
@@ -1992,7 +2018,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             default=False,
                         )
                         if reward_fn is not None and launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(data=batch, reward_fn=reward_fn, actor_wg=self.actor_rollout_wg)
+                            future_reward = compute_reward_async.remote(
+                                data=batch, reward_fn=reward_fn, actor_wg=self.actor_rollout_wg
+                            )
                         elif reward_fn is not None:
                             reward_tensor, reward_extra_infos_dict = compute_reward(
                                 batch, reward_fn, actor_wg=self.actor_rollout_wg
@@ -2006,7 +2034,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                    if self.intermediate_mc_controller is not None:
+                        batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"].clone()
+                    elif bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
 
                         apply_bypass_mode(
@@ -2049,14 +2079,14 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
-                    if self.use_reference_policy:
+                    if self.use_reference_policy and self.intermediate_mc_controller is None:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
-                    if self.use_critic:
+                    if self.use_critic and self.intermediate_mc_controller is None:
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
                             batch = batch.union(values)
@@ -2070,9 +2100,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
                         if reward_extra_infos_dict:
                             metrics.update(_compute_shortest_success_reward_metrics(reward_extra_infos_dict))
-                            metrics.update(
-                                _compute_longest_success_penalty_reward_metrics(reward_extra_infos_dict)
-                            )
+                            metrics.update(_compute_longest_success_penalty_reward_metrics(reward_extra_infos_dict))
                             batch.non_tensor_batch.update(
                                 {k: _pack_reward_extra_info(v) for k, v in reward_extra_infos_dict.items()}
                             )
@@ -2086,45 +2114,61 @@ class RayPPOTrainer(OneLoggerInstrumented):
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # Compute rollout correction: IS weights, rejection sampling, and metrics
-                        # Only runs in decoupled mode (computes once per batch using stable π_old)
-                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
-                        if (
-                            rollout_corr_config is not None
-                            and "rollout_log_probs" in batch.batch
-                            and not bypass_recomputing_logprobs  # Only in decoupled mode
-                        ):
-                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+                        if self.intermediate_mc_controller is not None:
+                            if intermediate_mc_records is None:
+                                raise RuntimeError("intermediate MC generation records were not captured")
+                            actor_updated = self.intermediate_mc_controller.run_update(
+                                batch,
+                                intermediate_mc_records,
+                                reward_tensor,
+                                metrics,
+                                timing_raw,
+                            )
+                            metrics["intermediate_mc/actor_updated"] = float(actor_updated)
+                        else:
+                            # Compute rollout correction: IS weights, rejection sampling, and metrics
+                            # Only runs in decoupled mode (computes once per batch using stable π_old)
+                            if (
+                                rollout_corr_config is not None
+                                and "rollout_log_probs" in batch.batch
+                                and not bypass_recomputing_logprobs  # Only in decoupled mode
+                            ):
+                                from verl.trainer.ppo.rollout_corr_helper import (
+                                    compute_rollout_correction_and_add_to_batch,
+                                )
 
-                            # Compute IS weights, apply rejection sampling, compute metrics
-                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
-                            # IS and off-policy metrics already have rollout_corr/ prefix
-                            metrics.update(is_metrics)
+                                batch, is_metrics = compute_rollout_correction_and_add_to_batch(
+                                    batch, rollout_corr_config
+                                )
+                                metrics.update(is_metrics)
 
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get(
-                            "norm_adv_by_std_in_grpo", True
-                        )  # GRPO adv normalization factor
+                            # compute advantages, executed on the driver process
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get(
+                                "norm_adv_by_std_in_grpo", True
+                            )  # GRPO adv normalization factor
 
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                config=self.config.algorithm,
+                            )
 
                     # update critic
-                    if self.use_critic:
+                    if self.use_critic and self.intermediate_mc_controller is None:
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    if (
+                        self.intermediate_mc_controller is None
+                        and self.config.trainer.critic_warmup <= self.global_steps
+                    ):
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)
@@ -2164,14 +2208,48 @@ class RayPPOTrainer(OneLoggerInstrumented):
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
+                    if self.intermediate_mc_controller is not None:
+                        # Keep VeRL's native checkpoint cadence and timeout handling during both
+                        # critic-only warmup and joint actor/critic updates.
+                        esi_close_to_expiration = should_save_ckpt_esi(
+                            max_steps_duration=self.max_steps_duration,
+                            save_ckpt_duration=self.config.trainer.get("checkpoint_save_duration", 60),
+                            redundant_time=self.config.trainer.esi_redundant_time,
+                        )
+                        timeout_close_to_expiration = should_save_ckpt_timeout(
+                            max_steps_duration=self.max_steps_duration,
+                            save_ckpt_duration=self.config.trainer.get("checkpoint_save_duration", 60),
+                            redundant_time=self.config.trainer.esi_redundant_time,
+                            checkpoint_must_save_by=self.config.trainer.get("checkpoint_must_save_by", None),
+                            start_time=self.training_start_time,
+                        )
+                        save_due_to_schedule = self.config.trainer.save_freq > 0 and (
+                            is_last_step or self.global_steps % self.config.trainer.save_freq == 0
+                        )
+                        if save_due_to_schedule or esi_close_to_expiration or timeout_close_to_expiration:
+                            if esi_close_to_expiration:
+                                print("Force saving checkpoint: ESI instance expiration approaching.")
+                            if timeout_close_to_expiration:
+                                print("Force saving checkpoint: job timeout approaching.")
+                            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                self._save_checkpoint()
+                            if timeout_close_to_expiration:
+                                stop_after_timeout_checkpoint = True
+                        if not stop_after_timeout_checkpoint:
+                            with marked_timer("update_weights", timing_raw, color="red"):
+                                # This also wakes the unchanged rollout actor after critic-only warmup.
+                                self.checkpoint_manager.update_weights(self.global_steps)
+
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir and not stop_after_timeout_checkpoint:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
-                if (not stop_after_timeout_checkpoint) and self.config.trainer.test_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
+                if (
+                    (not stop_after_timeout_checkpoint)
+                    and self.config.trainer.test_freq > 0
+                    and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0)
                 ):
                     with marked_timer("testing", timing_raw, color="green"):
                         val_metrics: dict = self._validate()

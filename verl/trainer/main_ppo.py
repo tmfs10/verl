@@ -25,8 +25,8 @@ from omegaconf import OmegaConf, open_dict
 from verl.experimental.dataset.sampler import AbstractSampler
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.constants_ppo import get_ppo_ray_runtime_env
-from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from verl.trainer.ppo.reward import load_reward_manager
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.config import validate_config
 from verl.utils.device import auto_set_device, is_cuda_available
@@ -126,7 +126,9 @@ def _build_validation_reward_config(config):
 
     if val_reward_manager_cfg is not None:
         val_config = OmegaConf.create(OmegaConf.to_container(config, resolve=False))
-        val_config.reward.reward_manager = OmegaConf.create(OmegaConf.to_container(val_reward_manager_cfg, resolve=False))
+        val_config.reward.reward_manager = OmegaConf.create(
+            OmegaConf.to_container(val_reward_manager_cfg, resolve=False)
+        )
         return val_config, _disable_training_only_group_rewards(val_reward_kwargs)
 
     train_reward_source = OmegaConf.select(config, "reward.reward_manager.source", default="register")
@@ -427,6 +429,7 @@ class TaskRunner:
                 config,
                 actor_tokenizer=tokenizer,
                 critic_tokenizer=critic_tokenizer,
+                actor_model_path=local_path,
             )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
@@ -458,10 +461,7 @@ class TaskRunner:
 
         trainer_cls = RayPPOTrainer
         if intermediate_mc_enabled:
-            from verl.trainer.ppo.ray_trainer_intermediate_mc import IntermediateMCRayPPOTrainer
-
-            trainer_cls = IntermediateMCRayPPOTrainer
-            print("Using synchronous IntermediateMCRayPPOTrainer")
+            print("Using RayPPOTrainer with synchronous intermediate MC integration")
         if bool(config.data.get("use_dataset_responses", False)):
             from verl.trainer.ppo.ray_trainer_off_policy import RayTrainerOffPolicy
 

@@ -1391,6 +1391,13 @@ class CriticWorker(Worker, DistProfilerExtension):
         )
         self.use_orig_params = self.config.model.fsdp_config.get("use_orig_params", False)
 
+    def _get_data_parallel_group(self):
+        """Return the critic DP group, matching ActorRolloutRefWorker."""
+
+        if self.ulysses_device_mesh is not None:
+            return self.ulysses_device_mesh.get_group(mesh_dim="dp")
+        return torch.distributed.group.WORLD
+
     def _build_critic_model_optimizer(self, config: FSDPCriticConfig):
         # the following line is necessary
         from torch.distributed.fsdp import MixedPrecision
@@ -1443,10 +1450,10 @@ class CriticWorker(Worker, DistProfilerExtension):
         intermediate_mc_config = self.config.get("intermediate_mc_value", {})
         intermediate_mc_enabled = bool(intermediate_mc_config.get("enable", False))
         if intermediate_mc_enabled:
-            recipe = intermediate_mc_config.get("recipe")
-            if recipe not in {"scalar_random", "beta_variance"}:
-                raise ValueError(f"unsupported intermediate MC critic recipe {recipe!r}")
-            critic_model_config.num_labels = 1 if recipe == "scalar_random" else 2
+            critic_head = intermediate_mc_config.get("critic_head")
+            if critic_head not in {"scalar", "beta"}:
+                raise ValueError(f"unsupported intermediate MC critic head {critic_head!r}")
+            critic_model_config.num_labels = 1 if critic_head == "scalar" else 2
         else:
             critic_model_config.num_labels = 1
         # patch for kimi-vl
@@ -1478,7 +1485,7 @@ class CriticWorker(Worker, DistProfilerExtension):
                 critic_model_config,
                 config.model.get("trust_remote_code", False),
             )
-            if intermediate_mc_enabled and recipe == "beta_variance" and hasattr(critic_module, "v_head"):
+            if intermediate_mc_enabled and critic_head == "beta" and hasattr(critic_module, "v_head"):
                 summary = getattr(critic_module.v_head, "summary", None)
                 if not isinstance(summary, torch.nn.Linear):
                     raise RuntimeError("Beta intermediate MC requires a linear token value head with two outputs")
@@ -1704,9 +1711,14 @@ class CriticWorker(Worker, DistProfilerExtension):
         data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
         # perform forward computation
+        dp_group = self._get_data_parallel_group()
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on critic.compute_values
-            computed = self.critic.compute_values(data=data)
+            computed = self.critic.compute_values(
+                data=data,
+                dp_group=dp_group,
+                same_micro_num_in_dp=True,
+            )
             if isinstance(computed, tuple):
                 values, variances = computed
                 tensors = {"values": values}
@@ -1730,10 +1742,15 @@ class CriticWorker(Worker, DistProfilerExtension):
             load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=get_device_id())
 
         # perform forward computation
+        dp_group = self._get_data_parallel_group()
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on critic.update_critic
             with Timer(name="update_critic", logger=None) as timer:
-                metrics = self.critic.update_critic(data=data)
+                metrics = self.critic.update_critic(
+                    data=data,
+                    dp_group=dp_group,
+                    same_micro_num_in_dp=True,
+                )
             delta_time = timer.last
 
             global_num_tokens = data.meta_info["global_token_num"]

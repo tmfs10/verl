@@ -1,4 +1,4 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2026 NVIDIA Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,11 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .agent_loop import AgentLoopBase, AgentLoopManager, AgentLoopWorker, AsyncLLMServerManager
-from .intermediate_mc_agent_loop import IntermediateMCAgentLoop
-from .single_turn_agent_loop import SingleTurnAgentLoop
-from .tool_agent_loop import ToolAgentLoop
+defaults:
+  - ppo_trainer
+  - _self_
 
-_ = [IntermediateMCAgentLoop, SingleTurnAgentLoop, ToolAgentLoop]
+algorithm:
+  intermediate_mc_value:
+    enable: true
 
-__all__ = ["AgentLoopBase", "AgentLoopManager", "AsyncLLMServerManager", "AgentLoopWorker"]
+actor_rollout_ref:
+  actor:
+    policy_loss:
+      loss_mode: dppo_tv
+
+critic:
+  cliprange_value: 0.2
+
+trainer:
+  critic_warmup: 30

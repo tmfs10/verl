@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 
 from verl import DataProto
+from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.intermediate_mc_value import (
     beta_value_loss_components,
     scalar_value_loss_components,
@@ -16,6 +17,7 @@ from verl.utils.attention_utils import index_first_axis, pad_input, rearrange, u
 from verl.utils.device import get_device_id
 from verl.utils.py_functional import append_to_dict
 from verl.utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
+from verl.utils.torch_functional import masked_mean
 from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 from verl.workers.critic.dp_critic import DataParallelPPOCritic
 
@@ -26,10 +28,10 @@ class DataParallelIntermediateMCCritic(DataParallelPPOCritic):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         feature = self.config.intermediate_mc_value
-        self.recipe = str(feature["recipe"])
+        self.critic_head = str(feature["critic_head"])
         self.max_reward = float(feature["max_reward"])
         self.scalar_loss = str(feature["scalar_loss"])
-        self.value_clip_epsilon = float(feature["value_clip_epsilon"])
+        self.cliprange_value = float(self.config.cliprange_value)
         self.beta_target_epsilon = float(feature["beta_target_epsilon"])
 
     def _forward_context_micro_batch(self, micro_batch: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -115,21 +117,28 @@ class DataParallelIntermediateMCCritic(DataParallelPPOCritic):
         return logits.gather(dim=1, index=gather_index).float()
 
     def _distribution(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if self.recipe == "scalar_random":
+        if self.critic_head == "scalar":
             if logits.shape[-1] != 1:
                 raise RuntimeError(f"scalar critic expected one logit, got {tuple(logits.shape)}")
             return self.max_reward * torch.sigmoid(logits[..., 0].float()), None
-        if self.recipe != "beta_variance" or logits.shape[-1] != 2:
-            raise RuntimeError(f"Beta critic expected two logits, got recipe={self.recipe} shape={tuple(logits.shape)}")
+        if self.critic_head != "beta" or logits.shape[-1] != 2:
+            raise RuntimeError(
+                f"Beta critic expected two logits, got critic_head={self.critic_head} shape={tuple(logits.shape)}"
+            )
         normalized_mean = torch.sigmoid(logits[..., 0].float()).clamp(
-            torch.finfo(torch.float32).eps,
-            1.0 - torch.finfo(torch.float32).eps,
+            self.beta_target_epsilon,
+            1.0 - self.beta_target_epsilon,
         )
         mean = self.max_reward * normalized_mean
         q = torch.sigmoid(logits[..., 1].float())
         return mean, q * mean * (self.max_reward - mean)
 
-    def compute_values(self, data: DataProto) -> tuple[torch.Tensor, torch.Tensor | None]:
+    def compute_values(
+        self,
+        data: DataProto,
+        dp_group=None,
+        same_micro_num_in_dp: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self.critic_module.eval()
         keys = [
             "input_ids",
@@ -141,7 +150,12 @@ class DataParallelIntermediateMCCritic(DataParallelPPOCritic):
         data = data.select(batch_keys=keys)
         if data.meta_info["use_dynamic_bsz"]:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, batch_indices = prepare_dynamic_batch(data, max_token_len=max_token_len)
+            micro_batches, batch_indices = prepare_dynamic_batch(
+                data,
+                max_token_len=max_token_len,
+                dp_group=dp_group,
+                same_micro_num_in_dp=same_micro_num_in_dp,
+            )
         else:
             micro_batches = data.split(data.meta_info["micro_batch_size"])
             batch_indices = None
@@ -167,7 +181,12 @@ class DataParallelIntermediateMCCritic(DataParallelPPOCritic):
                 variances = restore_dynamic_batch(variances, batch_indices)
         return values, variances
 
-    def update_critic(self, data: DataProto) -> dict[str, object]:
+    def update_critic(
+        self,
+        data: DataProto,
+        dp_group=None,
+        same_micro_num_in_dp: bool = True,
+    ) -> dict[str, object]:
         self.critic_module.train()
         keys = [
             "input_ids",
@@ -187,7 +206,12 @@ class DataParallelIntermediateMCCritic(DataParallelPPOCritic):
             for mini_batch in mini_batches:
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    micro_batches, _ = prepare_dynamic_batch(
+                        mini_batch,
+                        max_token_len=max_token_len,
+                        dp_group=dp_group,
+                        same_micro_num_in_dp=same_micro_num_in_dp,
+                    )
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
@@ -202,39 +226,39 @@ class DataParallelIntermediateMCCritic(DataParallelPPOCritic):
                     targets = inputs["critic_targets"].float()
                     old_values = inputs["critic_old_values"].float()
                     target_mask = inputs["critic_target_mask"].float()
-                    selected = target_mask.bool()
-                    valid_count = selected.sum()
-                    if valid_count:
-                        selected_targets = targets[selected]
-                        selected_old_values = old_values[selected]
-                        if self.recipe == "scalar_random":
-                            components = scalar_value_loss_components(
-                                logits[..., 0][selected],
-                                selected_targets,
-                                selected_old_values,
-                                max_reward=self.max_reward,
-                                value_clip_epsilon=self.value_clip_epsilon,
-                                target_loss=self.scalar_loss,
-                            )
-                            predictions = components.values
-                        else:
-                            components = beta_value_loss_components(
-                                logits[selected],
-                                selected_targets,
-                                selected_old_values,
-                                max_reward=self.max_reward,
-                                value_clip_epsilon=self.value_clip_epsilon,
-                                beta_target_epsilon=self.beta_target_epsilon,
-                            )
-                            predictions = components.mean
-                        loss_matrix = torch.maximum(components.current_loss, components.clipped_loss)
-                        critic_loss = loss_matrix.mean()
-                        clip_fraction = (components.clipped_loss > components.current_loss).float().mean()
-                        prediction_mean = predictions.mean()
+                    if not torch.any(target_mask):
+                        raise RuntimeError("intermediate MC critic microbatch contains no supervised positions")
+                    if self.critic_head == "scalar":
+                        components = scalar_value_loss_components(
+                            logits[..., 0],
+                            targets,
+                            old_values,
+                            max_reward=self.max_reward,
+                            cliprange_value=self.cliprange_value,
+                            target_loss=self.scalar_loss,
+                        )
+                        predictions = components.values
                     else:
-                        critic_loss = logits.sum() * 0.0
-                        clip_fraction = logits.new_zeros(())
-                        prediction_mean = logits.new_zeros(())
+                        components = beta_value_loss_components(
+                            logits,
+                            targets,
+                            old_values,
+                            max_reward=self.max_reward,
+                            cliprange_value=self.cliprange_value,
+                            beta_target_epsilon=self.beta_target_epsilon,
+                        )
+                        predictions = components.mean
+                    loss_matrix = torch.maximum(components.current_loss, components.clipped_loss)
+                    critic_loss = agg_loss(
+                        loss_mat=loss_matrix,
+                        loss_mask=target_mask,
+                        loss_agg_mode=self.config.loss_agg_mode,
+                    )
+                    clip_fraction = masked_mean(
+                        (components.clipped_loss > components.current_loss).float(),
+                        target_mask,
+                    )
+                    prediction_mean = masked_mean(predictions, target_mask)
                     if self.config.use_dynamic_bsz:
                         loss_scale_factor = target_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:

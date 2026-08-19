@@ -11,9 +11,9 @@ done
 
 SMOKE_ROOT=${SMOKE_ROOT:-/home/siddjain/data/intermediate_mc_value_model/verl/smoke}
 GPU_COUNT=${GPU_COUNT:-2}
-RECIPES=${RECIPES:-"scalar_random beta_variance"}
+CELLS=${CELLS:-"scalar_random scalar_ema beta_variance"}
 BACKENDS=${BACKENDS:-"fsdp fsdp2"}
-RUN_RESUME=${RUN_RESUME:-1}
+RUN_RESUME=${RUN_RESUME:-0}
 DRY_RUN=${DRY_RUN:-0}
 NUM_CRITIQUES=${NUM_CRITIQUES:-2}
 TARGET_UPDATES=2
@@ -30,11 +30,22 @@ if [[ "$DRY_RUN" != "1" ]] && ! command -v nvidia-smi >/dev/null 2>&1; then
     exit 2
 fi
 
+cell_config() {
+    case "$1" in
+        scalar_random) printf '%s %s\n' scalar random ;;
+        scalar_ema) printf '%s %s\n' scalar ema ;;
+        beta_variance) printf '%s %s\n' beta variance ;;
+        *) echo "Unknown smoke cell: $1" >&2; return 2 ;;
+    esac
+}
+
 run_target() {
-    local recipe=$1
+    local cell=$1
     local backend=$2
     local run_dir=$3
     local total_steps=$4
+    local critic_head mark_selector
+    read -r critic_head mark_selector < <(cell_config "$cell")
     local audit_dir="$run_dir/audit"
     local checkpoint_dir="$run_dir/checkpoints"
     local log_file="$run_dir/train-to-${total_steps}.log"
@@ -43,21 +54,25 @@ run_target() {
         config_only=(--cfg job)
     fi
 
-    echo "[$recipe/$backend] training synchronously through update $total_steps"
-    python3 -m verl.trainer.main_ppo "${config_only[@]}" \
+    echo "[$cell/$backend] native RayPPO training through global step $total_steps"
+    python3 -m verl.trainer.main_ppo \
+        --config-name=intermediate_mc_ppo_trainer \
+        "${config_only[@]}" \
         algorithm.adv_estimator=gae \
+        algorithm.gamma=1.0 \
         algorithm.use_kl_in_reward=false \
-        algorithm.intermediate_mc_value.enable=true \
-        algorithm.intermediate_mc_value.recipe="$recipe" \
-        algorithm.intermediate_mc_value.actor_loss_mode=dppo_tv \
+        algorithm.intermediate_mc_value.critic_head="$critic_head" \
+        algorithm.intermediate_mc_value.mark_selector="$mark_selector" \
         algorithm.intermediate_mc_value.num_critiques="$NUM_CRITIQUES" \
         algorithm.intermediate_mc_value.continuations_per_mark=2 \
         algorithm.intermediate_mc_value.max_marks=1 \
-        algorithm.intermediate_mc_value.critic_warmup_updates=1 \
         algorithm.intermediate_mc_value.critique_max_response_length=64 \
         algorithm.intermediate_mc_value.mark_start_fraction=0.20 \
         algorithm.intermediate_mc_value.mark_end_fraction=0.80 \
         algorithm.intermediate_mc_value.min_mark_gap=1 \
+        algorithm.intermediate_mc_value.ema_baseline_token=1 \
+        algorithm.intermediate_mc_value.ema_ratio_up=1.000001 \
+        algorithm.intermediate_mc_value.ema_ratio_down=0.999999 \
         algorithm.intermediate_mc_value.variance_scope=rollout \
         algorithm.intermediate_mc_value.variance_random_probability=0.0 \
         algorithm.intermediate_mc_value.audit_output_dir="$audit_dir" \
@@ -80,9 +95,11 @@ run_target() {
         actor_rollout_ref.actor.use_kl_loss=false \
         actor_rollout_ref.rollout.name=vllm \
         actor_rollout_ref.rollout.n=1 \
+        actor_rollout_ref.rollout.max_model_len=1024 \
         actor_rollout_ref.rollout.temperature=1.0 \
         actor_rollout_ref.rollout.top_p=1.0 \
         actor_rollout_ref.rollout.top_k=-1 \
+        actor_rollout_ref.rollout.logprobs_mode=processed_logprobs \
         actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
         actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
         actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
@@ -94,16 +111,17 @@ run_target() {
         critic.model.tokenizer_path="$MODEL_PATH" \
         critic.model.use_remove_padding=true \
         critic.optim.lr=1.0e-5 \
+        critic.cliprange_value=0.2 \
         critic.ppo_mini_batch_size=2 \
         critic.ppo_micro_batch_size_per_gpu=1 \
         critic.forward_micro_batch_size_per_gpu=1 \
         critic.ppo_epochs=1 \
         reward.reward_model.enable=false \
         trainer.use_legacy_worker_impl=enable \
-        trainer.critic_warmup=0 \
+        trainer.critic_warmup=1 \
         trainer.logger='["console"]' \
         trainer.project_name=intermediate_mc_value_smoke \
-        trainer.experiment_name="${recipe}_${backend}" \
+        trainer.experiment_name="${cell}_${backend}" \
         trainer.default_local_dir="$checkpoint_dir" \
         trainer.n_gpus_per_node="$GPU_COUNT" \
         trainer.nnodes=1 \
@@ -115,33 +133,35 @@ run_target() {
         trainer.resume_mode=auto 2>&1 | tee "$log_file"
 }
 
-for recipe in $RECIPES; do
+for cell in $CELLS; do
+    read -r critic_head mark_selector < <(cell_config "$cell")
     for backend in $BACKENDS; do
-        run_dir="$SMOKE_ROOT/${recipe}_${backend}"
+        run_dir="$SMOKE_ROOT/${cell}_${backend}"
         done_marker="$run_dir/verified-${TARGET_UPDATES}.done"
         mkdir -p "$run_dir"
         if [[ -f "$done_marker" ]]; then
-            echo "[$recipe/$backend] already verified; skipping"
+            echo "[$cell/$backend] already verified; skipping"
             continue
         fi
 
-        run_target "$recipe" "$backend" "$run_dir" 2
+        run_target "$cell" "$backend" "$run_dir" 2
         if [[ "$DRY_RUN" == "1" ]]; then
-            echo "[$recipe/$backend] configuration dry-run complete"
+            echo "[$cell/$backend] configuration dry-run complete"
             continue
         fi
         if [[ "$RUN_RESUME" == "1" ]]; then
-            run_target "$recipe" "$backend" "$run_dir" 3
+            run_target "$cell" "$backend" "$run_dir" 3
         fi
 
         python3 smoke_tests/intermediate_mc_value/verify_audit.py \
             --audit-file "$run_dir/audit/intermediate_mc_value.jsonl" \
             --checkpoint-root "$run_dir/checkpoints" \
-            --recipe "$recipe" \
+            --critic-head "$critic_head" \
+            --mark-selector "$mark_selector" \
             --num-critiques "$NUM_CRITIQUES" \
-            --expected-critic-updates "$TARGET_UPDATES"
+            --expected-global-step "$TARGET_UPDATES"
         touch "$done_marker"
-        echo "[$recipe/$backend] verified"
+        echo "[$cell/$backend] verified"
     done
 done
 

@@ -117,14 +117,14 @@ algorithm:
     # Structured configuration target.
     _target_: verl.trainer.config.IntermediateMCValueConfig
 
-    # Enable the dedicated synchronous trainer path.
+    # Enable synchronous self-critique and intermediate continuation supervision.
     enable: false
 
-    # Closed recipe selector: scalar_random or beta_variance.
-    recipe: scalar_random
+    # Critic parameterization: scalar or beta.
+    critic_head: scalar
 
-    # VeRL-native actor objective. DPPO-Binary-TV is the feature default.
-    actor_loss_mode: dppo_tv
+    # Mark selector: random, ema, or variance. Variance requires a beta critic.
+    mark_selector: random
 
     # Number of independent critiques sampled for each solution.
     num_critiques: 4
@@ -132,11 +132,8 @@ algorithm:
     # Number of continuation suffixes sampled for every selected mark.
     continuations_per_mark: 1
 
-    # Maximum selected marks in one configured variance scope; zero disables continuations.
-    max_marks: 1
-
-    # Completed critic update calls before actor training begins.
-    critic_warmup_updates: 30
+    # Maximum selected marks; null resolves to 4 for EMA and 1 otherwise. Zero disables continuations.
+    max_marks: null
 
     # Critique token cap; null inherits data.max_response_length.
     critique_max_response_length: null
@@ -149,6 +146,21 @@ algorithm:
 
     # Minimum token distance between marks in one rollout.
     min_mark_gap: 32
+
+    # EMA coefficient over behavior-policy token probabilities.
+    ema_alpha: 0.1
+
+    # First one-indexed token eligible to establish the EMA reference.
+    ema_baseline_token: 32
+
+    # Positive floor used in EMA ratios.
+    ema_floor: 1.0e-4
+
+    # EMA upward ratio threshold.
+    ema_ratio_up: 2.0
+
+    # EMA downward ratio threshold.
+    ema_ratio_down: 0.5
 
     # Variance selection scope: rollout, prompt, or batch.
     variance_scope: rollout
@@ -164,9 +176,6 @@ algorithm:
 
     # Scalar critic loss: mse or bce.
     scalar_loss: mse
-
-    # PPO-style normalized value clipping epsilon.
-    value_clip_epsilon: 0.2
 
     # Open-interval target transform for Beta likelihood.
     beta_target_epsilon: 1.0e-4

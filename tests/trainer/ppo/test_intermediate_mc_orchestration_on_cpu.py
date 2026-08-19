@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
+import asyncio
 from types import SimpleNamespace
 
 import numpy as np
@@ -21,54 +21,80 @@ import torch
 from omegaconf import OmegaConf
 
 from verl import DataProto
+from verl.experimental.agent_loop.intermediate_mc_agent_loop import (
+    INTERMEDIATE_MC_CHILD_FIELD,
+    ContinuationGeneration,
+    CritiqueGeneration,
+    IntermediateMCAgentLoop,
+    IntermediateMCGenerationRecord,
+)
 from verl.trainer.config import IntermediateMCValueConfig
 from verl.trainer.ppo.intermediate_mc_value import build_critic_context
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.ray_trainer_intermediate_mc import (
-    IntermediateMCRayPPOTrainer,
+    IntermediateMCValueController,
     _Bundle,
     validate_intermediate_mc_runtime_config,
 )
+from verl.workers.rollout.replica import TokenOutput
 
 
-def _trainer(recipe="scalar_random", warmup=30, continuations_per_mark=1):
-    trainer = IntermediateMCRayPPOTrainer.__new__(IntermediateMCRayPPOTrainer)
-    trainer.feature = IntermediateMCValueConfig(
-        recipe=recipe,
-        num_critiques=2,
-        continuations_per_mark=continuations_per_mark,
-        critic_warmup_updates=warmup,
+class _Tokenizer:
+    pad_token_id = 0
+    eos_token_id = 9
+
+
+def _controller(*, num_critiques=2, critic_head="scalar", mark_selector="random"):
+    controller = IntermediateMCValueController.__new__(IntermediateMCValueController)
+    controller.feature = IntermediateMCValueConfig(
+        num_critiques=num_critiques,
+        critic_head=critic_head,
+        mark_selector=mark_selector,
+        continuations_per_mark=2,
+        max_marks=1,
+        min_mark_gap=1,
     )
-    trainer.config = SimpleNamespace(
-        algorithm=SimpleNamespace(gamma=1.0, lam=1.0),
-        actor_rollout_ref=SimpleNamespace(
-            actor=SimpleNamespace(ppo_mini_batch_size=1),
-            rollout=SimpleNamespace(n=1, prompt_length=4, response_length=5),
-        ),
-        critic=SimpleNamespace(
-            ppo_mini_batch_size=1,
-            forward_micro_batch_size_per_gpu=1,
-            forward_max_token_len_per_gpu=1024,
-            use_dynamic_bsz=False,
-        ),
+    controller.config = OmegaConf.create(
+        {
+            "algorithm": {"gamma": 1.0, "lam": 1.0},
+            "actor_rollout_ref": {
+                "actor": {"ppo_mini_batch_size": 1},
+                "rollout": {
+                    "n": 1,
+                    "prompt_length": 8,
+                    "response_length": 8,
+                    "max_model_len": 64,
+                },
+            },
+            "critic": {
+                "ppo_mini_batch_size": 1,
+                "forward_micro_batch_size_per_gpu": 1,
+                "forward_max_token_len_per_gpu": 1024,
+                "use_dynamic_bsz": False,
+            },
+            "trainer": {"critic_warmup": 2, "balance_batch": False},
+        }
     )
-    trainer.tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=9)
-    trainer.global_steps = 7
-    trainer.critic_update_count = 0
-    trainer._tokenizer_fingerprint = "tokenizer"
-    trainer._audit_path = None
-    return trainer
+    controller.tokenizer = _Tokenizer()
+    controller.critique_delimiter_ids = [6]
+    controller.solution_delimiter_ids = [7]
+    controller.critique_instruction_ids = [30, 31]
+    controller.critic_context_limit = 64
+    controller.audit_path = None
+    controller.trainer = SimpleNamespace(global_steps=1)
+    return controller
 
 
-def _bundle(reward=1.0):
+def _bundle(*, reward=1.0, num_critiques=2):
     contexts = [
         build_critic_context(
-            [1],
-            [2],
-            [3, 4, 5],
+            [11, 12],
+            [40 + index, 50 + index],
+            [21, 22, 23],
             critique_delimiter_ids=[6],
             solution_delimiter_ids=[7],
         )
-        for _ in range(2)
+        for index in range(num_critiques)
     ]
     return _Bundle(
         order=0,
@@ -76,99 +102,157 @@ def _bundle(reward=1.0):
         rollout_id="rollout",
         prompt_group_id="prompt",
         source_row=0,
-        prompt_ids=[1],
-        solution_ids=[3, 4, 5],
+        prompt_ids=[11, 12],
+        solution_ids=[21, 22, 23],
+        solution_log_probs=[-0.1, -0.2, -0.3],
         terminal_reward=reward,
+        critique_ids=[[40 + index, 50 + index] for index in range(num_critiques)],
+        critique_log_probs=[[-0.4, -0.5] for _ in range(num_critiques)],
         contexts=contexts,
-        critic_values=[[0.2, 0.4, 0.6, 0.8], [0.4, 0.6, 0.8, 1.0]],
+        critic_values=[
+            [0.2 + 0.1 * index, 0.4 + 0.1 * index, 0.6 + 0.1 * index, 0.8 + 0.1 * index]
+            for index in range(num_critiques)
+        ],
+        critic_variances=[None] * num_critiques,
     )
 
 
-def test_warmup_supervises_only_terminal_solution_position() -> None:
-    trainer = _trainer()
+def _source() -> DataProto:
+    prompts = torch.tensor([[0, 11, 12]])
+    responses = torch.tensor([[21, 22, 23, 0, 0, 0, 0, 0]])
+    response_mask = torch.tensor([[1, 1, 1, 0, 0, 0, 0, 0]])
+    attention_mask = torch.tensor([[0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0]])
+    return DataProto.from_dict(
+        tensors={
+            "prompts": prompts,
+            "responses": responses,
+            "response_mask": response_mask,
+            "input_ids": torch.cat([prompts, responses], dim=1),
+            "attention_mask": attention_mask,
+            "position_ids": torch.tensor([[0, 0, 1, 2, 3, 4, 0, 0, 0, 0, 0]]),
+            "rollout_log_probs": torch.tensor([[-0.1, -0.2, -0.3, 0.0, 0.0, 0.0, 0.0, 0.0]]),
+            "advantages": torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0]]),
+        },
+        non_tensors={
+            "raw_prompt": np.array([[{"role": "user", "content": "q"}]], dtype=object),
+            "intermediate_mc_rollout_id": np.array(["rollout"], dtype=object),
+        },
+    )
+
+
+def test_critic_targets_train_s0_dense_states_and_eos_for_every_critique() -> None:
+    controller = _controller()
     bundle = _bundle()
-    critic_batch, mapping = trainer._make_critic_batch([bundle])
-    trainer._set_warmup_targets(critic_batch, mapping, [bundle])
-    assert critic_batch.batch["critic_target_mask"].tolist() == [
-        [0.0, 0.0, 0.0, 1.0],
-        [0.0, 0.0, 0.0, 1.0],
+    bundle.per_mark_targets = {2: 0.5}
+    bundle.dense_targets = {1: 0.5, 2: 0.5}
+    batch = controller._make_critic_batch([bundle])
+    controller._set_critic_targets(batch, [bundle])
+    assert batch.batch["critic_target_mask"].tolist() == [
+        [1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0],
     ]
-    assert critic_batch.batch["critic_targets"][:, 3].tolist() == [1.0, 1.0]
+    assert batch.batch["critic_targets"][0].tolist() == pytest.approx([0.75, 0.5, 0.5, 1.0])
 
 
-def test_dense_marks_supervise_earlier_tokens_and_never_delimiter() -> None:
-    trainer = _trainer()
-    bundle = _bundle()
-    bundle.dense_targets = {1: 0.25, 2: 0.75}
-    critic_batch, mapping = trainer._make_critic_batch([bundle])
-    trainer._set_training_targets(critic_batch, mapping, [bundle])
-    assert critic_batch.batch["critic_target_mask"].tolist() == [
-        [0.0, 1.0, 1.0, 1.0],
-        [0.0, 1.0, 1.0, 1.0],
+def test_warmup_and_all_failed_marks_train_s0_and_eos_only() -> None:
+    controller = _controller()
+    bundle = _bundle(reward=0.25)
+    batch = controller._make_critic_batch([bundle])
+    controller._set_critic_targets(batch, [bundle])
+    assert batch.batch["critic_target_mask"].tolist() == [
+        [1.0, 0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0, 1.0],
     ]
-    assert critic_batch.batch["critic_targets"][0].tolist() == [0.0, 0.25, 0.75, 1.0]
+    assert batch.batch["critic_targets"][:, [0, 3]].tolist() == [[0.25, 0.25], [0.25, 0.25]]
 
 
-def test_solution_advantages_average_critiques_and_use_unsupervised_delimiter() -> None:
-    trainer = _trainer()
-    advantages = trainer._solution_advantages([_bundle()], response_width=5)
-    assert advantages.shape == (1, 5)
-    assert torch.count_nonzero(advantages[:, 3:]) == 0
-    # Whitening is over exactly the three solution tokens.
-    torch.testing.assert_close(advantages[0, :3].mean(), torch.tensor(0.0), atol=1e-6, rtol=0)
-    torch.testing.assert_close(advantages[0, :3].var(unbiased=False), torch.tensor(1.0), atol=1e-6, rtol=0)
-
-
-def test_checkpoint_contract_restores_exact_critic_update_count(tmp_path) -> None:
-    trainer = _trainer(recipe="beta_variance")
-    trainer.critic_update_count = 29
-    trainer._save_additional_trainer_state(str(tmp_path))
-    state = json.loads((tmp_path / trainer.STATE_FILENAME).read_text())
-    assert state["critic_update_count"] == 29
-    trainer._validate_additional_trainer_state(str(tmp_path))
-    trainer.critic_update_count = 0
-    trainer._load_additional_trainer_state(str(tmp_path))
-    assert trainer.critic_update_count == 29
-
-
-def test_checkpoint_contract_mismatch_fails_before_restore(tmp_path) -> None:
-    trainer = _trainer(recipe="scalar_random")
-    trainer._save_additional_trainer_state(str(tmp_path))
-    incompatible = _trainer(recipe="beta_variance")
-    with pytest.raises(RuntimeError, match="contract"):
-        incompatible._validate_additional_trainer_state(str(tmp_path))
-
-
-def test_dummy_critic_padding_has_zero_target_mass() -> None:
-    trainer = _trainer()
-    trainer.config.critic.ppo_mini_batch_size = 4
-    bundle = _bundle()
-    critic_batch, mapping = trainer._make_critic_batch([bundle])
-    trainer._set_warmup_targets(critic_batch, mapping, [bundle])
-    padded = trainer._pad_critic_batch(critic_batch)
-    assert len(padded) == 4
-    assert padded.batch["critic_target_mask"][-2:].sum().item() == 0.0
-
-
-def test_continuation_rows_are_not_part_of_actor_key_contract() -> None:
-    assert IntermediateMCRayPPOTrainer._actor_keys() == [
-        "prompts",
-        "responses",
-        "response_mask",
-        "input_ids",
-        "attention_mask",
-        "position_ids",
-        "rollout_log_probs",
-    ]
-    assert "continuation" not in " ".join(IntermediateMCRayPPOTrainer._actor_keys())
-
-
-def test_context_batch_positions_include_delimiter_then_every_solution_token() -> None:
-    trainer = _trainer()
-    batch, _ = trainer._make_critic_batch([_bundle()])
-    assert batch.batch["critic_positions"][0].tolist() == [3, 4, 5, 6]
+def test_critic_batch_preserves_explicit_s0_plus_solution_positions() -> None:
+    batch = _controller()._make_critic_batch([_bundle()])
+    assert batch.batch["critic_positions"][0].tolist() == [5, 6, 7, 8]
     assert batch.batch["critic_position_mask"][0].tolist() == [1.0, 1.0, 1.0, 1.0]
     assert isinstance(batch, DataProto)
+
+
+def test_actor_packing_has_one_real_prompt_token_and_only_output_tokens_train() -> None:
+    controller = _controller()
+    actor_batch = controller._make_actor_batch(_source(), [_bundle()])
+    assert len(actor_batch) == 3
+    assert actor_batch.batch["prompts"].shape[1] == 1
+    assert actor_batch.non_tensor_batch["intermediate_mc_actor_kind"].tolist() == [
+        "solution",
+        "critique",
+        "critique",
+    ]
+    assert actor_batch.batch["response_mask"][0].tolist() == [0, 1, 1, 1, 0, 0, 0, 0]
+    assert actor_batch.batch["response_mask"][1].tolist() == [0, 0, 0, 0, 0, 0, 1, 1]
+    torch.testing.assert_close(actor_batch.batch["old_log_probs"], actor_batch.batch["rollout_log_probs"])
+    assert actor_batch.batch["response_mask"].sum().item() == 3 + 2 + 2
+    assert "continuation" not in actor_batch.non_tensor_batch["intermediate_mc_actor_kind"].tolist()
+
+
+def _causal_log_probs(input_ids: torch.Tensor, seed: int = 3) -> torch.Tensor:
+    generator = torch.Generator().manual_seed(seed)
+    embedding = torch.randn(64, 7, generator=generator)
+    projection = torch.randn(7, 64, generator=generator)
+    hidden = embedding[input_ids].cumsum(dim=0)
+    logits = hidden[:-1] @ projection
+    return torch.log_softmax(logits, dim=-1).gather(1, input_ids[1:].unsqueeze(1)).squeeze(1)
+
+
+def test_packed_and_conventional_causal_log_probs_are_identical() -> None:
+    actor_batch = _controller()._make_actor_batch(_source(), [_bundle()])
+    full = torch.tensor([11, 12, 21, 22, 23])
+    conventional = _causal_log_probs(full)[1:]
+    packed_full = actor_batch.batch["input_ids"][0, : len(full)]
+    packed_all = _causal_log_probs(packed_full)
+    packed = packed_all[actor_batch.batch["response_mask"][0, : len(full) - 1].bool()]
+    torch.testing.assert_close(packed, conventional)
+
+
+def test_optimizer_batches_fail_instead_of_adding_dummy_rows() -> None:
+    controller = _controller()
+    controller.trainer = SimpleNamespace(_get_dp_size=lambda _worker, _role: 2)
+    controller.config.actor_rollout_ref.actor.ppo_mini_batch_size = 2
+    batch = controller._make_actor_batch(_source(), [_bundle()])
+    with pytest.raises(ValueError, match="optimizer padding is forbidden"):
+        controller._validate_optimizer_batch(batch, role="actor", worker_group=object())
+    assert len(batch) == 3
+
+
+def test_native_warmup_uses_global_step_without_feature_checkpoint_state() -> None:
+    controller = _controller()
+    batch = DataProto.from_dict(non_tensors={"prompt_group_id": np.array(["p", "p"], dtype=object)})
+    controller.trainer.global_steps = 2
+    controller.prepare_generation_batch(batch)
+    assert batch.non_tensor_batch["intermediate_mc_warmup"].tolist() == [True, True]
+    controller.trainer.global_steps = 3
+    controller.prepare_generation_batch(batch)
+    assert batch.non_tensor_batch["intermediate_mc_warmup"].tolist() == [False, False]
+    assert not hasattr(RayPPOTrainer, "_save_additional_trainer_state")
+
+
+def test_child_record_is_extracted_once_and_removed_before_reward_logging() -> None:
+    controller = _controller()
+    record = IntermediateMCGenerationRecord(
+        rollout_id="r",
+        critiques=(CritiqueGeneration((1,), (-0.1,)), CritiqueGeneration((2,), (-0.2,))),
+        selected_marks=(1,),
+        continuations=(ContinuationGeneration(1, 0, (3,)),),
+        failed_continuations=(),
+        selector_diagnostics=(),
+    )
+    values = np.empty(1, dtype=object)
+    values[0] = record
+    # Real generation outputs always have a tensor batch; retain that invariant so
+    # DataProto.__len__ continues to identify the one generated solution after the
+    # controller removes its private non-tensor child record.
+    output = DataProto.from_dict(
+        tensors={"responses": torch.ones((1, 1), dtype=torch.long)},
+        non_tensors={INTERMEDIATE_MC_CHILD_FIELD: values},
+    )
+    extracted = controller.extract_generation_records(output)
+    assert extracted == {"r": record}
+    assert INTERMEDIATE_MC_CHILD_FIELD not in output.non_tensor_batch
 
 
 def _runtime_config():
@@ -178,31 +262,44 @@ def _runtime_config():
                 "intermediate_mc_value": {
                     "_target_": "verl.trainer.config.IntermediateMCValueConfig",
                     "enable": True,
-                    "recipe": "scalar_random",
-                    "actor_loss_mode": "dppo_tv",
+                    "critic_head": "scalar",
+                    "mark_selector": "random",
                 },
                 "adv_estimator": "gae",
+                "gamma": 1.0,
                 "use_kl_in_reward": False,
                 "rollout_correction": {"rollout_is": None, "rollout_rs": None, "bypass_mode": False},
                 "opsd": {"enable": False},
             },
             "actor_rollout_ref": {
+                "model": {"trust_remote_code": False, "override_config": {}},
                 "actor": {
                     "strategy": "fsdp",
                     "use_kl_loss": False,
                     "use_rollout_log_probs": False,
+                    "use_prefix_grouper": False,
+                    "router_replay": {"mode": "none"},
                     "policy_loss": {"loss_mode": "vanilla"},
                 },
                 "rollout": {
+                    "name": "vllm",
                     "n": 1,
                     "temperature": 1.0,
                     "calculate_log_probs": False,
+                    "max_model_len": 64,
+                    "logprobs_mode": "processed_logprobs",
+                    "skip_rollout": False,
+                    "enable_rollout_routing_replay": False,
                     "multi_turn": {"enable": False},
                     "val_kwargs": {"temperature": 1.0},
                 },
             },
-            "critic": {"strategy": "fsdp", "enable": None},
-            "trainer": {"use_legacy_worker_impl": "auto", "critic_warmup": 0},
+            "critic": {
+                "strategy": "fsdp",
+                "enable": None,
+                "cliprange_value": 0.2,
+            },
+            "trainer": {"use_legacy_worker_impl": "auto", "critic_warmup": 30},
             "reward": {
                 "reward_model": {
                     "enable": False,
@@ -212,18 +309,22 @@ def _runtime_config():
                     "reward_loop_class_name": None,
                 }
             },
-            "data": {"use_dataset_responses": False},
+            "data": {
+                "use_dataset_responses": False,
+                "max_prompt_length": 16,
+                "max_response_length": 16,
+            },
         }
     )
 
 
-def test_runtime_config_forces_recorded_behavior_probs_and_dppo_default() -> None:
+def test_runtime_config_keeps_native_loss_and_enables_behavior_log_probs() -> None:
     config = _runtime_config()
     validate_intermediate_mc_runtime_config(config)
     assert config.critic.enable is True
     assert config.actor_rollout_ref.rollout.calculate_log_probs is True
     assert config.actor_rollout_ref.actor.use_rollout_log_probs is True
-    assert config.actor_rollout_ref.actor.policy_loss.loss_mode == "dppo_tv"
+    assert config.actor_rollout_ref.actor.policy_loss.loss_mode == "vanilla"
 
 
 def test_disabled_runtime_config_is_a_strict_noop() -> None:
@@ -233,124 +334,104 @@ def test_disabled_runtime_config_is_a_strict_noop() -> None:
     assert config.critic.enable is None
     assert config.actor_rollout_ref.rollout.calculate_log_probs is False
     assert config.actor_rollout_ref.actor.use_rollout_log_probs is False
-    assert config.actor_rollout_ref.actor.policy_loss.loss_mode == "vanilla"
 
 
-def test_runtime_config_rejects_rollout_correction_and_non_unit_temperature() -> None:
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        ("algorithm.gamma", 0.99, "gamma=1"),
+        ("actor_rollout_ref.rollout.temperature", 0.9, "temperature=1.0"),
+        ("actor_rollout_ref.rollout.max_model_len", None, "explicit positive"),
+        ("reward.reward_model.launch_reward_fn_async", True, "blocking iteration barrier"),
+    ],
+)
+def test_runtime_config_rejects_unsupported_modes(path, value, message) -> None:
     config = _runtime_config()
-    config.algorithm.rollout_correction.rollout_is = "sequence"
-    with pytest.raises(ValueError, match="rollout correction"):
-        validate_intermediate_mc_runtime_config(config)
-    config = _runtime_config()
-    config.actor_rollout_ref.rollout.temperature = 0.9
-    with pytest.raises(ValueError, match="temperature=1.0"):
+    OmegaConf.update(config, path, value)
+    with pytest.raises(ValueError, match=message):
         validate_intermediate_mc_runtime_config(config)
 
 
-def test_actor_batch_contains_only_solutions_and_critiques_with_behavior_denominator() -> None:
-    trainer = _trainer()
-    width = 5
-    tensor_row = {
-        "prompts": torch.tensor([[0, 1]]),
-        "responses": torch.tensor([[3, 4, 5, 0, 0]]),
-        "response_mask": torch.tensor([[1, 1, 1, 0, 0]]),
-        "input_ids": torch.tensor([[0, 1, 3, 4, 5, 0, 0]]),
-        "attention_mask": torch.tensor([[0, 1, 1, 1, 1, 0, 0]]),
-        "position_ids": torch.tensor([[0, 0, 1, 2, 3, 0, 0]]),
-        "rollout_log_probs": torch.tensor([[-0.1, -0.2, -0.3, 0.0, 0.0]]),
-    }
-    source = DataProto.from_dict(
-        tensors=tensor_row,
-        non_tensors={"source_only": np.array(["solution"], dtype=object)},
+def _agent_loop(*, include_critiques=True):
+    loop = IntermediateMCAgentLoop.__new__(IntermediateMCAgentLoop)
+    loop.feature = IntermediateMCValueConfig(
+        num_critiques=2,
+        continuations_per_mark=2,
+        max_marks=1,
+        min_mark_gap=1,
     )
-    bundle = _bundle()
-    bundle.critique_rows = []
-    for offset in (0.0, 1.0):
-        critique_tensors = {key: value.clone() for key, value in tensor_row.items()}
-        critique_tensors["rollout_log_probs"] += offset
-        bundle.critique_rows.append(
-            DataProto.from_dict(
-                tensors=critique_tensors,
-                non_tensors={"critique_only": np.array([offset], dtype=object)},
+    loop.response_length = 8
+    loop.max_model_len = 64
+    loop.critique_instruction_ids = [30]
+    loop.critique_delimiter_ids = [31]
+    loop.solution_delimiter_ids = [32]
+    return loop
+
+
+def test_sampling_parameters_force_temperature_processed_logprobs_and_explicit_cap() -> None:
+    params = IntermediateMCAgentLoop._sampling_params(
+        {"temperature": 0.4, "logprobs": False, "max_new_tokens": 99},
+        max_tokens=7,
+    )
+    assert params["temperature"] == 1.0
+    assert params["logprobs"] is True
+    assert params["max_tokens"] == 7
+    assert "max_new_tokens" not in params
+
+
+def test_critique_failure_drains_every_child_before_raising() -> None:
+    loop = _agent_loop()
+    completed: list[str] = []
+    route_keys: list[str] = []
+
+    async def fake_generate(route_key, _prompt, _params, *, max_tokens, kind):
+        route_keys.append(route_key)
+        await asyncio.sleep(0.002 if kind == "critique[0]" else 0.005)
+        completed.append(kind)
+        if kind == "critique[0]":
+            raise RuntimeError("injected critique failure")
+        return TokenOutput(token_ids=[1], log_probs=[-0.1])
+
+    loop._generate = fake_generate
+    with pytest.raises(RuntimeError, match="after draining"):
+        asyncio.run(
+            loop._generate_children(
+                route_key="sticky",
+                prompt_ids=[10],
+                solution_ids=[20, 21, 22],
+                solution_log_probs=[-0.1, -0.2, -0.3],
+                selected_marks=[1],
+                sampling_params={"temperature": 1.0},
+                critic_context_limit=64,
+                include_critiques=True,
             )
         )
-    actor_batch = trainer._make_actor_batch(source, [bundle])
-    assert len(actor_batch) == 3
-    assert actor_batch.non_tensor_batch == {}
-    torch.testing.assert_close(actor_batch.batch["old_log_probs"], actor_batch.batch["rollout_log_probs"])
-    assert actor_batch.batch["response_mask"].shape == (3, width)
+    assert len(completed) == 4
+    assert route_keys == ["sticky"] * 4
 
 
-class _CheckpointManager:
-    def __init__(self):
-        self.sleep_calls = 0
+def test_individual_continuation_failure_is_omitted_after_drain() -> None:
+    loop = _agent_loop()
 
-    def sleep_replicas(self) -> None:
-        self.sleep_calls += 1
+    async def fake_generate(_route_key, _prompt, _params, *, max_tokens, kind):
+        await asyncio.sleep(0)
+        if kind.endswith(",0]"):
+            raise RuntimeError("injected continuation failure")
+        return TokenOutput(token_ids=[7], log_probs=[-0.1])
 
-
-def _request_source() -> DataProto:
-    raw_prompt = np.empty(1, dtype=object)
-    raw_prompt[0] = [{"role": "user", "content": "q"}]
-    return DataProto.from_dict(non_tensors={"raw_prompt": raw_prompt})
-
-
-def _generated_continuation_row() -> DataProto:
-    return DataProto.from_dict(
-        tensors={
-            "prompts": torch.tensor([[0, 0, 0, 1]]),
-            "responses": torch.tensor([[8, 9, 0, 0, 0]]),
-            "response_mask": torch.tensor([[1, 1, 0, 0, 0]]),
-            "rollout_log_probs": torch.tensor([[-0.1, -0.2, 0.0, 0.0, 0.0]]),
-            "attention_mask": torch.tensor([[0, 0, 0, 1, 1, 1, 0, 0, 0]]),
-            "input_ids": torch.tensor([[0, 0, 0, 1, 8, 9, 0, 0, 0]]),
-            "position_ids": torch.tensor([[0, 0, 0, 0, 1, 2, 0, 0, 0]]),
-        }
+    loop._generate = fake_generate
+    critiques, continuations, failures, _ = asyncio.run(
+        loop._generate_children(
+            route_key="sticky",
+            prompt_ids=[10],
+            solution_ids=[20, 21, 22],
+            solution_log_probs=[-0.1, -0.2, -0.3],
+            selected_marks=[1],
+            sampling_params={"temperature": 1.0},
+            critic_context_limit=64,
+            include_critiques=False,
+        )
     )
-
-
-def test_continuation_generation_failure_still_sleeps_inference_replicas() -> None:
-    trainer = _trainer()
-    trainer.checkpoint_manager = _CheckpointManager()
-    bundle = _bundle()
-    bundle.marks = [1]
-
-    def fail_generation(_request, **_kwargs):
-        raise RuntimeError("injected generation failure")
-
-    trainer._generate_rows_with_isolation = fail_generation
-    with pytest.raises(RuntimeError, match="injected"):
-        trainer._run_continuations(_request_source(), [bundle])
-    assert trainer.checkpoint_manager.sleep_calls == 1
-
-
-def test_partial_continuation_failure_averages_only_successes() -> None:
-    trainer = _trainer(continuations_per_mark=2)
-    trainer.checkpoint_manager = _CheckpointManager()
-    bundle = _bundle()
-    bundle.marks = [1]
-    captured_prompts = []
-
-    def generate(request, **_kwargs):
-        captured_prompts.extend(request.non_tensor_batch["prompt_ids_override"].tolist())
-        return [_generated_continuation_row(), None]
-
-    trainer._generate_rows_with_isolation = generate
-    trainer._continuation_rewards_with_isolation = lambda _batch: [0.75]
-    trainer._run_continuations(_request_source(), [bundle])
-    assert trainer.checkpoint_manager.sleep_calls == 1
-    assert captured_prompts == [[1, 3], [1, 3]]
-    assert bundle.per_mark_targets == {1: 0.75}
-    assert bundle.dense_targets == {1: 0.75}
-
-
-def test_all_failed_continuations_omit_the_mark() -> None:
-    trainer = _trainer(continuations_per_mark=2)
-    trainer.checkpoint_manager = _CheckpointManager()
-    bundle = _bundle()
-    bundle.marks = [1]
-    trainer._generate_rows_with_isolation = lambda _request, **_kwargs: [None, None]
-    trainer._run_continuations(_request_source(), [bundle])
-    assert trainer.checkpoint_manager.sleep_calls == 1
-    assert bundle.per_mark_targets == {}
-    assert bundle.dense_targets == {}
+    assert critiques == ()
+    assert [(item.mark, item.sample_index) for item in continuations] == [(1, 1)]
+    assert failures == ((1, 0),)

@@ -22,16 +22,15 @@ import json
 import math
 from pathlib import Path
 
-STATE_FILENAME = "intermediate_mc_value_state.json"
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audit-file", type=Path, required=True)
     parser.add_argument("--checkpoint-root", type=Path, required=True)
-    parser.add_argument("--recipe", choices=("scalar_random", "beta_variance"), required=True)
+    parser.add_argument("--critic-head", choices=("scalar", "beta"), required=True)
+    parser.add_argument("--mark-selector", choices=("random", "ema", "variance"), required=True)
     parser.add_argument("--num-critiques", type=int, required=True)
-    parser.add_argument("--expected-critic-updates", type=int, required=True)
+    parser.add_argument("--expected-global-step", type=int, required=True)
     parser.add_argument("--max-reward", type=float, default=1.0)
     return parser.parse_args()
 
@@ -54,22 +53,19 @@ def load_jsonl(path: Path) -> list[dict[str, object]]:
                 raise AssertionError(f"invalid audit JSON at {path}:{line_number}: {error}") from error
             require(isinstance(row, dict), f"audit row {line_number} is not an object")
             rows.append(row)
-    require(rows, f"empty audit file: {path}")
+    require(bool(rows), f"empty audit file: {path}")
     return rows
 
 
-def latest_feature_state(checkpoint_root: Path) -> tuple[Path, dict[str, object]]:
-    candidates = list(checkpoint_root.glob(f"global_step_*/{STATE_FILENAME}"))
-    require(bool(candidates), f"no {STATE_FILENAME} beneath {checkpoint_root}")
+def latest_native_checkpoint(checkpoint_root: Path) -> tuple[int, Path]:
+    candidates = [path for path in checkpoint_root.glob("global_step_*") if path.is_dir()]
+    require(bool(candidates), f"no native global_step checkpoint beneath {checkpoint_root}")
 
     def step(path: Path) -> int:
-        return int(path.parent.name.removeprefix("global_step_"))
+        return int(path.name.removeprefix("global_step_"))
 
     path = max(candidates, key=step)
-    with path.open(encoding="utf-8") as handle:
-        state = json.load(handle)
-    require(isinstance(state, dict), f"invalid checkpoint state: {path}")
-    return path, state
+    return step(path), path
 
 
 def main() -> None:
@@ -80,61 +76,68 @@ def main() -> None:
         by_event.setdefault(str(row.get("event")), []).append(row)
 
     warmup = by_event.get("warmup", [])
-    require(warmup, "warmup phase was not audited")
+    require(bool(warmup), "critic-only warmup was not audited")
     require(all(row.get("continuations") == 0 for row in warmup), "warmup requested a continuation")
 
     actor_batches = by_event.get("actor_batch", [])
-    require(actor_batches, "post-warmup actor update was not audited")
+    require(bool(actor_batches), "post-warmup actor update was not audited")
     for row in actor_batches:
         require(row.get("continuations") == 0, "a continuation entered an actor batch")
+        require(row.get("padding") == 0, "actor optimizer batch contains dummy padding")
         solutions = int(row["solutions"])
         critiques = int(row["critiques"])
         require(critiques == solutions * args.num_critiques, "actor critique multiplicity is incorrect")
 
-    selections = by_event.get("mark_selection", [])
-    require(selections, "no nonterminal mark was selected")
-    if args.recipe == "scalar_random":
-        require(all(row.get("reason") == "random" for row in selections), "scalar recipe used a non-random mark")
+    selections = [row for row in by_event.get("mark_selection", []) if row.get("reason") != "ema_summary"]
+    require(bool(selections), "no nonterminal mark was selected")
+    if args.mark_selector == "random":
+        require(all(row.get("reason") == "random" for row in selections), "random selector used another reason")
+    elif args.mark_selector == "ema":
+        require(
+            all(row.get("reason") in {"ema_up", "ema_down"} for row in selections),
+            "EMA selector used an unknown reason",
+        )
+        require(all(math.isfinite(float(row["ratio"])) for row in selections), "EMA ratio is non-finite")
     else:
+        require(args.critic_head == "beta", "variance selection did not use a Beta critic")
         require(
             all(row.get("reason") in {"variance", "random_fallback"} for row in selections),
-            "Beta recipe used an unknown selection reason",
+            "variance selector used an unknown reason",
         )
-        for row in selections:
-            variance = float(row["variance"])
-            require(math.isfinite(variance) and variance >= 0.0, "invalid selected variance")
+        require(
+            all(math.isfinite(float(row["variance"])) and float(row["variance"]) >= 0 for row in selections),
+            "selected variance is invalid",
+        )
 
     continuations = by_event.get("continuation", [])
-    require(continuations, "no continuation completed")
+    require(bool(continuations), "no continuation completed")
     for row in continuations:
         reward = float(row["reward"])
-        require(0.0 <= reward <= args.max_reward and math.isfinite(reward), "continuation reward is out of range")
+        require(0.0 <= reward <= args.max_reward and math.isfinite(reward), "continuation reward is invalid")
 
-    targets = by_event.get("critic_targets", [])
-    require(targets, "post-warmup critic targets were not audited")
+    targets = [row for row in by_event.get("critic_targets", []) if int(row.get("global_step", 0)) > 1]
+    require(bool(targets), "post-warmup critic targets were not audited")
     require(any(int(row["dense_token_labels"]) > 0 for row in targets), "no dense continuation labels survived")
     for row in targets:
         terminal = int(row["terminal_token"])
         require(
             all(1 <= int(mark) < terminal for mark in row.get("selected_marks", [])),
-            "a selected mark was not a one-indexed nonterminal prefix",
+            "a selected mark is not a one-indexed nonterminal prefix",
         )
-    require(
-        all(int(row["terminal_token"]) >= 1 for row in targets),
-        "a terminal label did not use the final valid response token",
-    )
+        initial = float(row["initial_state_target"])
+        require(0.0 <= initial <= args.max_reward and math.isfinite(initial), "invalid trained V(s0) target")
 
-    state_path, state = latest_feature_state(args.checkpoint_root)
+    step, checkpoint = latest_native_checkpoint(args.checkpoint_root)
     require(
-        state.get("critic_update_count") == args.expected_critic_updates,
-        f"wrong critic update count in {state_path}: {state.get('critic_update_count')}",
+        step == args.expected_global_step, f"expected native checkpoint step {args.expected_global_step}, got {step}"
     )
-    contract = state.get("contract")
-    require(isinstance(contract, dict), f"missing checkpoint contract in {state_path}")
-    feature = contract.get("feature")
-    require(isinstance(feature, dict), f"missing feature contract in {state_path}")
-    require(feature.get("recipe") == args.recipe, f"checkpoint recipe mismatch in {state_path}")
-    require(feature.get("num_critiques") == args.num_critiques, f"checkpoint critique count mismatch in {state_path}")
+    require((checkpoint / "actor").is_dir(), f"missing native actor checkpoint in {checkpoint}")
+    require((checkpoint / "critic").is_dir(), f"missing native critic checkpoint in {checkpoint}")
+    require((checkpoint / "data.pt").is_file(), f"missing native dataloader state in {checkpoint}")
+    require(
+        not (checkpoint / "intermediate_mc_value_state.json").exists(),
+        "obsolete feature-owned checkpoint state was written",
+    )
 
     print(
         "verified",
@@ -142,8 +145,8 @@ def main() -> None:
             "audit_rows": len(rows),
             "actor_batches": len(actor_batches),
             "continuations": len(continuations),
-            "latest_state": str(state_path),
-            "critic_updates": state["critic_update_count"],
+            "latest_checkpoint": str(checkpoint),
+            "global_step": step,
         },
     )
 

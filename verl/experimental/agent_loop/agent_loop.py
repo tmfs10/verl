@@ -542,7 +542,18 @@ class AgentLoopWorker:
                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
-        outputs = await asyncio.gather(*tasks)
+        drain_on_error = bool(OmegaConf.select(self.config, "algorithm.intermediate_mc_value.enable", default=False))
+        if drain_on_error:
+            gathered = await asyncio.gather(*tasks, return_exceptions=True)
+            errors = [result for result in gathered if isinstance(result, BaseException)]
+            if errors:
+                raise RuntimeError(
+                    "intermediate MC rollout failed after draining every parent task: "
+                    + "; ".join(repr(error) for error in errors)
+                ) from errors[0]
+            outputs = gathered
+        else:
+            outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs, input_non_tensor_batch=batch.non_tensor_batch)
 
@@ -896,12 +907,7 @@ class AgentLoopWorker:
         # a stable contract for set-derived diagnostic keys. Treat these as columns and sort them
         # before storing in meta_info, otherwise DataProto.concat can see false conflicts.
         reward_extra_keys = sorted(
-            {
-                key
-                for info in reward_extra_infos
-                if isinstance(info, dict)
-                for key in info.keys()
-            }
+            {key for info in reward_extra_infos if isinstance(info, dict) for key in info.keys()}
         )
         for key in reward_extra_keys:
             values = [info.get(key) if isinstance(info, dict) else None for info in reward_extra_infos]
@@ -1135,12 +1141,22 @@ class AgentLoopManager:
         active_workers = min(len(self.agent_loop_workers), len(prompts))
         split_size = (len(prompts) + active_workers - 1) // active_workers
         chunkes = prompts.split(split_size)
-        outputs = await asyncio.gather(
-            *[
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers[: len(chunkes)], chunkes, strict=True)
-            ]
-        )
+        calls = [
+            worker.generate_sequences.remote(chunk)
+            for worker, chunk in zip(self.agent_loop_workers[: len(chunkes)], chunkes, strict=True)
+        ]
+        drain_on_error = bool(OmegaConf.select(self.config, "algorithm.intermediate_mc_value.enable", default=False))
+        if drain_on_error:
+            gathered = await asyncio.gather(*calls, return_exceptions=True)
+            errors = [result for result in gathered if isinstance(result, BaseException)]
+            if errors:
+                raise RuntimeError(
+                    "intermediate MC rollout failed after draining every agent-loop worker: "
+                    + "; ".join(repr(error) for error in errors)
+                ) from errors[0]
+            outputs = gathered
+        else:
+            outputs = await asyncio.gather(*calls)
         output = DataProto.concat(outputs)
 
         # calculate performance metrics

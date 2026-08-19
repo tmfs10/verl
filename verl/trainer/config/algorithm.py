@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -43,71 +44,68 @@ incorrect or didn't later enable moving in the correct direction."""
 
 @dataclass
 class IntermediateMCValueConfig(BaseConfig):
-    """Synchronous self-critique and continuation supervision for PPO.
-
-    The two recipes are deliberately closed rather than independently combining
-    critic heads and selectors. This keeps checkpoint and numerical contracts
-    explicit and prevents stale EMA configurations from being accepted.
-    """
+    """Synchronous self-critique and continuation supervision for PPO."""
 
     enable: bool = False
-    recipe: str = "scalar_random"
-    actor_loss_mode: str = "dppo_tv"
+    critic_head: str = "scalar"
+    mark_selector: str = "random"
     num_critiques: int = 4
     continuations_per_mark: int = 1
-    max_marks: int = 1
-    critic_warmup_updates: int = 30
+    max_marks: Optional[int] = None
     critique_max_response_length: Optional[int] = None
     mark_start_fraction: float = 0.05
     mark_end_fraction: float = 0.90
     min_mark_gap: int = 32
+    ema_alpha: float = 0.1
+    ema_baseline_token: int = 32
+    ema_floor: float = 1e-4
+    ema_ratio_up: float = 2.0
+    ema_ratio_down: float = 0.5
     variance_scope: str = "rollout"
     variance_random_probability: float = 0.05
     selection_seed: int = 0
     max_reward: float = 1.0
     scalar_loss: str = "mse"
-    value_clip_epsilon: float = 0.2
     beta_target_epsilon: float = 1e-4
     critique_normalization_epsilon: float = 1e-8
     critique_prompt: str = INTERMEDIATE_MC_CRITIQUE_PROMPT
     audit_output_dir: Optional[str] = None
 
     @property
-    def critic_head(self) -> str:
-        return "scalar" if self.recipe == "scalar_random" else "beta"
-
-    @property
-    def mark_selector(self) -> str:
-        return "random" if self.recipe == "scalar_random" else "variance"
-
-    @property
     def num_critic_labels(self) -> int:
         return 1 if self.critic_head == "scalar" else 2
 
+    @property
+    def resolved_max_marks(self) -> int:
+        if self.max_marks is not None:
+            return self.max_marks
+        return 4 if self.mark_selector == "ema" else 1
+
     def __post_init__(self):
-        if self.recipe not in {"scalar_random", "beta_variance"}:
-            raise ValueError(
-                "algorithm.intermediate_mc_value.recipe must be scalar_random or beta_variance; "
-                f"EMA and arbitrary head/selector combinations are unsupported, got {self.recipe!r}"
-            )
-        if not isinstance(self.actor_loss_mode, str) or not self.actor_loss_mode.strip():
-            raise ValueError("algorithm.intermediate_mc_value.actor_loss_mode must be non-empty")
+        if self.critic_head not in {"scalar", "beta"}:
+            raise ValueError("algorithm.intermediate_mc_value.critic_head must be scalar or beta")
+        if self.mark_selector not in {"random", "ema", "variance"}:
+            raise ValueError("algorithm.intermediate_mc_value.mark_selector must be random, ema, or variance")
+        if self.mark_selector == "variance" and self.critic_head != "beta":
+            raise ValueError("algorithm.intermediate_mc_value.mark_selector=variance requires critic_head=beta")
         positive_ints = {
             "num_critiques": self.num_critiques,
             "continuations_per_mark": self.continuations_per_mark,
             "min_mark_gap": self.min_mark_gap,
+            "ema_baseline_token": self.ema_baseline_token,
         }
         for name, value in positive_ints.items():
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"algorithm.intermediate_mc_value.{name} must be a positive integer")
-        if not isinstance(self.max_marks, int) or isinstance(self.max_marks, bool) or self.max_marks < 0:
-            raise ValueError("algorithm.intermediate_mc_value.max_marks must be a non-negative integer")
-        if (
-            not isinstance(self.critic_warmup_updates, int)
-            or isinstance(self.critic_warmup_updates, bool)
-            or self.critic_warmup_updates < 0
+        if self.max_marks is not None and (
+            not isinstance(self.max_marks, int) or isinstance(self.max_marks, bool) or self.max_marks < 0
         ):
-            raise ValueError("algorithm.intermediate_mc_value.critic_warmup_updates must be non-negative")
+            raise ValueError("algorithm.intermediate_mc_value.max_marks must be null or a non-negative integer")
+        if self.num_critiques == 1:
+            warnings.warn(
+                "intermediate_mc_value.num_critiques=1 makes the normalized critique advantage exactly zero",
+                stacklevel=2,
+            )
         if self.critique_max_response_length is not None:
             if (
                 not isinstance(self.critique_max_response_length, int)
@@ -121,6 +119,14 @@ class IntermediateMCValueConfig(BaseConfig):
             raise ValueError("algorithm.intermediate_mc_value.selection_seed must be an integer")
         if not 0.0 <= self.mark_start_fraction <= self.mark_end_fraction <= 1.0:
             raise ValueError("mark fractions must satisfy 0 <= start <= end <= 1")
+        if not math.isfinite(self.ema_alpha) or not 0.0 < self.ema_alpha <= 1.0:
+            raise ValueError("ema_alpha must be finite and in (0, 1]")
+        if not math.isfinite(self.ema_floor) or self.ema_floor <= 0.0:
+            raise ValueError("ema_floor must be finite and positive")
+        if not math.isfinite(self.ema_ratio_up) or self.ema_ratio_up <= 1.0:
+            raise ValueError("ema_ratio_up must be finite and greater than 1")
+        if not math.isfinite(self.ema_ratio_down) or not 0.0 < self.ema_ratio_down < 1.0:
+            raise ValueError("ema_ratio_down must be finite and in (0, 1)")
         if self.variance_scope not in {"rollout", "prompt", "batch"}:
             raise ValueError("variance_scope must be rollout, prompt, or batch")
         if not 0.0 <= self.variance_random_probability <= 1.0:
@@ -129,8 +135,6 @@ class IntermediateMCValueConfig(BaseConfig):
             raise ValueError("max_reward must be finite and positive")
         if self.scalar_loss not in {"mse", "bce"}:
             raise ValueError("scalar_loss must be mse or bce")
-        if not math.isfinite(self.value_clip_epsilon) or self.value_clip_epsilon < 0.0:
-            raise ValueError("value_clip_epsilon must be finite and non-negative")
         if not 0.0 < self.beta_target_epsilon < 0.5:
             raise ValueError("beta_target_epsilon must be in (0, 0.5)")
         if not math.isfinite(self.critique_normalization_epsilon) or self.critique_normalization_epsilon <= 0:
@@ -750,28 +754,20 @@ class OPSDTokenKLLoggingConfig(BaseConfig):
 
     def __post_init__(self):
         if self.start_step <= 0:
-            raise ValueError(
-                f"opsd.token_kl_logging.start_step must be positive, got {self.start_step}"
-            )
+            raise ValueError(f"opsd.token_kl_logging.start_step must be positive, got {self.start_step}")
         if self.end_step is not None and self.end_step < self.start_step:
             raise ValueError(
-                "opsd.token_kl_logging.end_step must be at least start_step, got "
-                f"{self.end_step} < {self.start_step}"
+                f"opsd.token_kl_logging.end_step must be at least start_step, got {self.end_step} < {self.start_step}"
             )
         if self.interval_steps <= 0:
-            raise ValueError(
-                "opsd.token_kl_logging.interval_steps must be positive, got "
-                f"{self.interval_steps}"
-            )
+            raise ValueError(f"opsd.token_kl_logging.interval_steps must be positive, got {self.interval_steps}")
         if self.max_samples_per_rank <= 0:
             raise ValueError(
-                "opsd.token_kl_logging.max_samples_per_rank must be positive, got "
-                f"{self.max_samples_per_rank}"
+                f"opsd.token_kl_logging.max_samples_per_rank must be positive, got {self.max_samples_per_rank}"
             )
         if self.max_tokens_per_sample <= 0:
             raise ValueError(
-                "opsd.token_kl_logging.max_tokens_per_sample must be positive, got "
-                f"{self.max_tokens_per_sample}"
+                f"opsd.token_kl_logging.max_tokens_per_sample must be positive, got {self.max_tokens_per_sample}"
             )
 
 
@@ -789,14 +785,10 @@ class OPSDGapDiagnosticsConfig(BaseConfig):
     def __post_init__(self):
         if self.interval_steps <= 0:
             raise ValueError(
-                "opsd.steering.gap_diagnostics.interval_steps must be positive, got "
-                f"{self.interval_steps}"
+                f"opsd.steering.gap_diagnostics.interval_steps must be positive, got {self.interval_steps}"
             )
         if self.fold_seed < 0:
-            raise ValueError(
-                "opsd.steering.gap_diagnostics.fold_seed must be non-negative, got "
-                f"{self.fold_seed}"
-            )
+            raise ValueError(f"opsd.steering.gap_diagnostics.fold_seed must be non-negative, got {self.fold_seed}")
 
 
 @dataclass
@@ -826,9 +818,7 @@ class OPSDSteeringConfig(BaseConfig):
     normalize: Optional[str] = None
     apply_positions: str = "all_nonpad"
     detach_vectors: bool = True
-    gap_diagnostics: OPSDGapDiagnosticsConfig = field(
-        default_factory=OPSDGapDiagnosticsConfig
-    )
+    gap_diagnostics: OPSDGapDiagnosticsConfig = field(default_factory=OPSDGapDiagnosticsConfig)
 
     def __post_init__(self):
         if isinstance(self.gap_diagnostics, dict):
@@ -839,29 +829,21 @@ class OPSDSteeringConfig(BaseConfig):
             )
         if self.expected_total_layers is not None and self.expected_total_layers <= 0:
             raise ValueError(
-                "opsd.steering.expected_total_layers must be positive when set, got "
-                f"{self.expected_total_layers}"
+                f"opsd.steering.expected_total_layers must be positive when set, got {self.expected_total_layers}"
             )
         if any(index < 0 for index in self.expected_layer_indices):
-            raise ValueError(
-                "opsd.steering.expected_layer_indices must contain only non-negative indexes"
-            )
+            raise ValueError("opsd.steering.expected_layer_indices must contain only non-negative indexes")
         if len(set(self.expected_layer_indices)) != len(self.expected_layer_indices):
             raise ValueError("opsd.steering.expected_layer_indices must not contain duplicates")
         if self.source_mode not in {"caa", "positive", "policy_gradient"}:
             raise ValueError(
-                "Invalid opsd.steering.source_mode: "
-                f"{self.source_mode}. Must be caa, positive, or policy_gradient"
+                f"Invalid opsd.steering.source_mode: {self.source_mode}. Must be caa, positive, or policy_gradient"
             )
         if self.caa_scope not in {"same_prompt", "global_batch"}:
-            raise ValueError(
-                f"Invalid opsd.steering.caa_scope: {self.caa_scope}. "
-                "Must be same_prompt or global_batch"
-            )
+            raise ValueError(f"Invalid opsd.steering.caa_scope: {self.caa_scope}. Must be same_prompt or global_batch")
         if self.source_mode not in {"caa", "policy_gradient"} and self.caa_scope != "same_prompt":
             raise ValueError(
-                "opsd.steering.caa_scope=global_batch is defined only for "
-                "source_mode=caa or policy_gradient"
+                "opsd.steering.caa_scope=global_batch is defined only for source_mode=caa or policy_gradient"
             )
         if self.correct_rollout_aggregation not in {"first", "all"}:
             raise ValueError(
@@ -875,24 +857,19 @@ class OPSDSteeringConfig(BaseConfig):
             )
         if self.gradient_objective != "grpo_advantage":
             raise ValueError(
-                "Invalid opsd.steering.gradient_objective: "
-                f"{self.gradient_objective}. Must be grpo_advantage"
+                f"Invalid opsd.steering.gradient_objective: {self.gradient_objective}. Must be grpo_advantage"
             )
         if self.gradient_aggregation != "per_rollout":
             raise ValueError(
-                "Invalid opsd.steering.gradient_aggregation: "
-                f"{self.gradient_aggregation}. Must be per_rollout"
+                f"Invalid opsd.steering.gradient_aggregation: {self.gradient_aggregation}. Must be per_rollout"
             )
         if not math.isfinite(self.scale):
             raise ValueError(f"opsd.steering.scale must be finite, got {self.scale}")
         if self.normalize not in {None, "unit_norm", "rms"}:
-            raise ValueError(
-                f"Invalid opsd.steering.normalize: {self.normalize}. Must be unit_norm, rms, or null"
-            )
+            raise ValueError(f"Invalid opsd.steering.normalize: {self.normalize}. Must be unit_norm, rms, or null")
         if self.apply_positions not in {"all_nonpad", "response_only"}:
             raise ValueError(
-                "Invalid opsd.steering.apply_positions: "
-                f"{self.apply_positions}. Must be all_nonpad or response_only"
+                f"Invalid opsd.steering.apply_positions: {self.apply_positions}. Must be all_nonpad or response_only"
             )
         if not self.detach_vectors:
             raise ValueError(
@@ -941,15 +918,9 @@ class OPSDAdvantageShapingConfig(BaseConfig):
                 f"{self.normalize}. Must be one of ['mean_abs', 'none', 'range', 'std'] or None"
             )
         if not math.isfinite(self.scale) or self.scale < 0.0:
-            raise ValueError(
-                "opsd.advantage_shaping.scale must be finite and non-negative, "
-                f"got {self.scale}"
-            )
+            raise ValueError(f"opsd.advantage_shaping.scale must be finite and non-negative, got {self.scale}")
         if self.clip_z is not None and (not math.isfinite(self.clip_z) or self.clip_z <= 0.0):
-            raise ValueError(
-                "opsd.advantage_shaping.clip_z must be finite and positive when set, "
-                f"got {self.clip_z}"
-            )
+            raise ValueError(f"opsd.advantage_shaping.clip_z must be finite and positive when set, got {self.clip_z}")
         if self.max_delta_fraction is not None and (
             not math.isfinite(self.max_delta_fraction) or self.max_delta_fraction <= 0.0
         ):
@@ -959,8 +930,7 @@ class OPSDAdvantageShapingConfig(BaseConfig):
             )
         if self.max_response_tokens is not None and self.max_response_tokens <= 0:
             raise ValueError(
-                "opsd.advantage_shaping.max_response_tokens must be positive when set, "
-                f"got {self.max_response_tokens}"
+                f"opsd.advantage_shaping.max_response_tokens must be positive when set, got {self.max_response_tokens}"
             )
         if not math.isfinite(self.student_rlvr_backward_scale) or self.student_rlvr_backward_scale < 0.0:
             raise ValueError(
@@ -1006,7 +976,9 @@ class OPSDConfig(BaseConfig):
     teacher_prefix: str = "\n\nBelow is the ground truth answer:\n"
     teacher_suffix: str = "\n\nNow solve the problem"
     sdpo_success_prefix: str = "\n\nBelow is a successful previous attempt for this question:\n"
-    sdpo_success_suffix: str = "\n\nUse the successful previous attempt as implicit feedback and solve the problem again."
+    sdpo_success_suffix: str = (
+        "\n\nUse the successful previous attempt as implicit feedback and solve the problem again."
+    )
     sdpo_distill_only_failed: bool = True
     sdpo_exclude_self_success: bool = True
     distill_loss: str = "sampled_reverse_kl"
@@ -1077,19 +1049,14 @@ class OPSDConfig(BaseConfig):
         }
         if self.actor_objective is None:
             resolved_actor_objective = (
-                "grpo_advantage_reweighting"
-                if self.advantage_shaping.enable
-                else "direct_reverse_kl"
+                "grpo_advantage_reweighting" if self.advantage_shaping.enable else "direct_reverse_kl"
             )
             object.__setattr__(self, "actor_objective", resolved_actor_objective)
         elif self.actor_objective not in valid_actor_objectives:
             raise ValueError(
-                f"Invalid opsd.actor_objective: {self.actor_objective}. "
-                f"Must be one of {sorted(valid_actor_objectives)}"
+                f"Invalid opsd.actor_objective: {self.actor_objective}. Must be one of {sorted(valid_actor_objectives)}"
             )
-        if self.advantage_shaping.enable != (
-            self.actor_objective == "grpo_advantage_reweighting"
-        ):
+        if self.advantage_shaping.enable != (self.actor_objective == "grpo_advantage_reweighting"):
             raise ValueError(
                 "opsd.advantage_shaping.enable is a compatibility alias and must equal "
                 "(opsd.actor_objective == 'grpo_advantage_reweighting')"
@@ -1102,8 +1069,7 @@ class OPSDConfig(BaseConfig):
         valid_teacher_sources = {"ground_truth", "sdpo_success_rollout"}
         if self.teacher_source not in valid_teacher_sources:
             raise ValueError(
-                f"Invalid opsd.teacher_source: {self.teacher_source}. "
-                f"Must be one of {sorted(valid_teacher_sources)}"
+                f"Invalid opsd.teacher_source: {self.teacher_source}. Must be one of {sorted(valid_teacher_sources)}"
             )
 
         valid_sdpo_conditioning_modes = {"prompt_append", "steering"}
@@ -1115,8 +1081,7 @@ class OPSDConfig(BaseConfig):
         if self.sdpo_conditioning_mode == "steering":
             if self.teacher_source != "sdpo_success_rollout":
                 raise ValueError(
-                    "opsd.sdpo_conditioning_mode=steering requires "
-                    "opsd.teacher_source=sdpo_success_rollout"
+                    "opsd.sdpo_conditioning_mode=steering requires opsd.teacher_source=sdpo_success_rollout"
                 )
             if self.teacher_model != "actor":
                 raise ValueError(
@@ -1129,20 +1094,14 @@ class OPSDConfig(BaseConfig):
                 raise ValueError("Steering-vector OPSD does not support teacher SFT")
             if self.sdpo_distill_only_failed:
                 raise ValueError(
-                    "Steering-vector OPSD is outcome-symmetric and requires "
-                    "opsd.sdpo_distill_only_failed=False"
+                    "Steering-vector OPSD is outcome-symmetric and requires opsd.sdpo_distill_only_failed=False"
                 )
             if self.actor_objective in {"direct_reverse_kl", "negative_kl_advantage"}:
                 if self.mode != "opsd":
-                    raise ValueError(
-                        f"Steering actor_objective={self.actor_objective} requires opsd.mode=opsd"
-                    )
+                    raise ValueError(f"Steering actor_objective={self.actor_objective} requires opsd.mode=opsd")
             elif self.actor_objective == "grpo_advantage_reweighting":
                 if self.mode != "opsd_rlvr":
-                    raise ValueError(
-                        "Steering actor_objective=grpo_advantage_reweighting requires "
-                        "opsd.mode=opsd_rlvr"
-                    )
+                    raise ValueError("Steering actor_objective=grpo_advantage_reweighting requires opsd.mode=opsd_rlvr")
             if self.steering.strict_contract:
                 strict_mismatches = {}
                 expected_values = {
@@ -1223,11 +1182,7 @@ class OPSDConfig(BaseConfig):
                         }
                     )
                 strict_mismatches.update(
-                    {
-                        field_name: values
-                        for field_name, values in parent_expected.items()
-                        if values[0] != values[1]
-                    }
+                    {field_name: values for field_name, values in parent_expected.items() if values[0] != values[1]}
                 )
                 if strict_mismatches:
                     raise ValueError(
@@ -1238,8 +1193,7 @@ class OPSDConfig(BaseConfig):
         valid_teacher_models = {"actor", "ema", "fixed", "separate"}
         if self.teacher_model not in valid_teacher_models:
             raise ValueError(
-                f"Invalid opsd.teacher_model: {self.teacher_model}. "
-                f"Must be one of {sorted(valid_teacher_models)}"
+                f"Invalid opsd.teacher_model: {self.teacher_model}. Must be one of {sorted(valid_teacher_models)}"
             )
         if self.teacher_model == "ema" and self.mode == "opsd_rlvr":
             raise ValueError("opsd.teacher_model=ema is only supported with opsd.mode=opsd.")
@@ -1248,9 +1202,7 @@ class OPSDConfig(BaseConfig):
         if self.teacher_model == "separate" and self.mode != "opsd_rlvr":
             raise ValueError("opsd.teacher_model=separate requires opsd.mode=opsd_rlvr.")
         if not 0.0 <= self.teacher_ema_rate <= 1.0:
-            raise ValueError(
-                f"opsd.teacher_ema_rate must be in [0, 1], got {self.teacher_ema_rate}"
-            )
+            raise ValueError(f"opsd.teacher_ema_rate must be in [0, 1], got {self.teacher_ema_rate}")
 
         valid_teacher_prompt_styles = {"append_instruction", "reference_solution_single_user"}
         if self.teacher_prompt_style not in valid_teacher_prompt_styles:
@@ -1271,9 +1223,7 @@ class OPSDConfig(BaseConfig):
                 "stabilization policy. Use sampled_reverse_kl."
             )
         if self.distill_loss != "sampled_reverse_kl":
-            raise ValueError(
-                f"Invalid opsd.distill_loss: {self.distill_loss}. Only sampled_reverse_kl is supported."
-            )
+            raise ValueError(f"Invalid opsd.distill_loss: {self.distill_loss}. Only sampled_reverse_kl is supported.")
 
         legacy_distill_controls = {
             "topk": self.topk,
@@ -1292,8 +1242,7 @@ class OPSDConfig(BaseConfig):
 
         if self.distill_max_response_tokens is not None and self.distill_max_response_tokens <= 0:
             raise ValueError(
-                "opsd.distill_max_response_tokens must be positive when set, "
-                f"got {self.distill_max_response_tokens}"
+                f"opsd.distill_max_response_tokens must be positive when set, got {self.distill_max_response_tokens}"
             )
 
         if self.debug_print_interval < 0:
@@ -1327,28 +1276,16 @@ class OPSDConfig(BaseConfig):
             raise ValueError("opsd.actor_objective=negative_kl_advantage requires opsd.mode=opsd")
 
         if self.distill_backward_scale < 0.0:
-            raise ValueError(
-                "opsd.distill_backward_scale must be non-negative, "
-                f"got {self.distill_backward_scale}"
-            )
+            raise ValueError(f"opsd.distill_backward_scale must be non-negative, got {self.distill_backward_scale}")
 
         if self.rlvr_backward_scale < 0.0:
-            raise ValueError(
-                "opsd.rlvr_backward_scale must be non-negative, "
-                f"got {self.rlvr_backward_scale}"
-            )
+            raise ValueError(f"opsd.rlvr_backward_scale must be non-negative, got {self.rlvr_backward_scale}")
 
         if self.rlvr_warmup_steps < 0:
-            raise ValueError(
-                "opsd.rlvr_warmup_steps must be non-negative, "
-                f"got {self.rlvr_warmup_steps}"
-            )
+            raise ValueError(f"opsd.rlvr_warmup_steps must be non-negative, got {self.rlvr_warmup_steps}")
 
         if not math.isfinite(self.teacher_sft_weight) or self.teacher_sft_weight < 0.0:
-            raise ValueError(
-                "opsd.teacher_sft_weight must be finite and non-negative, "
-                f"got {self.teacher_sft_weight}"
-            )
+            raise ValueError(f"opsd.teacher_sft_weight must be finite and non-negative, got {self.teacher_sft_weight}")
         valid_teacher_sft_scopes = {"thinking_only", "thinking_and_answer"}
         if self.teacher_sft_target_scope not in valid_teacher_sft_scopes:
             raise ValueError(
@@ -1359,8 +1296,7 @@ class OPSDConfig(BaseConfig):
             raise ValueError("opsd.teacher_sft_success_field must be non-empty")
         if not math.isfinite(self.teacher_sft_success_threshold):
             raise ValueError(
-                "opsd.teacher_sft_success_threshold must be finite, "
-                f"got {self.teacher_sft_success_threshold}"
+                f"opsd.teacher_sft_success_threshold must be finite, got {self.teacher_sft_success_threshold}"
             )
         if not self.teacher_sft_think_end_tag:
             raise ValueError("opsd.teacher_sft_think_end_tag must be non-empty")
