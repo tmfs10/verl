@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from smoke_tests.intermediate_mc_value.topology import submit_oci_iad as submit_module
 from smoke_tests.intermediate_mc_value.topology.analyze import (
     _apply_token_drift_rejection,
     _recommendations,
@@ -40,6 +41,7 @@ from smoke_tests.intermediate_mc_value.topology.submit_oci_iad import (
     _extra_args,
     _replace_ssh_tunnel_host,
     _replace_verl_container,
+    _requeue_value,
     build_command,
 )
 
@@ -151,6 +153,38 @@ containers:
     updated, original_container = _replace_verl_container(updated, container)
     assert original_container == "/containers/missing-verl.sqsh"
     assert updated == source.replace(original, target).replace(original_container, container)
+
+
+def test_scheduler_requeue_contract_parser() -> None:
+    assert _requeue_value("JobId=123 JobState=PENDING Requeue=0 Restarts=0") == 0
+    assert _requeue_value("JobId=123 JobState=PENDING Requeue=1 Restarts=0") == 1
+    with pytest.raises(ValueError, match="no Requeue field"):
+        _requeue_value("JobId=123 JobState=PENDING")
+
+
+def test_scheduler_requeue_enforcement_verifies_and_cancels_on_failure(monkeypatch) -> None:
+    commands: list[str] = []
+
+    def success(command: str):
+        commands.append(command)
+        stdout = "JobId=123 JobState=PENDING Requeue=0 Restarts=0" if command.startswith("scontrol show") else ""
+        return submit_module.subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(submit_module, "_ssh", success)
+    assert "Requeue=0" in submit_module._force_no_requeue("123")
+    assert commands == ["scontrol update JobId=123 Requeue=0", "scontrol show job 123 -o"]
+
+    commands.clear()
+
+    def rejected(command: str):
+        commands.append(command)
+        stdout = "JobId=123 JobState=PENDING Requeue=1 Restarts=0" if command.startswith("scontrol show") else ""
+        return submit_module.subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(submit_module, "_ssh", rejected)
+    with pytest.raises(RuntimeError, match="job was cancelled"):
+        submit_module._force_no_requeue("123")
+    assert commands[-1] == "scancel 123"
 
 
 def test_memory_aggressive_profile_cannot_be_bulk_launched() -> None:

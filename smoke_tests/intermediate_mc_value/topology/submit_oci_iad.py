@@ -487,6 +487,35 @@ def _ssh(command: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["ssh", SSH_ALIAS, command], capture_output=True, text=True, check=False)
 
 
+def _requeue_value(scontrol_output: str) -> int:
+    match = re.search(r"(?:^|\s)Requeue=(\d+)(?:\s|$)", scontrol_output)
+    if match is None:
+        raise ValueError(f"scontrol output has no Requeue field: {scontrol_output!r}")
+    return int(match.group(1))
+
+
+def _force_no_requeue(job_id: str) -> str:
+    if not job_id.isdigit():
+        raise ValueError(f"invalid Slurm job id {job_id!r}")
+    update = _ssh(f"scontrol update JobId={job_id} Requeue=0")
+    if update.returncode:
+        _ssh(f"scancel {job_id}")
+        raise RuntimeError(
+            f"failed to enforce Requeue=0 for job {job_id}; job was cancelled: "
+            f"{update.stderr.strip() or update.stdout.strip()}"
+        )
+    query = _ssh(f"scontrol show job {job_id} -o")
+    try:
+        requeue = _requeue_value(query.stdout) if query.returncode == 0 else None
+    except ValueError:
+        requeue = None
+    if requeue != 0:
+        _ssh(f"scancel {job_id}")
+        detail = query.stderr.strip() or query.stdout.strip()
+        raise RuntimeError(f"job {job_id} did not retain Requeue=0 after enforcement; job was cancelled: {detail}")
+    return query.stdout.strip()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("render", "dry-run", "submit", "status", "collect"))
@@ -653,6 +682,10 @@ def main() -> None:
             if result.returncode:
                 raise SystemExit(result.returncode)
             job_id = _parse_job_id(log_path)
+            scheduler_contract = _force_no_requeue(job_id)
+            contract_dir = local_run_dir / "scheduler_contracts"
+            contract_dir.mkdir(parents=True, exist_ok=True)
+            (contract_dir / f"{candidate_id}.txt").write_text(scheduler_contract + "\n", encoding="utf-8")
             with jobs_path.open("a", encoding="utf-8") as handle:
                 handle.write(f"{candidate_id}\t{job_id}\t{remote_output}\n")
             print(f"[submitted] candidate={candidate_id} job={job_id}", flush=True)

@@ -125,6 +125,12 @@ full nodes, all eight GPUs per node, four hours, and `Requeue=0`. W&B,
 validation, checkpoints, detailed audit JSONL, and rollout dumps are disabled
 in the measurement window.
 
+The installed NeMo Run wrapper may invoke `sbatch --requeue` even when its
+generated script contains `#SBATCH --no-requeue`. Immediately after receiving
+the job ID, the submitter therefore sets `Requeue=0`, verifies it from live
+`scontrol` output, and records the scheduler contract. If either operation
+fails, it cancels the job before adding it to the local submission ledger.
+
 Check state and collect completed benchmark artifacts through the pinned
 `iad-2` route:
 
