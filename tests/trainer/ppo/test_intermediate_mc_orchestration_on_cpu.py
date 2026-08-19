@@ -185,6 +185,23 @@ def test_critic_batch_preserves_explicit_s0_plus_solution_positions() -> None:
     assert isinstance(batch, DataProto)
 
 
+def test_scalar_critic_scoring_accepts_missing_optional_variances() -> None:
+    controller = _controller(critic_head="scalar")
+    bundle = _bundle()
+    critic_batch = controller._make_critic_batch([bundle])
+    expected = critic_batch.batch["critic_position_mask"].shape
+    controller.trainer = SimpleNamespace(
+        critic_wg=object(),
+        _get_dp_size=lambda _worker, _role: 1,
+        _compute_values=lambda _batch: DataProto.from_dict(tensors={"values": torch.ones(expected)}),
+    )
+
+    controller._score_contexts(critic_batch, [bundle])
+
+    assert bundle.critic_values == [[1.0] * 4, [1.0] * 4]
+    assert bundle.critic_variances == [None, None]
+
+
 def test_actor_packing_has_one_real_prompt_token_and_only_output_tokens_train() -> None:
     controller = _controller()
     actor_batch = controller._make_actor_batch(_source(), [_bundle()])

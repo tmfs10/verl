@@ -628,7 +628,9 @@ class IntermediateMCValueController:
         if pad_size:
             output = unpad_dataproto(output, pad_size=pad_size)
         values = output.batch["values"].detach().cpu()
-        variances = output.batch.get("variances")
+        # TensorDict.get() treats an omitted default as required-key access, unlike
+        # dict.get(). Scalar critics intentionally return only ``values``.
+        variances = output.batch["variances"] if "variances" in output.batch.keys() else None
         if variances is not None:
             variances = variances.detach().cpu()
         expected = critic_batch.batch["critic_position_mask"].shape
