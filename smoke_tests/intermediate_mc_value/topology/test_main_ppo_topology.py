@@ -129,6 +129,13 @@ def test_contract_accepts_feature_enabled_m0_and_rejects_detailed_audit() -> Non
         _validate_contract(config, benchmark)
 
 
+def test_contract_rejects_obsolete_launcher_critic_key() -> None:
+    config = _contract_config()
+    config.critic.append_solution_to_prompt = False
+    with pytest.raises(ValueError, match="obsolete critic.append_solution_to_prompt"):
+        _validate_contract(config, _benchmark_contract())
+
+
 def test_contract_rejects_manifest_topology_drift_before_training() -> None:
     config = _contract_config()
     config.actor_rollout_ref.actor.fsdp_config.fsdp_size = 16

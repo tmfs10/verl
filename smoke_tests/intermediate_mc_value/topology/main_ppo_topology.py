@@ -132,6 +132,8 @@ def _validate_contract(config, benchmark: dict[str, object]) -> None:
             raise ValueError(f"topology benchmark contract requires {key}={expected}, got {actual!r}")
     if not bool(OmegaConf.select(config, "algorithm.intermediate_mc_value.enable")):
         raise ValueError("topology benchmark requires intermediate MC to remain enabled")
+    if OmegaConf.select(config, "critic.append_solution_to_prompt") is not None:
+        raise ValueError("topology benchmark must remove the launcher's obsolete critic.append_solution_to_prompt")
     if int(OmegaConf.select(config, "algorithm.intermediate_mc_value.num_critiques")) not in {0, 4}:
         raise ValueError("topology benchmark supports only matched M0 and M4 workloads")
     if float(OmegaConf.select(config, "actor_rollout_ref.rollout.temperature")) != 1.0:

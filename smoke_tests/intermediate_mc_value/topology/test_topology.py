@@ -127,6 +127,7 @@ def test_launcher_contract_keeps_feature_enabled_for_m0_and_has_no_fully_async_t
     assert "/data/prime_rl/opsd_math_30k/openthoughts_math_30k_opsd_full.jsonl" in joined
     assert "trainer.critic_warmup=0" in joined
     assert "trainer.logger=[file]" in joined
+    assert "~critic.append_solution_to_prompt" in joined
     assert "fully_async" not in joined
     assert command[-1] == "--dry_run"
     assert remote_output.endswith(candidate["candidate_id"])

@@ -194,6 +194,10 @@ def _extra_args(candidate: dict[str, Any], remote_output: str, *, allow_memory_g
     actor_micro = "null" if profile["actor_dynamic"] else "1"
     critic_micro = "null" if profile["critic_dynamic"] else "1"
     overrides = [
+        # The shared launcher still injects this deleted, non-VeRL critic key.
+        # Remove it after the launcher's base overrides instead of weakening
+        # FSDPCriticConfig to accept obsolete configuration.
+        "~critic.append_solution_to_prompt",
         "algorithm.adv_estimator=gae",
         "algorithm.gamma=1.0",
         "algorithm.lam=1.0",
