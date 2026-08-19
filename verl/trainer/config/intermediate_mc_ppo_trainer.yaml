@@ -26,6 +26,7 @@ actor_rollout_ref:
       loss_mode: dppo_tv
 
 critic:
+  # Intermediate MC applies this epsilon to value changes normalized by max_reward.
   cliprange_value: 0.2
 
 trainer:

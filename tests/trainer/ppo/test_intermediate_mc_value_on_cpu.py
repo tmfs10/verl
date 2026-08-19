@@ -23,7 +23,9 @@ from hydra import compose, initialize_config_dir
 from verl.trainer.config import INTERMEDIATE_MC_CRITIQUE_PROMPT, IntermediateMCValueConfig
 from verl.trainer.ppo.core_algos import compute_gae_advantage_return
 from verl.trainer.ppo.intermediate_mc_value import (
+    CRITIQUE_DELIMITER,
     FP32_EPSILON,
+    SOLUTION_DELIMITER,
     BetaValueLossComponents,
     VarianceCandidate,
     aggregate_mark_targets,
@@ -255,7 +257,7 @@ def test_critique_reward_and_population_normalization() -> None:
     assert critique_group_advantages([0.7], 1e-8) == [0.0]
 
 
-def test_scalar_mse_and_bce_use_absolute_native_value_clip() -> None:
+def test_scalar_mse_and_bce_use_reward_normalized_value_clip() -> None:
     logits = torch.tensor([[0.0, 2.0]])
     targets = torch.tensor([[0.5, 1.5]])
     old = torch.tensor([[0.8, 0.8]])
@@ -276,7 +278,7 @@ def test_scalar_mse_and_bce_use_absolute_native_value_clip() -> None:
         target_loss="bce",
     )
     expected_values = 2.0 * torch.sigmoid(logits)
-    expected_clip = old + torch.clamp(expected_values - old, -0.2, 0.2)
+    expected_clip = old + 2.0 * torch.clamp((expected_values - old) / 2.0, -0.2, 0.2)
     torch.testing.assert_close(mse.values, expected_values)
     torch.testing.assert_close(mse.clipped_values, expected_clip)
     torch.testing.assert_close(mse.current_loss, (expected_values - targets).square())
@@ -303,6 +305,22 @@ def test_beta_parameterization_mean_only_clip_and_gradients() -> None:
     assert torch.isfinite(loss)
     loss.backward()
     assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+def test_beta_value_clip_scales_with_reward_range() -> None:
+    logits = torch.tensor([[[2.0, 0.0]]])
+    old = torch.tensor([[0.5]])
+    components = beta_value_loss_components(
+        logits,
+        torch.tensor([[1.0]]),
+        old,
+        max_reward=2.0,
+        cliprange_value=0.2,
+        beta_target_epsilon=1e-4,
+    )
+    expected = old + 2.0 * torch.clamp((components.mean - old) / 2.0, -0.2, 0.2)
+    torch.testing.assert_close(components.clipped_values, expected)
+    torch.testing.assert_close(components.clipped_values, torch.tensor([[0.9]]))
 
 
 def test_beta_prediction_clamp_is_independent_of_target_transform_epsilon() -> None:
@@ -333,6 +351,12 @@ def test_exact_critic_boundaries_include_s0_and_solution_states() -> None:
     assert context.pre_solution_position == 8
     assert context.value_positions == [8, 9, 10, 11]
     assert [context.token_ids[index] for index in context.solution_positions] == [5, 6, 7]
+
+
+def test_literal_critic_delimiters_match_the_required_multiline_context() -> None:
+    assert CRITIQUE_DELIMITER == "\n\nCritique:\n"
+    assert SOLUTION_DELIMITER == "\n\nSolution:\n"
+    assert f"q{CRITIQUE_DELIMITER}c{SOLUTION_DELIMITER}x" == "q\n\nCritique:\nc\n\nSolution:\nx"
 
 
 def test_terminal_index_accepts_literal_or_length_capped_terminal() -> None:

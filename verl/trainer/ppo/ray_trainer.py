@@ -1937,19 +1937,22 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if curr_step_profile:
-                            self.async_rollout_manager.start_profile()
                         if self.intermediate_mc_controller is not None:
-                            try:
-                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                            finally:
-                                self.checkpoint_manager.sleep_replicas()
-                                if curr_step_profile:
-                                    self.async_rollout_manager.stop_profile()
+                            # The controller uses the same blocking lifecycle for
+                            # this first stage and the variance-only second stage.
+                            # It independently attempts sleep/profile cleanup
+                            # after partial lifecycle failures.
+                            gen_batch_output = self.intermediate_mc_controller._generate_sequences_with_lifecycle(
+                                gen_batch_output,
+                                profile_rollout=curr_step_profile,
+                                wake_up_replicas=False,
+                            )
                             intermediate_mc_records = self.intermediate_mc_controller.extract_generation_records(
                                 gen_batch_output
                             )
                         else:
+                            if curr_step_profile:
+                                self.async_rollout_manager.start_profile()
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                             self.checkpoint_manager.sleep_replicas()
                             if curr_step_profile:

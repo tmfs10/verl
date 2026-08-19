@@ -302,6 +302,7 @@ def _runtime_config():
             },
             "trainer": {"use_legacy_worker_impl": "auto", "critic_warmup": 30},
             "reward": {
+                "reward_kwargs": {},
                 "reward_model": {
                     "enable": False,
                     "launch_reward_fn_async": False,
@@ -309,7 +310,7 @@ def _runtime_config():
                     "reward_loop_module_path": None,
                     "reward_loop_class_name": None,
                     "enable_resource_pool": False,
-                }
+                },
             },
             "data": {
                 "use_dataset_responses": False,
@@ -377,6 +378,14 @@ def test_intermediate_mc_disables_streaming_reward_loop_and_preserves_rollout_id
         ("actor_rollout_ref.rollout.temperature", 0.9, "temperature=1.0"),
         ("actor_rollout_ref.rollout.max_model_len", None, "explicit positive"),
         ("reward.reward_model.launch_reward_fn_async", True, "blocking iteration barrier"),
+        (
+            "reward.reward_kwargs.use_response_logprob_reward_for_uniform_outcome_groups",
+            True,
+            "grouped reward transformations",
+        ),
+        ("reward.reward_kwargs.use_shortest_success_reward", True, "grouped reward transformations"),
+        ("reward.reward_kwargs.use_longest_success_penalty_reward", True, "grouped reward transformations"),
+        ("critic.cliprange_value", 1.1, "normalized epsilon"),
     ],
 )
 def test_runtime_config_rejects_unsupported_modes(path, value, message) -> None:
@@ -471,7 +480,7 @@ def test_individual_continuation_failure_is_omitted_after_drain() -> None:
     assert failures == ((1, 0),)
 
 
-def test_variance_continuation_stage_profiles_and_cleans_up_on_failure() -> None:
+def test_variance_continuation_stage_profiles_and_cleans_up_on_generation_failure() -> None:
     controller = _controller(critic_head="beta", mark_selector="variance")
     bundle = _bundle()
     bundle.marks = [1]
@@ -503,3 +512,53 @@ def test_variance_continuation_stage_profiles_and_cleans_up_on_failure() -> None
             profile_rollout=True,
         )
     assert events == ["wake", "start_profile", "generate", "sleep", "stop_profile"]
+
+
+@pytest.mark.parametrize(
+    ("wake_up", "failure", "expected_events"),
+    [
+        (True, "wake", ["wake", "sleep"]),
+        (True, "start_profile", ["wake", "start_profile", "sleep", "stop_profile"]),
+        (True, "sleep", ["wake", "start_profile", "generate", "sleep", "stop_profile"]),
+        (True, "stop_profile", ["wake", "start_profile", "generate", "sleep", "stop_profile"]),
+        (False, "start_profile", ["start_profile", "sleep", "stop_profile"]),
+        (False, "generate", ["start_profile", "generate", "sleep", "stop_profile"]),
+        (False, "sleep", ["start_profile", "generate", "sleep", "stop_profile"]),
+        (False, "stop_profile", ["start_profile", "generate", "sleep", "stop_profile"]),
+    ],
+)
+def test_blocking_rollout_lifecycle_attempts_independent_cleanup(
+    wake_up: bool,
+    failure: str,
+    expected_events: list[str],
+) -> None:
+    controller = _controller()
+    events: list[str] = []
+
+    def operation(name: str, result=None):
+        def run(*_args, **_kwargs):
+            events.append(name)
+            if failure == name:
+                raise RuntimeError(f"injected {name} failure")
+            return result
+
+        return run
+
+    controller.trainer = SimpleNamespace(
+        checkpoint_manager=SimpleNamespace(
+            wake_up_replicas=operation("wake"),
+            sleep_replicas=operation("sleep"),
+        ),
+        async_rollout_manager=SimpleNamespace(
+            start_profile=operation("start_profile"),
+            stop_profile=operation("stop_profile"),
+            generate_sequences=operation("generate", DataProto()),
+        ),
+    )
+    with pytest.raises(RuntimeError, match=f"injected {failure} failure"):
+        controller._generate_sequences_with_lifecycle(
+            DataProto(),
+            profile_rollout=True,
+            wake_up_replicas=wake_up,
+        )
+    assert events == expected_events

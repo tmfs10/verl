@@ -335,8 +335,10 @@ def scalar_value_loss_components(
     target_loss: Literal["mse", "bce"],
 ) -> ScalarValueLossComponents:
     values = max_reward * torch.sigmoid(critic_logits.float())
-    clipped_values = old_predictions.float() + torch.clamp(
-        values - old_predictions.float(), -cliprange_value, cliprange_value
+    clipped_values = old_predictions.float() + max_reward * torch.clamp(
+        (values - old_predictions.float()) / max_reward,
+        -cliprange_value,
+        cliprange_value,
     )
     if target_loss == "mse":
         current_loss = (values - value_targets.float()).square()
@@ -375,8 +377,10 @@ def beta_value_loss_components(
     alpha = normalized_mean * kappa
     beta = (1.0 - normalized_mean) * kappa
 
-    raw_clipped = old_predictions.float() + torch.clamp(
-        mean - old_predictions.float(), -cliprange_value, cliprange_value
+    raw_clipped = old_predictions.float() + max_reward * torch.clamp(
+        (mean - old_predictions.float()) / max_reward,
+        -cliprange_value,
+        cliprange_value,
     )
     clipped_normalized_mean = (raw_clipped / max_reward).clamp(FP32_EPSILON, 1.0 - FP32_EPSILON)
     clipped_values = max_reward * clipped_normalized_mean

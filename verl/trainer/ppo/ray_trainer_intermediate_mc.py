@@ -165,13 +165,25 @@ def validate_intermediate_mc_runtime_config(
     reward_loop_keys = ("reward_loop_source", "reward_loop_module_path", "reward_loop_class_name")
     if any(config.reward.reward_model.get(key, None) is not None for key in reward_loop_keys):
         raise ValueError("intermediate MC does not support rollout-time reward loops")
+    grouped_reward_keys = (
+        "use_response_logprob_reward_for_uniform_outcome_groups",
+        "use_shortest_success_reward",
+        "use_longest_success_penalty_reward",
+    )
+    reward_kwargs = config.reward.get("reward_kwargs", {}) or {}
+    enabled_grouped_rewards = [key for key in grouped_reward_keys if bool(reward_kwargs.get(key, False))]
+    if enabled_grouped_rewards:
+        raise ValueError(
+            "intermediate MC does not support grouped reward transformations because continuation batches "
+            f"do not preserve native rollout groups: {enabled_grouped_rewards}"
+        )
     if config.data.get("use_dataset_responses", False):
         raise ValueError("intermediate MC does not support off-policy dataset responses")
     if OmegaConf.select(config, "algorithm.opsd.enable", default=False):
         raise ValueError("intermediate MC and OPSD cannot be enabled together")
     cliprange = float(config.critic.cliprange_value)
-    if not math.isfinite(cliprange) or not 0.0 <= cliprange <= feature.max_reward:
-        raise ValueError("critic.cliprange_value must be finite and in [0, max_reward]")
+    if not math.isfinite(cliprange) or not 0.0 <= cliprange <= 1.0:
+        raise ValueError("intermediate MC interprets critic.cliprange_value as a normalized epsilon in [0, 1]")
     if actor_tokenizer is not None and critic_tokenizer is not None:
         if _tokenizer_fingerprint(actor_tokenizer) != _tokenizer_fingerprint(critic_tokenizer):
             raise ValueError("actor and critic tokenizers must have identical vocabularies and special-token IDs")
@@ -636,21 +648,13 @@ class IntermediateMCValueController:
         request = self._make_variance_request(source, bundles)
         if request is None:
             return
-        self.trainer.checkpoint_manager.wake_up_replicas()
-        profile_started = False
-        try:
-            if profile_rollout:
-                self.trainer.async_rollout_manager.start_profile()
-                profile_started = True
-            with marked_timer("intermediate_mc_continuations", timing_raw, color="red"):
-                output = self.trainer.async_rollout_manager.generate_sequences(request)
-                records = self.extract_generation_records(output)
-        finally:
-            try:
-                self.trainer.checkpoint_manager.sleep_replicas()
-            finally:
-                if profile_started:
-                    self.trainer.async_rollout_manager.stop_profile()
+        with marked_timer("intermediate_mc_continuations", timing_raw, color="red"):
+            output = self._generate_sequences_with_lifecycle(
+                request,
+                profile_rollout=profile_rollout,
+                wake_up_replicas=True,
+            )
+            records = self.extract_generation_records(output)
         expected = {bundle.rollout_id for bundle in bundles if bundle.marks}
         if set(records) != expected:
             raise RuntimeError("variance continuation stage returned an unexpected rollout-id set")
@@ -664,6 +668,52 @@ class IntermediateMCValueController:
                 raise RuntimeError("variance continuation stage changed the selected marks")
             bundle.continuations = list(record.continuations)
             bundle.failed_continuations = list(record.failed_continuations)
+
+    def _generate_sequences_with_lifecycle(
+        self,
+        request: DataProto,
+        *,
+        profile_rollout: bool,
+        wake_up_replicas: bool,
+    ) -> DataProto:
+        """Run one blocking feature rollout and independently attempt every cleanup."""
+
+        primary_error: BaseException | None = None
+        profile_cleanup_required = False
+        try:
+            if wake_up_replicas:
+                self.trainer.checkpoint_manager.wake_up_replicas()
+            if profile_rollout:
+                # Mark cleanup required before entry because a multi-replica
+                # gather can partially succeed and then raise.
+                profile_cleanup_required = True
+                self.trainer.async_rollout_manager.start_profile()
+            return self.trainer.async_rollout_manager.generate_sequences(request)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            cleanup_error: BaseException | None = None
+            try:
+                # This is required even when wake-up partially fails, and for
+                # the already-awake first rollout stage.
+                self.trainer.checkpoint_manager.sleep_replicas()
+            except BaseException as error:
+                cleanup_error = error
+
+            if profile_cleanup_required:
+                try:
+                    self.trainer.async_rollout_manager.stop_profile()
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                    else:
+                        cleanup_error.add_note(f"rollout profile cleanup also failed: {error!r}")
+
+            if cleanup_error is not None:
+                if primary_error is None:
+                    raise cleanup_error
+                primary_error.add_note(f"rollout lifecycle cleanup also failed: {cleanup_error!r}")
 
     def _make_reward_batch(
         self,
