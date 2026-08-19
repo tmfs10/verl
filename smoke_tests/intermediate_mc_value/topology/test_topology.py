@@ -121,6 +121,7 @@ def test_launcher_contract_keeps_feature_enabled_for_m0_and_has_no_fully_async_t
     assert "algorithm.intermediate_mc_value.continuations_per_mark=1" in joined
     assert "algorithm.intermediate_mc_value.max_marks=1" in joined
     assert "actor_rollout_ref.rollout.temperature=1.0" in joined
+    assert "/data/prime_rl/opsd_math_30k/openthoughts_math_30k_opsd_full.jsonl" in joined
     assert "trainer.critic_warmup=0" in joined
     assert "trainer.logger=[file]" in joined
     assert "fully_async" not in joined
