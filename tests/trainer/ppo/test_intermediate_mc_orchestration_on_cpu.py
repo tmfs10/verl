@@ -562,3 +562,79 @@ def test_blocking_rollout_lifecycle_attempts_independent_cleanup(
             wake_up_replicas=wake_up,
         )
     assert events == expected_events
+
+
+@pytest.mark.parametrize(("wake_up", "primary_failure"), [(True, "start_profile"), (False, "generate")])
+def test_blocking_rollout_lifecycle_retains_every_simultaneous_cleanup_failure(
+    wake_up: bool,
+    primary_failure: str,
+) -> None:
+    controller = _controller()
+    events: list[str] = []
+    failures = {primary_failure, "sleep", "stop_profile"}
+
+    def operation(name: str, result=None):
+        def run(*_args, **_kwargs):
+            events.append(name)
+            if name in failures:
+                raise RuntimeError(f"injected {name} failure")
+            return result
+
+        return run
+
+    controller.trainer = SimpleNamespace(
+        checkpoint_manager=SimpleNamespace(
+            wake_up_replicas=operation("wake"),
+            sleep_replicas=operation("sleep"),
+        ),
+        async_rollout_manager=SimpleNamespace(
+            start_profile=operation("start_profile"),
+            stop_profile=operation("stop_profile"),
+            generate_sequences=operation("generate", DataProto()),
+        ),
+    )
+    with pytest.raises(RuntimeError, match=f"injected {primary_failure} failure") as error_info:
+        controller._generate_sequences_with_lifecycle(
+            DataProto(),
+            profile_rollout=True,
+            wake_up_replicas=wake_up,
+        )
+
+    notes = error_info.value.__notes__
+    assert any("rollout sleep cleanup" in note and "injected sleep failure" in note for note in notes)
+    assert any("rollout profile cleanup" in note and "injected stop_profile failure" in note for note in notes)
+    expected_events = ["wake"] if wake_up else []
+    expected_events.append("start_profile")
+    if primary_failure == "generate":
+        expected_events.append("generate")
+    expected_events.extend(("sleep", "stop_profile"))
+    assert events == expected_events
+
+
+def test_blocking_rollout_lifecycle_retains_secondary_cleanup_failure_without_primary_error() -> None:
+    controller = _controller()
+
+    def fail_sleep():
+        raise RuntimeError("injected sleep failure")
+
+    def fail_stop_profile():
+        raise RuntimeError("injected stop_profile failure")
+
+    controller.trainer = SimpleNamespace(
+        checkpoint_manager=SimpleNamespace(sleep_replicas=fail_sleep),
+        async_rollout_manager=SimpleNamespace(
+            start_profile=lambda: None,
+            stop_profile=fail_stop_profile,
+            generate_sequences=lambda _request: DataProto(),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="injected sleep failure") as error_info:
+        controller._generate_sequences_with_lifecycle(
+            DataProto(),
+            profile_rollout=True,
+            wake_up_replicas=False,
+        )
+    assert any(
+        "rollout profile cleanup" in note and "injected stop_profile failure" in note
+        for note in error_info.value.__notes__
+    )

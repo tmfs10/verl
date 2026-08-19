@@ -693,27 +693,29 @@ class IntermediateMCValueController:
             primary_error = error
             raise
         finally:
-            cleanup_error: BaseException | None = None
+            cleanup_errors: list[tuple[str, BaseException]] = []
             try:
                 # This is required even when wake-up partially fails, and for
                 # the already-awake first rollout stage.
                 self.trainer.checkpoint_manager.sleep_replicas()
             except BaseException as error:
-                cleanup_error = error
+                cleanup_errors.append(("rollout sleep cleanup", error))
 
             if profile_cleanup_required:
                 try:
                     self.trainer.async_rollout_manager.stop_profile()
                 except BaseException as error:
-                    if cleanup_error is None:
-                        cleanup_error = error
-                    else:
-                        cleanup_error.add_note(f"rollout profile cleanup also failed: {error!r}")
+                    cleanup_errors.append(("rollout profile cleanup", error))
 
-            if cleanup_error is not None:
-                if primary_error is None:
-                    raise cleanup_error
-                primary_error.add_note(f"rollout lifecycle cleanup also failed: {cleanup_error!r}")
+            if cleanup_errors:
+                if primary_error is not None:
+                    for label, error in cleanup_errors:
+                        primary_error.add_note(f"{label} also failed: {error!r}")
+                else:
+                    _, first_error = cleanup_errors[0]
+                    for label, error in cleanup_errors[1:]:
+                        first_error.add_note(f"{label} also failed: {error!r}")
+                    raise first_error
 
     def _make_reward_batch(
         self,
