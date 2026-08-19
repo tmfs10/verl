@@ -151,6 +151,13 @@ python3 -m smoke_tests.intermediate_mc_value.topology.analyze \
   --output-dir "$RUN_ROOT/core/report"
 ```
 
+`collect` translates the container's `/output` path through the pinned iad-2
+host mount before rsync. New runs write `metrics.jsonl` directly under each
+`benchmark` directory by propagating the logger path to Ray's remote
+TaskRunner. For runs created before that propagation fix, collection accepts
+exactly one NeMo-bundled file-logger artifact and records its remote source and
+SHA-256 in `collection_provenance.json`; zero or multiple matches fail closed.
+
 The analyzer writes `summary.json` and a wide-page `REPORT.md`. Use the leading
 families from that report to generate the batching, finalist, and four-node
 manifests:

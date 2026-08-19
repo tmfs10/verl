@@ -25,7 +25,7 @@ import re
 import shlex
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 DEFAULT_PYTHON = Path("/home/siddjain/anaconda3/envs/skills_latest/bin/python")
@@ -39,6 +39,7 @@ TRAIN_ROWS = 29427
 TRAIN_SHA256 = "f79a42fe155218db2f1927ee903afd101929724f2d0516352bdbb91cdb139178"
 SSH_ALIAS = "iad-2"
 VERL_CONTAINER = "/lustre/fsw/portfolios/llmservice/users/igitman/llm/images/nemo-skills-verl-0.7.0.sqsh"
+REMOTE_OUTPUT_ROOT = PurePosixPath("/lustre/fsw/portfolios/llmservice/users/siddjain/nemo-run/output")
 
 
 def _resolve_ssh_hostname(alias: str) -> str:
@@ -488,6 +489,19 @@ def _load_submitted(path: Path) -> dict[str, dict[str, str]]:
     return records
 
 
+def _remote_host_output_path(container_output: str) -> PurePosixPath:
+    """Translate the container's /output mount into its iad-2 login-node path."""
+
+    container_path = PurePosixPath(container_output)
+    try:
+        relative = container_path.relative_to("/output")
+    except ValueError as error:
+        raise ValueError(f"remote output is outside the pinned /output mount: {container_output!r}") from error
+    if not relative.parts or any(part in {".", ".."} for part in relative.parts):
+        raise ValueError(f"invalid remote output below /output: {container_output!r}")
+    return REMOTE_OUTPUT_ROOT.joinpath(relative)
+
+
 def _ssh(command: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["ssh", SSH_ALIAS, command], capture_output=True, text=True, check=False)
 
@@ -724,11 +738,51 @@ def main() -> None:
     for index, (candidate_id, record) in enumerate(submitted.items(), start=1):
         destination = collect_root / candidate_id
         destination.mkdir(parents=True, exist_ok=True)
-        source = f"{SSH_ALIAS}:{record['remote_output']}/benchmark/"
+        host_output = _remote_host_output_path(record["remote_output"])
+        benchmark_output = host_output / "benchmark"
+        source = f"{SSH_ALIAS}:{benchmark_output}/"
         print(f"[collect {index}/{len(submitted)}] {candidate_id}", flush=True)
         result = subprocess.run(["rsync", "-a", source, str(destination) + "/"], check=False)
         if result.returncode:
             raise SystemExit(result.returncode)
+        metrics_source = benchmark_output / "metrics.jsonl"
+        used_legacy_fallback = False
+        if not (destination / "metrics.jsonl").is_file():
+            # Runs created before the TaskRunner runtime-env fix wrote the file
+            # logger under NeMo Run's bundled working directory. Recover exactly
+            # one such artifact and reject ambiguity instead of guessing.
+            legacy_root = host_output / "job"
+            legacy_pattern = f"*/nemo-run/code/intermediate_mc_topology/{candidate_id}.jsonl"
+            query = _ssh(f"find {shlex.quote(str(legacy_root))} -type f -path {shlex.quote(legacy_pattern)} -print")
+            if query.returncode:
+                raise RuntimeError(query.stderr.strip() or f"could not search legacy metrics below {legacy_root}")
+            matches = [line for line in query.stdout.splitlines() if line.strip()]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"{candidate_id}: expected exactly one legacy metrics file below {legacy_root}, got {matches!r}"
+                )
+            metrics_source = PurePosixPath(matches[0])
+            result = subprocess.run(
+                ["rsync", "-a", f"{SSH_ALIAS}:{metrics_source}", str(destination / "metrics.jsonl")],
+                check=False,
+            )
+            if result.returncode:
+                raise SystemExit(result.returncode)
+            used_legacy_fallback = True
+        (destination / "collection_provenance.json").write_text(
+            json.dumps(
+                {
+                    "benchmark_source": str(benchmark_output),
+                    "metrics_sha256": _sha256(destination / "metrics.jsonl"),
+                    "metrics_source": str(metrics_source),
+                    "used_legacy_metrics_fallback": used_legacy_fallback,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":

@@ -224,6 +224,22 @@ def _validate_inputs(config, benchmark: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _configure_file_logger(config, metrics_path: Path) -> None:
+    """Route the file logger in both this driver and Ray's TaskRunner."""
+
+    value = str(metrics_path)
+    os.environ["VERL_FILE_LOGGER_PATH"] = value
+    # PPO constructs Tracking inside a remote TaskRunner. Environment mutations
+    # made by this Ray job driver are not automatically inherited by that actor,
+    # so bind the path into the explicit Ray runtime environment as well.
+    OmegaConf.update(
+        config,
+        "ray_kwargs.ray_init.runtime_env.env_vars.VERL_FILE_LOGGER_PATH",
+        value,
+        force_add=True,
+    )
+
+
 @hydra.main(config_path="../../../verl/trainer/config", config_name="intermediate_mc_ppo_trainer", version_base=None)
 def main(config) -> None:
     benchmark_config = OmegaConf.select(config, "topology_benchmark")
@@ -234,7 +250,7 @@ def main(config) -> None:
     if not output_dir.is_absolute() or str(output_dir).startswith("/opt/verl"):
         raise ValueError("topology benchmark output_dir must be an absolute mounted data/output path")
     output_dir.mkdir(parents=True, exist_ok=True)
-    os.environ["VERL_FILE_LOGGER_PATH"] = str(output_dir / "metrics.jsonl")
+    _configure_file_logger(config, output_dir / "metrics.jsonl")
 
     _write_json(output_dir / "resolved_config.json", OmegaConf.to_container(config, resolve=True))
     _write_json(output_dir / "driver_hardware_before.json", _local_hardware_snapshot())

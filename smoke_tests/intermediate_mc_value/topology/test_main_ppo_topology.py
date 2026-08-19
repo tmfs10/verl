@@ -20,7 +20,11 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
-from smoke_tests.intermediate_mc_value.topology.main_ppo_topology import _validate_contract, _validate_inputs
+from smoke_tests.intermediate_mc_value.topology.main_ppo_topology import (
+    _configure_file_logger,
+    _validate_contract,
+    _validate_inputs,
+)
 
 
 def _contract_config():
@@ -127,6 +131,16 @@ def test_contract_accepts_feature_enabled_m0_and_rejects_detailed_audit() -> Non
     config.algorithm.intermediate_mc_value.audit_output_dir = "/output/audit"
     with pytest.raises(ValueError, match="detailed intermediate-MC audit"):
         _validate_contract(config, benchmark)
+
+
+def test_file_logger_path_is_propagated_to_remote_task_runner(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VERL_FILE_LOGGER_PATH", raising=False)
+    config = OmegaConf.create({"ray_kwargs": {"ray_init": {}}})
+    metrics_path = Path("/output/run/benchmark/metrics.jsonl")
+
+    _configure_file_logger(config, metrics_path)
+
+    assert config.ray_kwargs.ray_init.runtime_env.env_vars.VERL_FILE_LOGGER_PATH == str(metrics_path)
 
 
 def test_contract_rejects_obsolete_launcher_critic_key() -> None:

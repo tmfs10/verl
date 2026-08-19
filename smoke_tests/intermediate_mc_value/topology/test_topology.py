@@ -39,6 +39,7 @@ from smoke_tests.intermediate_mc_value.topology.matrix import (
 )
 from smoke_tests.intermediate_mc_value.topology.submit_oci_iad import (
     _extra_args,
+    _remote_host_output_path,
     _replace_ssh_tunnel_host,
     _replace_verl_container,
     _requeue_value,
@@ -161,6 +162,16 @@ def test_oci_runtime_is_the_a100_preflighted_shared_verl_image() -> None:
     assert submit_module.VERL_CONTAINER == (
         "/lustre/fsw/portfolios/llmservice/users/igitman/llm/images/nemo-skills-verl-0.7.0.sqsh"
     )
+
+
+def test_collector_translates_only_the_pinned_output_mount() -> None:
+    assert str(_remote_host_output_path("/output/smoke_tests/run/candidate")) == (
+        "/lustre/fsw/portfolios/llmservice/users/siddjain/nemo-run/output/smoke_tests/run/candidate"
+    )
+    with pytest.raises(ValueError, match="outside the pinned /output mount"):
+        _remote_host_output_path("/tmp/run")
+    with pytest.raises(ValueError, match="invalid remote output"):
+        _remote_host_output_path("/output/../tmp/run")
 
 
 def test_scheduler_requeue_contract_parser() -> None:
