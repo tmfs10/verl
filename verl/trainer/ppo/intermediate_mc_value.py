@@ -47,7 +47,7 @@ class VarianceSelection:
 @dataclass(frozen=True)
 class EMASelection:
     token: int
-    probability: float
+    value: float
     ema: float
     reference: float
     ratio: float
@@ -189,7 +189,7 @@ def select_variance_marks(
 
 
 def select_ema_marks(
-    token_log_probs: Sequence[float],
+    token_values: Sequence[float],
     *,
     k: int,
     min_gap: int,
@@ -201,7 +201,7 @@ def select_ema_marks(
     ratio_up: float,
     ratio_down: float,
 ) -> tuple[list[EMASelection], list[float]]:
-    """Select marks from an EMA of behavior-policy token probabilities.
+    """Select marks from an EMA of one-indexed solution-state values.
 
     All arithmetic is Python float (IEEE float64). ``baseline_token`` is a
     one-indexed solution-token position and establishes the initial reference;
@@ -219,23 +219,17 @@ def select_ema_marks(
     if floor <= 0.0 or ratio_up <= 1.0 or not 0.0 < ratio_down < 1.0:
         raise ValueError("invalid EMA floor or ratio thresholds")
 
-    probabilities: list[float] = []
-    for value in token_log_probs:
-        log_probability = float(value)
-        if not math.isfinite(log_probability):
-            raise ValueError("EMA selector requires finite behavior-policy log probabilities")
-        probability = math.exp(log_probability)
-        if not math.isfinite(probability) or probability < 0.0 or probability > 1.0 + 1e-12:
-            raise ValueError("EMA selector received an invalid behavior-policy probability")
-        probabilities.append(min(probability, 1.0))
-    if not probabilities:
+    values = [float(value) for value in token_values]
+    if not all(math.isfinite(value) and value >= 0.0 for value in values):
+        raise ValueError("EMA selector requires finite non-negative critic values")
+    if not values:
         return [], []
 
-    ema_values = [probabilities[0]]
-    for probability in probabilities[1:]:
-        ema_values.append(alpha * probability + (1.0 - alpha) * ema_values[-1])
+    ema_values = [values[0]]
+    for value in values[1:]:
+        ema_values.append(alpha * value + (1.0 - alpha) * ema_values[-1])
 
-    low, high = candidate_bounds(len(probabilities), start_fraction, end_fraction)
+    low, high = candidate_bounds(len(values), start_fraction, end_fraction)
     if k == 0 or baseline_token > len(ema_values):
         return [], ema_values
     reference = ema_values[baseline_token - 1]
@@ -256,7 +250,7 @@ def select_ema_marks(
         selected.append(
             EMASelection(
                 token=token,
-                probability=probabilities[token - 1],
+                value=values[token - 1],
                 ema=current,
                 reference=reference,
                 ratio=ratio,
@@ -451,6 +445,34 @@ def build_critic_context(
     )
     if [context.token_ids[position] for position in context.solution_positions] != list(solution_ids):
         raise RuntimeError("critic solution positions do not preserve exact actor solution token IDs")
+    return context
+
+
+def build_unconditioned_critic_context(
+    prompt_ids: Sequence[int],
+    solution_ids: Sequence[int],
+    *,
+    solution_delimiter_ids: Sequence[int],
+) -> CriticContext:
+    """Build ``q + Solution: + x`` while retaining the common state-slot contract."""
+
+    if not prompt_ids or not solution_ids:
+        raise ValueError("critic prompt and solution token ranges must be non-empty")
+    if not solution_delimiter_ids:
+        raise ValueError("critic solution delimiter must tokenize to a non-empty sequence")
+    prompt_end = len(prompt_ids)
+    solution_delimiter_end = prompt_end + len(solution_delimiter_ids)
+    solution_end = solution_delimiter_end + len(solution_ids)
+    context = CriticContext(
+        token_ids=[*map(int, prompt_ids), *map(int, solution_delimiter_ids), *map(int, solution_ids)],
+        prompt_range=(0, prompt_end),
+        critique_delimiter_range=(prompt_end, prompt_end),
+        critique_range=(prompt_end, prompt_end),
+        solution_delimiter_range=(prompt_end, solution_delimiter_end),
+        solution_range=(solution_delimiter_end, solution_end),
+    )
+    if [context.token_ids[position] for position in context.solution_positions] != list(solution_ids):
+        raise RuntimeError("unconditioned critic solution positions do not preserve actor solution token IDs")
     return context
 
 

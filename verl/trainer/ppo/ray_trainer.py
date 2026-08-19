@@ -1939,7 +1939,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                     with marked_timer("gen", timing_raw, color="red"):
                         if self.intermediate_mc_controller is not None:
                             # The controller uses the same blocking lifecycle for
-                            # this first stage and the variance-only second stage.
+                            # this first stage and the critic-dependent continuation stage.
                             # It independently attempts sleep/profile cleanup
                             # after partial lifecycle failures.
                             gen_batch_output = self.intermediate_mc_controller._generate_sequences_with_lifecycle(

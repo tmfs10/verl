@@ -30,11 +30,12 @@ from verl.experimental.agent_loop.intermediate_mc_agent_loop import (
     IntermediateMCGenerationRecord,
 )
 from verl.trainer.config import IntermediateMCValueConfig
-from verl.trainer.ppo.intermediate_mc_value import build_critic_context
+from verl.trainer.ppo.intermediate_mc_value import build_critic_context, build_unconditioned_critic_context
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.ray_trainer_intermediate_mc import (
     IntermediateMCValueController,
     _Bundle,
+    configured_optimizer_rows,
     validate_intermediate_mc_runtime_config,
 )
 from verl.workers.rollout.replica import TokenOutput
@@ -77,9 +78,9 @@ def _controller(*, num_critiques=2, critic_head="scalar", mark_selector="random"
         }
     )
     controller.tokenizer = _Tokenizer()
-    controller.critique_delimiter_ids = [6]
+    controller.critique_delimiter_ids = [6] if num_critiques > 0 else []
     controller.solution_delimiter_ids = [7]
-    controller.critique_instruction_ids = [30, 31]
+    controller.critique_instruction_ids = [30, 31] if num_critiques > 0 else []
     controller.critic_context_limit = 64
     controller.audit_path = None
     controller.trainer = SimpleNamespace(global_steps=1)
@@ -87,16 +88,26 @@ def _controller(*, num_critiques=2, critic_head="scalar", mark_selector="random"
 
 
 def _bundle(*, reward=1.0, num_critiques=2):
-    contexts = [
-        build_critic_context(
-            [11, 12],
-            [40 + index, 50 + index],
-            [21, 22, 23],
-            critique_delimiter_ids=[6],
-            solution_delimiter_ids=[7],
-        )
-        for index in range(num_critiques)
-    ]
+    if num_critiques > 0:
+        contexts = [
+            build_critic_context(
+                [11, 12],
+                [40 + index, 50 + index],
+                [21, 22, 23],
+                critique_delimiter_ids=[6],
+                solution_delimiter_ids=[7],
+            )
+            for index in range(num_critiques)
+        ]
+    else:
+        contexts = [
+            build_unconditioned_critic_context(
+                [11, 12],
+                [21, 22, 23],
+                solution_delimiter_ids=[7],
+            )
+        ]
+    critic_streams = max(1, num_critiques)
     return _Bundle(
         order=0,
         dataset_index=10,
@@ -112,9 +123,9 @@ def _bundle(*, reward=1.0, num_critiques=2):
         contexts=contexts,
         critic_values=[
             [0.2 + 0.1 * index, 0.4 + 0.1 * index, 0.6 + 0.1 * index, 0.8 + 0.1 * index]
-            for index in range(num_critiques)
+            for index in range(critic_streams)
         ],
-        critic_variances=[None] * num_critiques,
+        critic_variances=[None] * critic_streams,
     )
 
 
@@ -189,6 +200,40 @@ def test_actor_packing_has_one_real_prompt_token_and_only_output_tokens_train() 
     torch.testing.assert_close(actor_batch.batch["old_log_probs"], actor_batch.batch["rollout_log_probs"])
     assert actor_batch.batch["response_mask"].sum().item() == 3 + 2 + 2
     assert "continuation" not in actor_batch.non_tensor_batch["intermediate_mc_actor_kind"].tolist()
+
+
+def test_no_self_critique_uses_one_unconditioned_critic_stream_and_solution_only_actor() -> None:
+    controller = _controller(num_critiques=0)
+    bundle = _bundle(num_critiques=0)
+    assert len(bundle.contexts) == 1
+    assert bundle.contexts[0].token_ids == [11, 12, 7, 21, 22, 23]
+    critic_batch = controller._make_critic_batch([bundle])
+    assert len(critic_batch) == 1
+    assert critic_batch.batch["critic_positions"].tolist() == [[2, 3, 4, 5]]
+
+    actor_batch = controller._make_actor_batch(_source(), [bundle])
+    assert len(actor_batch) == 1
+    assert actor_batch.non_tensor_batch["intermediate_mc_actor_kind"].tolist() == ["solution"]
+    assert actor_batch.batch["response_mask"].sum().item() == len(bundle.solution_ids)
+
+
+def test_no_self_critique_builds_one_unconditioned_context_from_empty_child_record() -> None:
+    controller = _controller(num_critiques=0)
+    record = IntermediateMCGenerationRecord(
+        rollout_id="rollout",
+        critiques=(),
+        selected_marks=(),
+        continuations=(),
+        failed_continuations=(),
+        selector_diagnostics=(),
+    )
+    bundle = controller._build_bundles(_source(), {"rollout": record}, [1.0])[0]
+    assert bundle.critique_ids == []
+    assert bundle.critique_log_probs == []
+    assert len(bundle.contexts) == 1
+    assert bundle.contexts[0].critique_range == (2, 2)
+    assert bundle.contexts[0].token_ids == [11, 12, 7, 21, 22, 23]
+    assert bundle.critic_values == [None]
 
 
 def _causal_log_probs(input_ids: torch.Tensor, seed: int = 3) -> torch.Tensor:
@@ -276,6 +321,8 @@ def _runtime_config():
                 "model": {"trust_remote_code": False, "override_config": {}},
                 "actor": {
                     "strategy": "fsdp",
+                    "ppo_mini_batch_size": 1,
+                    "ulysses_sequence_parallel_size": 1,
                     "use_kl_loss": False,
                     "use_rollout_log_probs": False,
                     "use_prefix_grouper": False,
@@ -299,9 +346,18 @@ def _runtime_config():
                 "strategy": "fsdp",
                 "enable": None,
                 "cliprange_value": 0.2,
+                "ppo_mini_batch_size": 1,
+                "ulysses_sequence_parallel_size": 1,
+                "model": {"path": "local-critic", "tokenizer_path": None},
             },
-            "trainer": {"use_legacy_worker_impl": "auto", "critic_warmup": 30},
+            "trainer": {
+                "use_legacy_worker_impl": "auto",
+                "critic_warmup": 30,
+                "n_gpus_per_node": 1,
+                "nnodes": 1,
+            },
             "reward": {
+                "reward_manager": {"source": "register", "name": "naive"},
                 "reward_kwargs": {},
                 "reward_model": {
                     "enable": False,
@@ -313,6 +369,8 @@ def _runtime_config():
                 },
             },
             "data": {
+                "train_batch_size": 1,
+                "gen_batch_size": 1,
                 "use_dataset_responses": False,
                 "max_prompt_length": 16,
                 "max_response_length": 16,
@@ -330,9 +388,25 @@ def test_runtime_config_keeps_native_loss_and_enables_behavior_log_probs() -> No
     assert config.actor_rollout_ref.actor.policy_loss.loss_mode == "vanilla"
 
 
+@pytest.mark.parametrize("num_critiques", [0, 2])
+def test_configured_optimizer_rows_cover_no_critique_and_self_critique_modes(num_critiques) -> None:
+    config = _runtime_config()
+    config.algorithm.intermediate_mc_value.num_critiques = num_critiques
+    feature = IntermediateMCValueConfig(enable=True, num_critiques=num_critiques)
+    rows = configured_optimizer_rows(config, feature)
+    assert rows == {
+        "solutions": 1,
+        "critic": max(1, num_critiques),
+        "actor": 1 + num_critiques,
+        "actor_critiques": num_critiques,
+    }
+
+
 def test_disabled_runtime_config_is_a_strict_noop() -> None:
     config = _runtime_config()
     config.algorithm.intermediate_mc_value.enable = False
+    config.reward.reward_manager.name = "conditional_logprob"
+    config.critic.model.path = "hdfs://unsupported/critic"
     validate_intermediate_mc_runtime_config(config)
     assert config.critic.enable is None
     assert config.actor_rollout_ref.rollout.calculate_log_probs is False
@@ -378,6 +452,9 @@ def test_intermediate_mc_disables_streaming_reward_loop_and_preserves_rollout_id
         ("actor_rollout_ref.rollout.temperature", 0.9, "temperature=1.0"),
         ("actor_rollout_ref.rollout.max_model_len", None, "explicit positive"),
         ("reward.reward_model.launch_reward_fn_async", True, "blocking iteration barrier"),
+        ("reward.reward_manager.name", "conditional_logprob", "conditional_logprob"),
+        ("critic.model.path", "hdfs://models/critic", "HDFS"),
+        ("critic.model.tokenizer_path", "hdfs://models/tokenizer", "HDFS"),
         (
             "reward.reward_kwargs.use_response_logprob_reward_for_uniform_outcome_groups",
             True,
@@ -392,6 +469,27 @@ def test_runtime_config_rejects_unsupported_modes(path, value, message) -> None:
     config = _runtime_config()
     OmegaConf.update(config, path, value)
     with pytest.raises(ValueError, match=message):
+        validate_intermediate_mc_runtime_config(config)
+
+
+def test_runtime_config_rejects_optimizer_cardinality_before_worker_allocation() -> None:
+    config = _runtime_config()
+    config.algorithm.intermediate_mc_value.num_critiques = 2
+    config.data.gen_batch_size = 2
+    config.actor_rollout_ref.actor.ppo_mini_batch_size = 4
+    with pytest.raises(ValueError, match="actor rows .* global PPO minibatch"):
+        validate_intermediate_mc_runtime_config(config)
+
+
+def test_runtime_config_rejects_minibatch_that_cannot_be_sharded_across_dp() -> None:
+    config = _runtime_config()
+    config.algorithm.intermediate_mc_value.num_critiques = 0
+    config.data.train_batch_size = 6
+    config.data.gen_batch_size = 6
+    config.trainer.n_gpus_per_node = 2
+    config.actor_rollout_ref.actor.ppo_mini_batch_size = 3
+    config.critic.ppo_mini_batch_size = 2
+    with pytest.raises(ValueError, match="actor global PPO minibatch .* actor DP size"):
         validate_intermediate_mc_runtime_config(config)
 
 
@@ -420,6 +518,34 @@ def test_sampling_parameters_force_temperature_processed_logprobs_and_explicit_c
     assert params["logprobs"] is True
     assert params["max_tokens"] == 7
     assert "max_new_tokens" not in params
+
+
+def test_no_self_critique_solution_stage_emits_no_critique_requests() -> None:
+    loop = _agent_loop()
+    loop.feature = IntermediateMCValueConfig(num_critiques=0, max_marks=0, min_mark_gap=1)
+    generated_kinds: list[str] = []
+
+    async def fake_generate(_route_key, _prompt, _params, *, max_tokens, kind):
+        generated_kinds.append(kind)
+        return TokenOutput(token_ids=[20, 21], log_probs=[-0.1, -0.2])
+
+    loop._generate = fake_generate
+    output = asyncio.run(
+        loop.run(
+            {"temperature": 1.0},
+            prompt_ids_override=[10],
+            intermediate_mc_stage="solution",
+            intermediate_mc_rollout_id="rollout",
+            intermediate_mc_critic_context_limit=64,
+            intermediate_mc_warmup=False,
+            intermediate_mc_global_step=1,
+            index=0,
+        )
+    )
+    record = output.extra_fields[INTERMEDIATE_MC_CHILD_FIELD]
+    assert generated_kinds == ["solution"]
+    assert record.critiques == ()
+    assert record.continuations == ()
 
 
 def test_critique_failure_drains_every_child_before_raising() -> None:
@@ -480,7 +606,62 @@ def test_individual_continuation_failure_is_omitted_after_drain() -> None:
     assert failures == ((1, 0),)
 
 
-def test_variance_continuation_stage_profiles_and_cleans_up_on_generation_failure() -> None:
+def test_ema_marks_are_selected_from_average_critic_values_after_scoring() -> None:
+    controller = _controller(mark_selector="ema")
+    controller.feature = IntermediateMCValueConfig(
+        num_critiques=2,
+        mark_selector="ema",
+        continuations_per_mark=2,
+        max_marks=1,
+        min_mark_gap=1,
+        mark_start_fraction=0.0,
+        mark_end_fraction=1.0,
+        ema_alpha=1.0,
+        ema_baseline_token=1,
+        ema_ratio_up=2.0,
+        ema_ratio_down=0.5,
+    )
+    bundle = _bundle()
+    bundle.critic_values = [
+        [0.4, 0.1, 0.5, 0.4],
+        [0.6, 0.3, 0.7, 0.4],
+    ]
+    audit: list[tuple[str, dict]] = []
+    controller._audit = lambda event, **payload: audit.append((event, payload))
+
+    controller._select_ema_marks([bundle])
+    assert bundle.marks == [2]
+    selection = next(payload for event, payload in audit if event == "mark_selection" and "token" in payload)
+    assert selection["value"] == pytest.approx(0.6)
+    assert selection["reference"] == pytest.approx(0.2)
+    assert selection["ratio"] == pytest.approx(3.0)
+
+    request = controller._make_deferred_continuation_request(_source(), [bundle])
+    assert request is not None
+    assert request.non_tensor_batch["intermediate_mc_stage"].tolist() == ["continuations"]
+    assert request.non_tensor_batch["intermediate_mc_selected_marks"][0] == [2]
+
+
+@pytest.mark.parametrize("selector", ["ema", "variance"])
+def test_critic_dependent_selectors_never_select_marks_in_initial_generation(selector) -> None:
+    loop = _agent_loop()
+    loop.feature = IntermediateMCValueConfig(
+        critic_head="beta" if selector == "variance" else "scalar",
+        mark_selector=selector,
+        max_marks=1,
+        min_mark_gap=1,
+    )
+    marks, diagnostics = loop._select_marks(
+        [1, 2, 3],
+        rollout_id="rollout",
+        global_step=1,
+        dataset_index=0,
+    )
+    assert marks == []
+    assert diagnostics == []
+
+
+def test_deferred_continuation_stage_profiles_and_cleans_up_on_generation_failure() -> None:
     controller = _controller(critic_head="beta", mark_selector="variance")
     bundle = _bundle()
     bundle.marks = [1]
@@ -501,11 +682,11 @@ def test_variance_continuation_stage_profiles_and_cleans_up_on_generation_failur
             generate_sequences=fail_generation,
         ),
     )
-    controller._make_variance_request = lambda _source, _bundles: DataProto.from_dict(
+    controller._make_deferred_continuation_request = lambda _source, _bundles: DataProto.from_dict(
         non_tensors={"request": np.array([1])}
     )
     with pytest.raises(RuntimeError, match="injected variance"):
-        controller._generate_variance_continuations(
+        controller._generate_deferred_continuations(
             _source(),
             [bundle],
             {},

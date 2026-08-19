@@ -15,7 +15,7 @@ CELLS=${CELLS:-"scalar_random scalar_ema beta_variance"}
 BACKENDS=${BACKENDS:-"fsdp fsdp2"}
 RUN_RESUME=${RUN_RESUME:-0}
 DRY_RUN=${DRY_RUN:-0}
-NUM_CRITIQUES=${NUM_CRITIQUES:-2}
+CRITIQUE_COUNTS=${CRITIQUE_COUNTS:-${NUM_CRITIQUES:-"2 0"}}
 TARGET_UPDATES=2
 if [[ "$RUN_RESUME" == "1" ]]; then
     TARGET_UPDATES=3
@@ -42,8 +42,9 @@ cell_config() {
 run_target() {
     local cell=$1
     local backend=$2
-    local run_dir=$3
-    local total_steps=$4
+    local num_critiques=$3
+    local run_dir=$4
+    local total_steps=$5
     local critic_head mark_selector
     read -r critic_head mark_selector < <(cell_config "$cell")
     local audit_dir="$run_dir/audit"
@@ -54,7 +55,7 @@ run_target() {
         config_only=(--cfg job)
     fi
 
-    echo "[$cell/$backend] native RayPPO training through global step $total_steps"
+    echo "[$cell/$backend/critiques=$num_critiques] native RayPPO training through global step $total_steps"
     python3 -m verl.trainer.main_ppo \
         --config-name=intermediate_mc_ppo_trainer \
         "${config_only[@]}" \
@@ -63,7 +64,7 @@ run_target() {
         algorithm.use_kl_in_reward=false \
         algorithm.intermediate_mc_value.critic_head="$critic_head" \
         algorithm.intermediate_mc_value.mark_selector="$mark_selector" \
-        algorithm.intermediate_mc_value.num_critiques="$NUM_CRITIQUES" \
+        algorithm.intermediate_mc_value.num_critiques="$num_critiques" \
         algorithm.intermediate_mc_value.continuations_per_mark=2 \
         algorithm.intermediate_mc_value.max_marks=1 \
         algorithm.intermediate_mc_value.critique_max_response_length=64 \
@@ -121,7 +122,7 @@ run_target() {
         trainer.critic_warmup=1 \
         trainer.logger='["console"]' \
         trainer.project_name=intermediate_mc_value_smoke \
-        trainer.experiment_name="${cell}_${backend}" \
+        trainer.experiment_name="${cell}_${backend}_critiques${num_critiques}" \
         trainer.default_local_dir="$checkpoint_dir" \
         trainer.n_gpus_per_node="$GPU_COUNT" \
         trainer.nnodes=1 \
@@ -136,32 +137,38 @@ run_target() {
 for cell in $CELLS; do
     read -r critic_head mark_selector < <(cell_config "$cell")
     for backend in $BACKENDS; do
-        run_dir="$SMOKE_ROOT/${cell}_${backend}"
-        done_marker="$run_dir/verified-${TARGET_UPDATES}.done"
-        mkdir -p "$run_dir"
-        if [[ -f "$done_marker" ]]; then
-            echo "[$cell/$backend] already verified; skipping"
-            continue
-        fi
+        for num_critiques in $CRITIQUE_COUNTS; do
+            if ! [[ "$num_critiques" =~ ^[0-9]+$ ]]; then
+                echo "Invalid non-negative critique count: $num_critiques" >&2
+                exit 2
+            fi
+            run_dir="$SMOKE_ROOT/${cell}_${backend}_critiques${num_critiques}"
+            done_marker="$run_dir/verified-${TARGET_UPDATES}.done"
+            mkdir -p "$run_dir"
+            if [[ -f "$done_marker" ]]; then
+                echo "[$cell/$backend/critiques=$num_critiques] already verified; skipping"
+                continue
+            fi
 
-        run_target "$cell" "$backend" "$run_dir" 2
-        if [[ "$DRY_RUN" == "1" ]]; then
-            echo "[$cell/$backend] configuration dry-run complete"
-            continue
-        fi
-        if [[ "$RUN_RESUME" == "1" ]]; then
-            run_target "$cell" "$backend" "$run_dir" 3
-        fi
+            run_target "$cell" "$backend" "$num_critiques" "$run_dir" 2
+            if [[ "$DRY_RUN" == "1" ]]; then
+                echo "[$cell/$backend/critiques=$num_critiques] configuration dry-run complete"
+                continue
+            fi
+            if [[ "$RUN_RESUME" == "1" ]]; then
+                run_target "$cell" "$backend" "$num_critiques" "$run_dir" 3
+            fi
 
-        python3 smoke_tests/intermediate_mc_value/verify_audit.py \
-            --audit-file "$run_dir/audit/intermediate_mc_value.jsonl" \
-            --checkpoint-root "$run_dir/checkpoints" \
-            --critic-head "$critic_head" \
-            --mark-selector "$mark_selector" \
-            --num-critiques "$NUM_CRITIQUES" \
-            --expected-global-step "$TARGET_UPDATES"
-        touch "$done_marker"
-        echo "[$cell/$backend] verified"
+            python3 smoke_tests/intermediate_mc_value/verify_audit.py \
+                --audit-file "$run_dir/audit/intermediate_mc_value.jsonl" \
+                --checkpoint-root "$run_dir/checkpoints" \
+                --critic-head "$critic_head" \
+                --mark-selector "$mark_selector" \
+                --num-critiques "$num_critiques" \
+                --expected-global-step "$TARGET_UPDATES"
+            touch "$done_marker"
+            echo "[$cell/$backend/critiques=$num_critiques] verified"
+        done
     done
 done
 

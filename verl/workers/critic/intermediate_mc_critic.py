@@ -35,6 +35,43 @@ class DataParallelIntermediateMCCritic(DataParallelPPOCritic):
         self.cliprange_value = float(self.config.cliprange_value)
         self.beta_target_epsilon = float(feature["beta_target_epsilon"])
 
+    @staticmethod
+    def _validated_gather_positions(
+        micro_batch: dict[str, torch.Tensor],
+        *,
+        sequence_length: int,
+    ) -> torch.Tensor:
+        """Validate active critic states and normalize only inactive padding."""
+
+        positions = micro_batch["critic_positions"]
+        position_mask = micro_batch["critic_position_mask"].bool()
+        attention_mask = micro_batch["attention_mask"].bool()
+        if positions.ndim != 2 or position_mask.shape != positions.shape:
+            raise ValueError("critic_positions and critic_position_mask must have equal rank-2 shapes")
+        if positions.shape[0] != attention_mask.shape[0] or attention_mask.shape[1] != sequence_length:
+            raise ValueError("critic positions and attention mask have inconsistent batch or sequence dimensions")
+
+        positions = positions.long()
+        invalid = position_mask & ((positions < 0) | (positions >= sequence_length))
+        if torch.any(invalid):
+            row, column = torch.nonzero(invalid, as_tuple=False)[0].tolist()
+            raise ValueError(
+                "active critic position is outside the model sequence: "
+                f"row={row} column={column} position={int(positions[row, column])} "
+                f"sequence_length={sequence_length}"
+            )
+
+        safe_positions = torch.where(position_mask, positions, torch.zeros_like(positions))
+        attended = attention_mask.gather(dim=1, index=safe_positions)
+        invalid_attention = position_mask & ~attended
+        if torch.any(invalid_attention):
+            row, column = torch.nonzero(invalid_attention, as_tuple=False)[0].tolist()
+            raise ValueError(
+                "active critic position refers to padding: "
+                f"row={row} column={column} position={int(safe_positions[row, column])}"
+            )
+        return safe_positions
+
     def _forward_context_micro_batch(self, micro_batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Return raw critic logits at ``critic_positions`` without causal shifting."""
 
@@ -113,7 +150,7 @@ class DataParallelIntermediateMCCritic(DataParallelPPOCritic):
                 else:
                     logits = output.logits
 
-        positions = micro_batch["critic_positions"].long().clamp(min=0, max=sequence_length - 1)
+        positions = self._validated_gather_positions(micro_batch, sequence_length=sequence_length)
         gather_index = positions.unsqueeze(-1).expand(-1, -1, logits.shape[-1])
         return logits.gather(dim=1, index=gather_index).float()
 
@@ -227,8 +264,17 @@ class DataParallelIntermediateMCCritic(DataParallelPPOCritic):
                     targets = inputs["critic_targets"].float()
                     old_values = inputs["critic_old_values"].float()
                     target_mask = inputs["critic_target_mask"].float()
+                    position_mask = inputs["critic_position_mask"].float()
+                    if target_mask.shape != position_mask.shape or torch.any(target_mask > position_mask):
+                        raise RuntimeError("critic targets must be a subset of active critic positions")
                     if not torch.any(target_mask):
                         raise RuntimeError("intermediate MC critic microbatch contains no supervised positions")
+                    active_targets = target_mask.bool()
+                    if (
+                        not torch.isfinite(targets[active_targets]).all()
+                        or not torch.isfinite(old_values[active_targets]).all()
+                    ):
+                        raise FloatingPointError("intermediate MC critic targets and old values must be finite")
                     if self.critic_head == "scalar":
                         components = scalar_value_loss_components(
                             logits[..., 0],

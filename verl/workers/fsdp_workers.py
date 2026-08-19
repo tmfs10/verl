@@ -78,7 +78,7 @@ from verl.utils.fsdp_utils import (
 )
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
-from verl.utils.model import convert_weight_keys
+from verl.utils.model import convert_weight_keys, update_model_config
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage, simple_timer
 from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min_max
 from verl.utils.py_functional import convert_to_regular_types
@@ -96,6 +96,25 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _configure_critic_model_config(critic_model_config, override_config_kwargs, intermediate_mc_config):
+    """Apply feature-owned critic overrides without changing VeRL's disabled path."""
+
+    intermediate_mc_enabled = bool(intermediate_mc_config.get("enable", False))
+    critic_head = None
+    if intermediate_mc_enabled:
+        # Match the actor's established override order: tokenizer IDs provide
+        # defaults, then explicit model overrides win. The feature-owned head
+        # width is forced last so it cannot be accidentally overridden.
+        update_model_config(critic_model_config, override_config_kwargs=override_config_kwargs)
+        critic_head = intermediate_mc_config.get("critic_head")
+        if critic_head not in {"scalar", "beta"}:
+            raise ValueError(f"unsupported intermediate MC critic head {critic_head!r}")
+        critic_model_config.num_labels = 1 if critic_head == "scalar" else 2
+    else:
+        critic_model_config.num_labels = 1
+    return intermediate_mc_enabled, critic_head
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -1447,15 +1466,11 @@ class CriticWorker(Worker, DistProfilerExtension):
         if self.ulysses_sequence_parallel_size > 1 and hasattr(critic_model_config, "vision_config"):
             critic_model_config.vision_config._attn_implementation = "eager"
 
-        intermediate_mc_config = self.config.get("intermediate_mc_value", {})
-        intermediate_mc_enabled = bool(intermediate_mc_config.get("enable", False))
-        if intermediate_mc_enabled:
-            critic_head = intermediate_mc_config.get("critic_head")
-            if critic_head not in {"scalar", "beta"}:
-                raise ValueError(f"unsupported intermediate MC critic head {critic_head!r}")
-            critic_model_config.num_labels = 1 if critic_head == "scalar" else 2
-        else:
-            critic_model_config.num_labels = 1
+        intermediate_mc_enabled, critic_head = _configure_critic_model_config(
+            critic_model_config,
+            override_config_kwargs,
+            self.config.get("intermediate_mc_value", {}),
+        )
         # patch for kimi-vl
         if getattr(critic_model_config, "model_type", None) == "kimi_vl":
             critic_model_config.text_config.topk_method = "greedy"
@@ -1710,23 +1725,24 @@ class CriticWorker(Worker, DistProfilerExtension):
         data.meta_info["micro_batch_size"] = micro_batch_size
         data.meta_info["max_token_len"] = self.config.forward_max_token_len_per_gpu
         data.meta_info["use_dynamic_bsz"] = self.config.use_dynamic_bsz
-        # perform forward computation
-        dp_group = self._get_data_parallel_group()
+        # Preserve the original VeRL critic call exactly when the feature is off.
+        intermediate_mc_enabled = bool(self.config.get("intermediate_mc_value", {}).get("enable", False))
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on critic.compute_values
-            computed = self.critic.compute_values(
-                data=data,
-                dp_group=dp_group,
-                same_micro_num_in_dp=True,
-            )
-            if isinstance(computed, tuple):
+            if intermediate_mc_enabled:
+                computed = self.critic.compute_values(
+                    data=data,
+                    dp_group=self._get_data_parallel_group(),
+                    same_micro_num_in_dp=True,
+                )
                 values, variances = computed
                 tensors = {"values": values}
                 if variances is not None:
                     tensors["variances"] = variances
                 output = DataProto.from_dict(tensors=tensors)
             else:
-                output = DataProto.from_dict(tensors={"values": computed})
+                values = self.critic.compute_values(data=data)
+                output = DataProto.from_dict(tensors={"values": values})
 
         output = output.to("cpu")
         if self._is_offload_param:
@@ -1741,16 +1757,19 @@ class CriticWorker(Worker, DistProfilerExtension):
         if self._is_offload_optimizer:
             load_fsdp_optimizer(optimizer=self.critic_optimizer, device_id=get_device_id())
 
-        # perform forward computation
-        dp_group = self._get_data_parallel_group()
+        # Preserve the original VeRL critic call exactly when the feature is off.
+        intermediate_mc_enabled = bool(self.config.get("intermediate_mc_value", {}).get("enable", False))
         with self.ulysses_sharding_manager:
             data = data.to("cpu")  # data will to device with each micro batch on critic.update_critic
             with Timer(name="update_critic", logger=None) as timer:
-                metrics = self.critic.update_critic(
-                    data=data,
-                    dp_group=dp_group,
-                    same_micro_num_in_dp=True,
-                )
+                if intermediate_mc_enabled:
+                    metrics = self.critic.update_critic(
+                        data=data,
+                        dp_group=self._get_data_parallel_group(),
+                        same_micro_num_in_dp=True,
+                    )
+                else:
+                    metrics = self.critic.update_critic(data=data)
             delta_time = timer.last
 
             global_num_tokens = data.meta_info["global_token_num"]

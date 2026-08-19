@@ -70,6 +70,7 @@ def latest_native_checkpoint(checkpoint_root: Path) -> tuple[int, Path]:
 
 def main() -> None:
     args = parse_args()
+    require(args.num_critiques >= 0, "num-critiques must be non-negative")
     rows = load_jsonl(args.audit_file)
     by_event: dict[str, list[dict[str, object]]] = {}
     for row in rows:
@@ -79,6 +80,19 @@ def main() -> None:
     require(bool(warmup), "critic-only warmup was not audited")
     require(all(row.get("continuations") == 0 for row in warmup), "warmup requested a continuation")
 
+    critic_batches = by_event.get("critic_batch", [])
+    require(bool(critic_batches), "critic batch construction was not audited")
+    for row in critic_batches:
+        solutions = int(row["solutions"])
+        require(
+            int(row["contexts"]) == solutions * max(1, args.num_critiques),
+            "critic context multiplicity is incorrect",
+        )
+        require(
+            int(row["critiques"]) == solutions * args.num_critiques,
+            "critic critique multiplicity is incorrect",
+        )
+
     actor_batches = by_event.get("actor_batch", [])
     require(bool(actor_batches), "post-warmup actor update was not audited")
     for row in actor_batches:
@@ -87,6 +101,12 @@ def main() -> None:
         solutions = int(row["solutions"])
         critiques = int(row["critiques"])
         require(critiques == solutions * args.num_critiques, "actor critique multiplicity is incorrect")
+
+    critique_credit = by_event.get("critique_credit", [])
+    if args.num_critiques == 0:
+        require(not critique_credit, "self-critique-disabled run emitted synthetic critique credit")
+    else:
+        require(bool(critique_credit), "self-critique run did not audit critique credit")
 
     selections = [row for row in by_event.get("mark_selection", []) if row.get("reason") != "ema_summary"]
     require(bool(selections), "no nonterminal mark was selected")
@@ -98,6 +118,10 @@ def main() -> None:
             "EMA selector used an unknown reason",
         )
         require(all(math.isfinite(float(row["ratio"])) for row in selections), "EMA ratio is non-finite")
+        require(
+            all(0.0 <= float(row["value"]) <= args.max_reward for row in selections),
+            "EMA selection did not record a bounded critic value",
+        )
     else:
         require(args.critic_head == "beta", "variance selection did not use a Beta critic")
         require(
@@ -108,6 +132,19 @@ def main() -> None:
             all(math.isfinite(float(row["variance"])) and float(row["variance"]) >= 0 for row in selections),
             "selected variance is invalid",
         )
+
+    if args.mark_selector in {"ema", "variance"}:
+        for index, row in enumerate(rows):
+            if row.get("event") != "mark_selection" or row.get("reason") == "ema_summary":
+                continue
+            step = int(row.get("global_step", -1))
+            require(
+                any(
+                    earlier.get("event") == "critic_scored" and int(earlier.get("global_step", -2)) == step
+                    for earlier in rows[:index]
+                ),
+                f"{args.mark_selector} mark selection occurred before critic scoring",
+            )
 
     continuations = by_event.get("continuation", [])
     require(bool(continuations), "no continuation completed")

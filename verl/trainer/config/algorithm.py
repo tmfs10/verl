@@ -76,6 +76,10 @@ class IntermediateMCValueConfig(BaseConfig):
         return 1 if self.critic_head == "scalar" else 2
 
     @property
+    def num_critic_streams(self) -> int:
+        return max(1, self.num_critiques)
+
+    @property
     def resolved_max_marks(self) -> int:
         if self.max_marks is not None:
             return self.max_marks
@@ -88,8 +92,9 @@ class IntermediateMCValueConfig(BaseConfig):
             raise ValueError("algorithm.intermediate_mc_value.mark_selector must be random, ema, or variance")
         if self.mark_selector == "variance" and self.critic_head != "beta":
             raise ValueError("algorithm.intermediate_mc_value.mark_selector=variance requires critic_head=beta")
+        if not isinstance(self.num_critiques, int) or isinstance(self.num_critiques, bool) or self.num_critiques < 0:
+            raise ValueError("algorithm.intermediate_mc_value.num_critiques must be a non-negative integer")
         positive_ints = {
-            "num_critiques": self.num_critiques,
             "continuations_per_mark": self.continuations_per_mark,
             "min_mark_gap": self.min_mark_gap,
             "ema_baseline_token": self.ema_baseline_token,

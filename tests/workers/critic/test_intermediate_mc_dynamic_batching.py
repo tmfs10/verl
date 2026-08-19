@@ -18,11 +18,13 @@ import os
 from types import MethodType
 
 import numpy as np
+import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from verl import DataProto
+from verl.workers.critic.intermediate_mc_critic import DataParallelIntermediateMCCritic
 
 
 class _EvalOnlyModule:
@@ -97,3 +99,35 @@ def test_two_rank_gloo_critic_synchronizes_dynamic_microbatch_count(tmp_path) ->
         (0, 2, (4, 2), True),
         (1, 2, (4, 2), True),
     ]
+
+
+def test_critic_positions_normalize_only_inactive_padding() -> None:
+    positions = DataParallelIntermediateMCCritic._validated_gather_positions(
+        {
+            "critic_positions": torch.tensor([[0, 2, 999], [1, -9, -9]]),
+            "critic_position_mask": torch.tensor([[1, 1, 0], [1, 0, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1], [1, 1, 0]]),
+        },
+        sequence_length=3,
+    )
+    assert positions.tolist() == [[0, 2, 0], [1, 0, 0]]
+
+
+@pytest.mark.parametrize(
+    ("position", "attention_mask", "message"),
+    [
+        (-1, [1, 1, 1], "outside"),
+        (3, [1, 1, 1], "outside"),
+        (2, [1, 1, 0], "padding"),
+    ],
+)
+def test_active_critic_positions_fail_closed(position, attention_mask, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        DataParallelIntermediateMCCritic._validated_gather_positions(
+            {
+                "critic_positions": torch.tensor([[position]]),
+                "critic_position_mask": torch.ones((1, 1)),
+                "attention_mask": torch.tensor([attention_mask]),
+            },
+            sequence_length=3,
+        )

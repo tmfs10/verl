@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 import random
 from pathlib import Path
 
@@ -31,6 +30,7 @@ from verl.trainer.ppo.intermediate_mc_value import (
     aggregate_mark_targets,
     beta_value_loss_components,
     build_critic_context,
+    build_unconditioned_critic_context,
     candidate_bounds,
     critique_accuracy_reward,
     critique_group_advantages,
@@ -58,11 +58,15 @@ def test_head_and_selector_are_independent_and_variance_requires_beta() -> None:
         IntermediateMCValueConfig(critic_head="scalar", mark_selector="variance")
 
 
-def test_explicit_zero_marks_and_one_critique_are_supported() -> None:
+def test_explicit_zero_marks_zero_critiques_and_one_critique_are_supported() -> None:
     assert IntermediateMCValueConfig(max_marks=0).resolved_max_marks == 0
+    without_critiques = IntermediateMCValueConfig(num_critiques=0)
+    assert without_critiques.num_critiques == 0
+    assert without_critiques.num_critic_streams == 1
     with pytest.warns(UserWarning, match="exactly zero"):
         config = IntermediateMCValueConfig(num_critiques=1)
     assert config.num_critiques == 1
+    assert config.num_critic_streams == 1
 
 
 def test_hydra_base_and_feature_preset_preserve_native_actor_loss_override() -> None:
@@ -88,7 +92,8 @@ def test_hydra_base_and_feature_preset_preserve_native_actor_loss_override() -> 
     [
         ({"critic_head": "categorical"}, "critic_head"),
         ({"mark_selector": "queue"}, "mark_selector"),
-        ({"num_critiques": 0}, "num_critiques"),
+        ({"num_critiques": -1}, "num_critiques"),
+        ({"num_critiques": True}, "num_critiques"),
         ({"num_critiques": 4.0}, "num_critiques"),
         ({"max_marks": -1}, "max_marks"),
         ({"selection_seed": 1.0}, "selection_seed"),
@@ -137,10 +142,10 @@ def test_random_marks_return_largest_feasible_nonterminal_subset() -> None:
     assert max(marks) < 10
 
 
-def test_ema_uses_float64_behavior_probabilities_and_chronological_reference_updates() -> None:
-    probabilities = [0.2, 0.5, 0.4, 0.1, 0.1]
+def test_ema_uses_float64_critic_values_and_chronological_reference_updates() -> None:
+    values = [0.2, 0.5, 0.4, 0.1, 0.1]
     selections, ema_values = select_ema_marks(
-        [math.log(value) for value in probabilities],
+        values,
         k=4,
         min_gap=1,
         start_fraction=0.0,
@@ -151,15 +156,17 @@ def test_ema_uses_float64_behavior_probabilities_and_chronological_reference_upd
         ratio_up=2.0,
         ratio_down=0.5,
     )
-    assert ema_values == pytest.approx(probabilities)
+    assert ema_values == pytest.approx(values)
     assert [(item.token, item.direction) for item in selections] == [(2, "up"), (4, "down")]
+    assert [item.value for item in selections] == pytest.approx([0.5, 0.1])
     assert selections[1].reference == pytest.approx(0.5)
 
 
-def test_ema_rejects_nonfinite_behavior_log_probability() -> None:
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -0.1])
+def test_ema_rejects_invalid_critic_value(invalid) -> None:
     with pytest.raises(ValueError, match="finite"):
         select_ema_marks(
-            [0.0, float("nan")],
+            [0.0, invalid],
             k=1,
             min_gap=1,
             start_fraction=0.0,
@@ -173,9 +180,9 @@ def test_ema_rejects_nonfinite_behavior_log_probability() -> None:
 
 
 def test_ema_keeps_configured_baseline_when_candidate_window_starts_later() -> None:
-    probabilities = [0.9] * 49 + [0.1] * 51
+    values = [0.9] * 49 + [0.1] * 51
     selections, _ = select_ema_marks(
-        [math.log(value) for value in probabilities],
+        values,
         k=1,
         min_gap=1,
         start_fraction=0.5,
@@ -192,7 +199,7 @@ def test_ema_keeps_configured_baseline_when_candidate_window_starts_later() -> N
 
 def test_ema_min_gap_is_anchored_at_the_configured_baseline() -> None:
     selections, _ = select_ema_marks(
-        [math.log(value) for value in [0.2, 0.8, 0.8, 0.8, 0.8]],
+        [0.2, 0.8, 0.8, 0.8, 0.8],
         k=1,
         min_gap=3,
         start_fraction=0.0,
@@ -350,6 +357,21 @@ def test_exact_critic_boundaries_include_s0_and_solution_states() -> None:
     assert context.token_ids == [1, 2, 10, 11, 3, 4, 20, 21, 22, 5, 6, 7]
     assert context.pre_solution_position == 8
     assert context.value_positions == [8, 9, 10, 11]
+    assert [context.token_ids[index] for index in context.solution_positions] == [5, 6, 7]
+
+
+def test_unconditioned_critic_context_uses_one_stream_and_no_critique_boundary() -> None:
+    context = build_unconditioned_critic_context(
+        [1, 2],
+        [5, 6, 7],
+        solution_delimiter_ids=[20, 21, 22],
+    )
+    assert context.token_ids == [1, 2, 20, 21, 22, 5, 6, 7]
+    assert context.prompt_range == (0, 2)
+    assert context.critique_delimiter_range == (2, 2)
+    assert context.critique_range == (2, 2)
+    assert context.pre_solution_position == 4
+    assert context.value_positions == [4, 5, 6, 7]
     assert [context.token_ids[index] for index in context.solution_positions] == [5, 6, 7]
 
 

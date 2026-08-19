@@ -25,7 +25,6 @@ from verl.trainer.config import INTERMEDIATE_MC_CRITIQUE_PROMPT
 from verl.trainer.ppo.intermediate_mc_value import (
     CRITIQUE_DELIMITER,
     SOLUTION_DELIMITER,
-    select_ema_marks,
     select_random_marks,
     stable_rng,
 )
@@ -95,14 +94,20 @@ class IntermediateMCAgentLoop(AgentLoopBase):
         )
         self.response_length = int(self.rollout_config.response_length)
         self.max_model_len = int(self.rollout_config.max_model_len)
-        self.critique_instruction_ids = self.tokenizer.encode(
-            "\n\n" + INTERMEDIATE_MC_CRITIQUE_PROMPT,
-            add_special_tokens=False,
-        )
-        self.critique_delimiter_ids = self.tokenizer.encode(CRITIQUE_DELIMITER, add_special_tokens=False)
         self.solution_delimiter_ids = self.tokenizer.encode(SOLUTION_DELIMITER, add_special_tokens=False)
-        if not self.critique_instruction_ids or not self.critique_delimiter_ids or not self.solution_delimiter_ids:
-            raise ValueError("intermediate MC delimiters and critique instruction must tokenize non-empty")
+        if not self.solution_delimiter_ids:
+            raise ValueError("intermediate MC solution delimiter must tokenize non-empty")
+        if self.feature.num_critiques > 0:
+            self.critique_instruction_ids = self.tokenizer.encode(
+                "\n\n" + INTERMEDIATE_MC_CRITIQUE_PROMPT,
+                add_special_tokens=False,
+            )
+            self.critique_delimiter_ids = self.tokenizer.encode(CRITIQUE_DELIMITER, add_special_tokens=False)
+            if not self.critique_instruction_ids or not self.critique_delimiter_ids:
+                raise ValueError("intermediate MC critique delimiter and instruction must tokenize non-empty")
+        else:
+            self.critique_instruction_ids = []
+            self.critique_delimiter_ids = []
 
     @staticmethod
     def _sampling_params(base: dict[str, Any], *, max_tokens: int) -> dict[str, Any]:
@@ -157,59 +162,26 @@ class IntermediateMCAgentLoop(AgentLoopBase):
     def _select_marks(
         self,
         solution_ids: list[int],
-        solution_log_probs: list[float],
         *,
         rollout_id: str,
         global_step: int,
         dataset_index: object,
     ) -> tuple[list[int], list[dict[str, Any]]]:
         k = self.feature.resolved_max_marks
-        if self.feature.mark_selector == "variance" or k == 0:
+        # EMA and variance depend on critic outputs and are selected by the
+        # synchronous controller after critic inference.
+        if self.feature.mark_selector != "random" or k == 0:
             return [], []
-        if self.feature.mark_selector == "random":
-            rng = stable_rng(self.feature.selection_seed, global_step, dataset_index, rollout_id)
-            marks = select_random_marks(
-                len(solution_ids),
-                k=k,
-                min_gap=self.feature.min_mark_gap,
-                start_fraction=self.feature.mark_start_fraction,
-                end_fraction=self.feature.mark_end_fraction,
-                rng=rng,
-            )
-            return marks, [{"token": mark, "reason": "random"} for mark in marks]
-        selections, ema_values = select_ema_marks(
-            solution_log_probs,
+        rng = stable_rng(self.feature.selection_seed, global_step, dataset_index, rollout_id)
+        marks = select_random_marks(
+            len(solution_ids),
             k=k,
             min_gap=self.feature.min_mark_gap,
             start_fraction=self.feature.mark_start_fraction,
             end_fraction=self.feature.mark_end_fraction,
-            alpha=self.feature.ema_alpha,
-            baseline_token=self.feature.ema_baseline_token,
-            floor=self.feature.ema_floor,
-            ratio_up=self.feature.ema_ratio_up,
-            ratio_down=self.feature.ema_ratio_down,
+            rng=rng,
         )
-        diagnostics = [
-            {
-                "token": selection.token,
-                "reason": f"ema_{selection.direction}",
-                "probability": selection.probability,
-                "ema": selection.ema,
-                "reference": selection.reference,
-                "ratio": selection.ratio,
-            }
-            for selection in selections
-        ]
-        if ema_values:
-            diagnostics.append(
-                {
-                    "reason": "ema_summary",
-                    "first": ema_values[0],
-                    "last": ema_values[-1],
-                    "count": len(ema_values),
-                }
-            )
-        return [selection.token for selection in selections], diagnostics
+        return marks, [{"token": mark, "reason": "random"} for mark in marks]
 
     async def _generate_children(
         self,
@@ -341,7 +313,6 @@ class IntermediateMCAgentLoop(AgentLoopBase):
             else:
                 selected_marks, diagnostics = self._select_marks(
                     solution_ids,
-                    solution_log_probs,
                     rollout_id=rollout_id,
                     global_step=int(kwargs.get("intermediate_mc_global_step", -1)),
                     dataset_index=kwargs.get("index", rollout_id),
@@ -354,7 +325,7 @@ class IntermediateMCAgentLoop(AgentLoopBase):
                 selected_marks=selected_marks,
                 sampling_params=sampling_params,
                 critic_context_limit=critic_context_limit,
-                include_critiques=True,
+                include_critiques=self.feature.num_critiques > 0,
             )
         elif stage == "continuations":
             prompt_ids = _as_int_list(kwargs["intermediate_mc_parent_prompt_ids"], "parent prompt")

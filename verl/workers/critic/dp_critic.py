@@ -150,12 +150,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         return grad_norm
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
-    def compute_values(
-        self,
-        data: DataProto,
-        dp_group=None,
-        same_micro_num_in_dp: bool = False,
-    ) -> torch.Tensor:
+    def compute_values(self, data: DataProto) -> torch.Tensor:
         self.critic_module.eval()
         micro_batch_size = data.meta_info["micro_batch_size"]
         use_dynamic_bsz = data.meta_info["use_dynamic_bsz"]
@@ -171,12 +166,7 @@ class DataParallelPPOCritic(BasePPOCritic):
 
         if use_dynamic_bsz:
             max_token_len = data.meta_info["max_token_len"] * self.ulysses_sequence_parallel_size
-            micro_batches, batch_idx_list = prepare_dynamic_batch(
-                data,
-                max_token_len=max_token_len,
-                dp_group=dp_group,
-                same_micro_num_in_dp=same_micro_num_in_dp,
-            )
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
         else:
             micro_batches = data.split(micro_batch_size)
 
@@ -199,7 +189,7 @@ class DataParallelPPOCritic(BasePPOCritic):
         return values
 
     @GPUMemoryLogger(role="dp critic", logger=logger)
-    def update_critic(self, data: DataProto, dp_group=None, same_micro_num_in_dp: bool = True):
+    def update_critic(self, data: DataProto):
         # make sure we are in training mode
         self.critic_module.train()
         metrics = {
@@ -220,12 +210,7 @@ class DataParallelPPOCritic(BasePPOCritic):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = prepare_dynamic_batch(
-                        mini_batch,
-                        max_token_len=max_token_len,
-                        dp_group=dp_group,
-                        same_micro_num_in_dp=same_micro_num_in_dp,
-                    )
+                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu

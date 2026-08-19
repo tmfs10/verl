@@ -45,16 +45,19 @@ from verl.trainer.ppo.intermediate_mc_value import (
     VarianceCandidate,
     aggregate_mark_targets,
     build_critic_context,
+    build_unconditioned_critic_context,
     candidate_bounds,
     critique_accuracy_reward,
     critique_group_advantages,
     initial_state_target,
+    select_ema_marks,
     select_variance_marks,
     stable_rng,
     validate_reward,
 )
 from verl.trainer.ppo.reward import compute_reward
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.fs import is_non_local
 from verl.utils.metric import reduce_metrics
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import marked_timer
@@ -93,6 +96,71 @@ def _is_moe_model(model_config) -> bool:
     return getattr(model_config, "moe_intermediate_size", None) is not None
 
 
+def configured_optimizer_rows(config, feature: IntermediateMCValueConfig) -> dict[str, int]:
+    """Return deterministic global row counts for one intermediate-MC update."""
+
+    configured_generation_batch = config.data.get("gen_batch_size", config.data.train_batch_size)
+    if (
+        isinstance(configured_generation_batch, bool)
+        or not isinstance(configured_generation_batch, int)
+        or configured_generation_batch <= 0
+    ):
+        raise ValueError("intermediate MC requires a positive integer data.gen_batch_size or data.train_batch_size")
+    rollout_n = config.actor_rollout_ref.rollout.n
+    if isinstance(rollout_n, bool) or not isinstance(rollout_n, int) or rollout_n <= 0:
+        raise ValueError("intermediate MC requires actor_rollout_ref.rollout.n to be a positive integer")
+    solution_rows = configured_generation_batch * rollout_n
+    return {
+        "solutions": solution_rows,
+        "critic": solution_rows * feature.num_critic_streams,
+        "actor": solution_rows * (1 + feature.num_critiques),
+        "actor_critiques": solution_rows * feature.num_critiques,
+    }
+
+
+def _validate_configured_optimizer_rows(config, feature: IntermediateMCValueConfig) -> None:
+    rows = configured_optimizer_rows(config, feature)
+    total_gpus = int(config.trainer.n_gpus_per_node) * int(config.trainer.nnodes)
+    if total_gpus <= 0:
+        raise ValueError("intermediate MC requires a positive trainer GPU count")
+    rollout_n = int(config.actor_rollout_ref.rollout.n)
+    role_configs = {
+        "actor": config.actor_rollout_ref.actor,
+        "critic": config.critic,
+    }
+    for role, role_config in role_configs.items():
+        sequence_parallel = int(role_config.get("ulysses_sequence_parallel_size", 1))
+        if sequence_parallel <= 0 or total_gpus % sequence_parallel != 0:
+            raise ValueError(
+                f"intermediate MC {role} Ulysses size ({sequence_parallel}) must divide total GPUs ({total_gpus})"
+            )
+        dp_size = total_gpus // sequence_parallel
+        configured_minibatch = role_config.ppo_mini_batch_size
+        if (
+            isinstance(configured_minibatch, bool)
+            or not isinstance(configured_minibatch, int)
+            or configured_minibatch <= 0
+        ):
+            raise ValueError(f"intermediate MC {role} PPO minibatch must be a positive integer")
+        global_minibatch = configured_minibatch * rollout_n
+        if global_minibatch % dp_size != 0:
+            raise ValueError(
+                f"intermediate MC {role} global PPO minibatch ({global_minibatch}) must be divisible by "
+                f"{role} DP size ({dp_size})"
+            )
+        role_rows = rows[role]
+        if role_rows % dp_size != 0:
+            raise ValueError(
+                f"intermediate MC configured {role} rows ({role_rows}) must be divisible by "
+                f"{role} DP size ({dp_size}); optimizer padding is forbidden"
+            )
+        if role_rows % global_minibatch != 0:
+            raise ValueError(
+                f"intermediate MC configured {role} rows ({role_rows}) must be divisible by "
+                f"global PPO minibatch ({global_minibatch}); optimizer padding is forbidden"
+            )
+
+
 def validate_intermediate_mc_runtime_config(
     config,
     actor_tokenizer=None,
@@ -107,6 +175,18 @@ def validate_intermediate_mc_runtime_config(
     )
     if not feature.enable:
         return
+    reward_source = str(OmegaConf.select(config, "reward.reward_manager.source", default="register"))
+    reward_name = str(OmegaConf.select(config, "reward.reward_manager.name", default=""))
+    if reward_source == "register" and reward_name == "conditional_logprob":
+        raise ValueError("intermediate MC does not support the registered conditional_logprob training reward manager")
+    critic_paths = {
+        "critic.model.path": config.critic.model.path,
+        "critic.model.tokenizer_path": config.critic.model.tokenizer_path,
+    }
+    for name, raw_path in critic_paths.items():
+        if raw_path is not None and is_non_local(str(raw_path)):
+            raise ValueError(f"intermediate MC requires a local or Hugging Face {name}; HDFS is unsupported")
+    _validate_configured_optimizer_rows(config, feature)
     if config.trainer.get("use_legacy_worker_impl", "auto") == "disable":
         raise ValueError("intermediate MC currently supports only VeRL's legacy FSDP/FSDP2 workers")
     if config.actor_rollout_ref.actor.strategy not in {"fsdp", "fsdp2"}:
@@ -248,9 +328,13 @@ class IntermediateMCValueController:
             raise ValueError("intermediate MC currently supports only text-only models and datasets")
         if trainer.reward_fn is None:
             raise ValueError("intermediate MC requires a synchronous environment reward function")
-        self.critique_delimiter_ids = self._encode(CRITIQUE_DELIMITER)
         self.solution_delimiter_ids = self._encode(SOLUTION_DELIMITER)
-        self.critique_instruction_ids = self._encode("\n\n" + INTERMEDIATE_MC_CRITIQUE_PROMPT)
+        if self.feature.num_critiques > 0:
+            self.critique_delimiter_ids = self._encode(CRITIQUE_DELIMITER)
+            self.critique_instruction_ids = self._encode("\n\n" + INTERMEDIATE_MC_CRITIQUE_PROMPT)
+        else:
+            self.critique_delimiter_ids = []
+            self.critique_instruction_ids = []
         self.critic_context_limit = _positive_model_limit(
             os.path.expanduser(self.config.critic.model.path),
             self.config.critic,
@@ -411,21 +495,30 @@ class IntermediateMCValueController:
                 for tokens, log_probs in zip(critique_ids, critique_log_probs, strict=True)
             ):
                 raise RuntimeError(f"rollout {rollout_id!r} contains an invalid critique child")
-            contexts = [
-                build_critic_context(
-                    prompt_ids,
-                    tokens,
-                    solution_ids,
-                    critique_delimiter_ids=self.critique_delimiter_ids,
-                    solution_delimiter_ids=self.solution_delimiter_ids,
-                )
-                for tokens in critique_ids
-            ]
+            if self.feature.num_critiques > 0:
+                contexts = [
+                    build_critic_context(
+                        prompt_ids,
+                        tokens,
+                        solution_ids,
+                        critique_delimiter_ids=self.critique_delimiter_ids,
+                        solution_delimiter_ids=self.solution_delimiter_ids,
+                    )
+                    for tokens in critique_ids
+                ]
+            else:
+                contexts = [
+                    build_unconditioned_critic_context(
+                        prompt_ids,
+                        solution_ids,
+                        solution_delimiter_ids=self.solution_delimiter_ids,
+                    )
+                ]
             if any(len(context.token_ids) > self.critic_context_limit for context in contexts):
-                raise ValueError("conditioned critic sequence exceeds its effective context limit")
+                raise ValueError("intermediate MC critic sequence exceeds its effective context limit")
             marks = sorted(int(mark) for mark in record.selected_marks)
-            if self.feature.mark_selector == "variance" and marks:
-                raise RuntimeError("variance marks must be selected only after critic inference")
+            if self.feature.mark_selector in {"ema", "variance"} and marks:
+                raise RuntimeError(f"{self.feature.mark_selector} marks must be selected only after critic inference")
             bundle = _Bundle(
                 order=row,
                 dataset_index=dataset_values[row],
@@ -439,8 +532,8 @@ class IntermediateMCValueController:
                 critique_ids=critique_ids,
                 critique_log_probs=critique_log_probs,
                 contexts=contexts,
-                critic_values=[None] * self.feature.num_critiques,
-                critic_variances=[None] * self.feature.num_critiques,
+                critic_values=[None] * self.feature.num_critic_streams,
+                critic_variances=[None] * self.feature.num_critic_streams,
                 marks=marks,
                 continuations=list(record.continuations),
                 failed_continuations=list(record.failed_continuations),
@@ -500,6 +593,12 @@ class IntermediateMCValueController:
                 "use_dynamic_bsz": self.config.critic.use_dynamic_bsz,
             }
         )
+        self._audit(
+            "critic_batch",
+            solutions=len(bundles),
+            contexts=len(contexts),
+            critiques=len(bundles) * self.feature.num_critiques,
+        )
         return batch
 
     def _global_minibatch_size(self, role: str) -> int:
@@ -555,7 +654,57 @@ class IntermediateMCValueController:
             if variances is not None:
                 bundle.critic_variances[critique_index] = variances[row, :count].tolist()
         if any(any(values is None for values in bundle.critic_values) for bundle in bundles):
-            raise RuntimeError("critic scoring did not cover every critique-conditioned context")
+            raise RuntimeError("critic scoring did not cover every intermediate MC context")
+        self._audit("critic_scored", contexts=len(critic_batch), solutions=len(bundles))
+
+    @staticmethod
+    def _average_streams(streams: list[list[float] | None], *, name: str) -> list[float]:
+        available = [stream for stream in streams if stream is not None]
+        if not available or len(available) != len(streams):
+            raise RuntimeError(f"{name} requires every critic stream")
+        try:
+            return [sum(items) / len(items) for items in zip(*available, strict=True)]
+        except ValueError as error:
+            raise RuntimeError(f"{name} critic streams have inconsistent lengths") from error
+
+    def _select_ema_marks(self, bundles: list[_Bundle]) -> None:
+        for bundle in bundles:
+            averaged = self._average_streams(bundle.critic_values, name="EMA selection")
+            if len(averaged) != len(bundle.solution_ids) + 1:
+                raise RuntimeError("EMA selection requires V(s0) plus one value per solution token")
+            selections, ema_values = select_ema_marks(
+                averaged[1:],
+                k=self.feature.resolved_max_marks,
+                min_gap=self.feature.min_mark_gap,
+                start_fraction=self.feature.mark_start_fraction,
+                end_fraction=self.feature.mark_end_fraction,
+                alpha=self.feature.ema_alpha,
+                baseline_token=self.feature.ema_baseline_token,
+                floor=self.feature.ema_floor,
+                ratio_up=self.feature.ema_ratio_up,
+                ratio_down=self.feature.ema_ratio_down,
+            )
+            bundle.marks = [selection.token for selection in selections]
+            for selection in selections:
+                self._audit(
+                    "mark_selection",
+                    rollout_id=bundle.rollout_id,
+                    token=selection.token,
+                    reason=f"ema_{selection.direction}",
+                    value=selection.value,
+                    ema=selection.ema,
+                    reference=selection.reference,
+                    ratio=selection.ratio,
+                )
+            if ema_values:
+                self._audit(
+                    "mark_selection",
+                    rollout_id=bundle.rollout_id,
+                    reason="ema_summary",
+                    first=ema_values[0],
+                    last=ema_values[-1],
+                    count=len(ema_values),
+                )
 
     def _select_variance_marks(self, bundles: list[_Bundle]) -> None:
         scopes: dict[str, list[_Bundle]] = {}
@@ -571,12 +720,7 @@ class IntermediateMCValueController:
         for scope, scope_bundles in scopes.items():
             candidates: list[VarianceCandidate] = []
             for bundle in scope_bundles:
-                if any(values is None for values in bundle.critic_variances):
-                    raise RuntimeError("variance selection requires every critique variance stream")
-                averaged = [
-                    sum(values) / len(values)
-                    for values in zip(*(value for value in bundle.critic_variances if value is not None), strict=True)
-                ]
+                averaged = self._average_streams(bundle.critic_variances, name="variance selection")
                 low, high = candidate_bounds(
                     len(bundle.solution_ids),
                     self.feature.mark_start_fraction,
@@ -607,7 +751,11 @@ class IntermediateMCValueController:
         for bundle in bundles:
             bundle.marks.sort()
 
-    def _make_variance_request(self, source: DataProto, bundles: list[_Bundle]) -> DataProto | None:
+    def _make_deferred_continuation_request(
+        self,
+        source: DataProto,
+        bundles: list[_Bundle],
+    ) -> DataProto | None:
         selected = [bundle for bundle in bundles if bundle.marks]
         if not selected:
             return None
@@ -638,14 +786,14 @@ class IntermediateMCValueController:
             meta_info={"global_steps": self.trainer.global_steps},
         )
 
-    def _generate_variance_continuations(
+    def _generate_deferred_continuations(
         self,
         source: DataProto,
         bundles: list[_Bundle],
         timing_raw: dict[str, float],
         profile_rollout: bool,
     ) -> None:
-        request = self._make_variance_request(source, bundles)
+        request = self._make_deferred_continuation_request(source, bundles)
         if request is None:
             return
         with marked_timer("intermediate_mc_continuations", timing_raw, color="red"):
@@ -657,15 +805,15 @@ class IntermediateMCValueController:
             records = self.extract_generation_records(output)
         expected = {bundle.rollout_id for bundle in bundles if bundle.marks}
         if set(records) != expected:
-            raise RuntimeError("variance continuation stage returned an unexpected rollout-id set")
+            raise RuntimeError("deferred continuation stage returned an unexpected rollout-id set")
         for bundle in bundles:
             if not bundle.marks:
                 continue
             record = records[bundle.rollout_id]
             if record.critiques:
-                raise RuntimeError("variance continuation stage unexpectedly regenerated critiques")
+                raise RuntimeError("deferred continuation stage unexpectedly regenerated critiques")
             if list(record.selected_marks) != bundle.marks:
-                raise RuntimeError("variance continuation stage changed the selected marks")
+                raise RuntimeError("deferred continuation stage changed the selected marks")
             bundle.continuations = list(record.continuations)
             bundle.failed_continuations = list(record.failed_continuations)
 
@@ -832,9 +980,10 @@ class IntermediateMCValueController:
         values = torch.zeros((len(bundles), response_width), dtype=torch.float32)
         rewards = torch.zeros_like(values)
         for row, bundle in enumerate(bundles):
-            streams = [stream for stream in bundle.critic_values if stream is not None]
-            averaged = [sum(items) / len(items) for items in zip(*streams, strict=True)]
+            averaged = self._average_streams(bundle.critic_values, name="solution GAE")
             token_count = len(bundle.solution_ids)
+            if len(averaged) != token_count + 1:
+                raise RuntimeError("solution GAE requires V(s0) plus one value per solution token")
             values[row, :token_count] = torch.tensor(averaged[:token_count], dtype=torch.float32)
             rewards[row, token_count - 1] = bundle.terminal_reward
         advantages, returns = core_algos.compute_gae_advantage_return(
@@ -850,6 +999,10 @@ class IntermediateMCValueController:
         source.batch["returns"] = returns
 
     def _critique_advantages(self, bundle: _Bundle) -> list[float]:
+        if self.feature.num_critiques <= 0:
+            raise RuntimeError("critique advantages are undefined when self-critique is disabled")
+        if len(bundle.critic_values) != self.feature.num_critiques:
+            raise RuntimeError("critique credit requires one critic stream per critique")
         points = [len(bundle.solution_ids), *sorted(bundle.per_mark_targets)]
         targets = [
             bundle.terminal_reward,
@@ -889,6 +1042,10 @@ class IntermediateMCValueController:
                     "solution",
                 )
             )
+            if self.feature.num_critiques == 0:
+                if bundle.critique_ids or bundle.critique_log_probs:
+                    raise RuntimeError("self-critique-disabled bundle unexpectedly contains critique outputs")
+                continue
             critique_advantages = self._critique_advantages(bundle)
             critique_prompt = [*bundle.prompt_ids, *bundle.solution_ids, *self.critique_instruction_ids]
             for critique_ids, log_probs, advantage in zip(
@@ -992,9 +1149,12 @@ class IntermediateMCValueController:
             self._score_contexts(critic_batch, bundles)
         in_warmup = self.trainer.global_steps <= int(self.config.trainer.critic_warmup)
         if not in_warmup:
-            if self.feature.mark_selector == "variance":
-                self._select_variance_marks(bundles)
-                self._generate_variance_continuations(
+            if self.feature.mark_selector in {"ema", "variance"}:
+                if self.feature.mark_selector == "ema":
+                    self._select_ema_marks(bundles)
+                else:
+                    self._select_variance_marks(bundles)
+                self._generate_deferred_continuations(
                     source,
                     bundles,
                     timing_raw,
