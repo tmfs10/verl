@@ -92,7 +92,15 @@ def _write_fixture(tmp_path, *, actor_continuations=0, num_critiques=2, mark_sel
     return audit_path, checkpoint_root
 
 
-def _argv(audit_path, checkpoint_root, *, num_critiques=2, mark_selector="random", critic_head="scalar"):
+def _argv(
+    audit_path,
+    checkpoint_root,
+    *,
+    num_critiques=2,
+    mark_selector="random",
+    critic_head="scalar",
+    expected_global_step=2,
+):
     return [
         "verify_audit.py",
         "--audit-file",
@@ -105,8 +113,10 @@ def _argv(audit_path, checkpoint_root, *, num_critiques=2, mark_selector="random
         mark_selector,
         "--num-critiques",
         str(num_critiques),
+        "--critic-warmup",
+        "1",
         "--expected-global-step",
-        "2",
+        str(expected_global_step),
     ]
 
 
@@ -121,6 +131,52 @@ def test_verifier_rejects_continuation_actor_membership(tmp_path, monkeypatch) -
     audit_path, checkpoint_root = _write_fixture(tmp_path, actor_continuations=1)
     monkeypatch.setattr("sys.argv", _argv(audit_path, checkpoint_root))
     with pytest.raises(AssertionError, match="continuation entered"):
+        verify_audit.main()
+
+
+def test_verifier_rejects_actor_batch_during_critic_warmup(tmp_path, monkeypatch) -> None:
+    audit_path, checkpoint_root = _write_fixture(tmp_path)
+    rows = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    actor_batch = next(row for row in rows if row["event"] == "actor_batch")
+    rows.insert(rows.index(actor_batch), {**actor_batch, "global_step": 1})
+    audit_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    monkeypatch.setattr("sys.argv", _argv(audit_path, checkpoint_root))
+    with pytest.raises(AssertionError, match="actor should be frozen"):
+        verify_audit.main()
+
+
+@pytest.mark.parametrize("mutation", ("missing", "duplicate", "nonconsecutive"))
+def test_verifier_requires_exact_critic_warmup_steps(tmp_path, monkeypatch, mutation) -> None:
+    audit_path, checkpoint_root = _write_fixture(tmp_path)
+    rows = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    warmup = next(row for row in rows if row["event"] == "warmup")
+    if mutation == "missing":
+        rows.remove(warmup)
+    elif mutation == "duplicate":
+        rows.insert(rows.index(warmup), warmup.copy())
+    else:
+        warmup["global_step"] = 2
+    audit_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    monkeypatch.setattr("sys.argv", _argv(audit_path, checkpoint_root))
+    with pytest.raises(AssertionError, match="warmup"):
+        verify_audit.main()
+
+
+def test_verifier_requires_post_warmup_actor_batch(tmp_path, monkeypatch) -> None:
+    audit_path, checkpoint_root = _write_fixture(tmp_path)
+    rows = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    rows = [row for row in rows if row["event"] != "actor_batch"]
+    audit_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    monkeypatch.setattr("sys.argv", _argv(audit_path, checkpoint_root))
+    with pytest.raises(AssertionError, match="post-warmup actor update"):
+        verify_audit.main()
+
+
+def test_resume_verifier_requires_actor_batch_at_resumed_step(tmp_path, monkeypatch) -> None:
+    audit_path, checkpoint_root = _write_fixture(tmp_path)
+    (checkpoint_root / "global_step_2").rename(checkpoint_root / "global_step_3")
+    monkeypatch.setattr("sys.argv", _argv(audit_path, checkpoint_root, expected_global_step=3))
+    with pytest.raises(AssertionError, match="expected actor audit steps"):
         verify_audit.main()
 
 

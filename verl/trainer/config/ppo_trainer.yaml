@@ -147,7 +147,7 @@ algorithm:
     # Minimum token distance between marks in one rollout.
     min_mark_gap: 32
 
-    # EMA coefficient over behavior-policy token probabilities.
+    # EMA coefficient over critique-averaged critic values.
     ema_alpha: 0.1
 
     # First one-indexed token eligible to establish the EMA reference.

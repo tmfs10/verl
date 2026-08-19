@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--critic-head", choices=("scalar", "beta"), required=True)
     parser.add_argument("--mark-selector", choices=("random", "ema", "variance"), required=True)
     parser.add_argument("--num-critiques", type=int, required=True)
+    parser.add_argument("--critic-warmup", type=int, required=True)
     parser.add_argument("--expected-global-step", type=int, required=True)
     parser.add_argument("--max-reward", type=float, default=1.0)
     return parser.parse_args()
@@ -71,14 +72,20 @@ def latest_native_checkpoint(checkpoint_root: Path) -> tuple[int, Path]:
 def main() -> None:
     args = parse_args()
     require(args.num_critiques >= 0, "num-critiques must be non-negative")
+    require(args.critic_warmup >= 0, "critic-warmup must be non-negative")
     rows = load_jsonl(args.audit_file)
     by_event: dict[str, list[dict[str, object]]] = {}
     for row in rows:
         by_event.setdefault(str(row.get("event")), []).append(row)
 
     warmup = by_event.get("warmup", [])
-    require(bool(warmup), "critic-only warmup was not audited")
+    require(bool(warmup) == (args.critic_warmup > 0), "critic-only warmup audit count is inconsistent")
     require(all(row.get("continuations") == 0 for row in warmup), "warmup requested a continuation")
+    warmup_steps = sorted(int(row.get("global_step", -1)) for row in warmup)
+    require(
+        warmup_steps == list(range(1, args.critic_warmup + 1)),
+        f"expected warmup audit steps 1..{args.critic_warmup}, got {warmup_steps}",
+    )
 
     critic_batches = by_event.get("critic_batch", [])
     require(bool(critic_batches), "critic batch construction was not audited")
@@ -95,6 +102,16 @@ def main() -> None:
 
     actor_batches = by_event.get("actor_batch", [])
     require(bool(actor_batches), "post-warmup actor update was not audited")
+    actor_steps = sorted(int(row.get("global_step", -1)) for row in actor_batches)
+    require(
+        all(step > args.critic_warmup for step in actor_steps),
+        "actor batch was emitted while the actor should be frozen for critic warmup",
+    )
+    expected_actor_steps = list(range(args.critic_warmup + 1, args.expected_global_step + 1))
+    require(
+        actor_steps == expected_actor_steps,
+        f"expected actor audit steps {expected_actor_steps}, got {actor_steps}",
+    )
     for row in actor_batches:
         require(row.get("continuations") == 0, "a continuation entered an actor batch")
         require(row.get("padding") == 0, "actor optimizer batch contains dummy padding")
@@ -152,7 +169,7 @@ def main() -> None:
         reward = float(row["reward"])
         require(0.0 <= reward <= args.max_reward and math.isfinite(reward), "continuation reward is invalid")
 
-    targets = [row for row in by_event.get("critic_targets", []) if int(row.get("global_step", 0)) > 1]
+    targets = [row for row in by_event.get("critic_targets", []) if int(row.get("global_step", 0)) > args.critic_warmup]
     require(bool(targets), "post-warmup critic targets were not audited")
     require(any(int(row["dense_token_labels"]) > 0 for row in targets), "no dense continuation labels survived")
     for row in targets:

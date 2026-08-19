@@ -13,6 +13,9 @@ SMOKE_ROOT=${SMOKE_ROOT:-/home/siddjain/data/intermediate_mc_value_model/verl/sm
 GPU_COUNT=${GPU_COUNT:-2}
 CELLS=${CELLS:-"scalar_random scalar_ema beta_variance"}
 BACKENDS=${BACKENDS:-"fsdp fsdp2"}
+DYNAMIC_CELLS=${DYNAMIC_CELLS-"scalar_random"}
+DYNAMIC_CRITIQUE_COUNT=${DYNAMIC_CRITIQUE_COUNT:-2}
+RUN_DYNAMIC_PARITY=${RUN_DYNAMIC_PARITY:-1}
 RUN_RESUME=${RUN_RESUME:-0}
 DRY_RUN=${DRY_RUN:-0}
 CRITIQUE_COUNTS=${CRITIQUE_COUNTS:-${NUM_CRITIQUES:-"2 0"}}
@@ -43,19 +46,27 @@ run_target() {
     local cell=$1
     local backend=$2
     local num_critiques=$3
-    local run_dir=$4
-    local total_steps=$5
+    local dynamic_critic=$4
+    local run_dir=$5
+    local total_steps=$6
     local critic_head mark_selector
     read -r critic_head mark_selector < <(cell_config "$cell")
     local audit_dir="$run_dir/audit"
     local checkpoint_dir="$run_dir/checkpoints"
     local log_file="$run_dir/train-to-${total_steps}.log"
     local -a config_only=()
+    local -a dynamic_overrides=()
     if [[ "$DRY_RUN" == "1" ]]; then
         config_only=(--cfg job)
     fi
+    if [[ "$dynamic_critic" == "true" ]]; then
+        dynamic_overrides=(
+            critic.ppo_max_token_len_per_gpu=1024
+            critic.forward_max_token_len_per_gpu=1024
+        )
+    fi
 
-    echo "[$cell/$backend/critiques=$num_critiques] native RayPPO training through global step $total_steps"
+    echo "[$cell/$backend/critiques=$num_critiques/dynamic_critic=$dynamic_critic] native RayPPO training through global step $total_steps"
     python3 -m verl.trainer.main_ppo \
         --config-name=intermediate_mc_ppo_trainer \
         "${config_only[@]}" \
@@ -93,6 +104,7 @@ run_target() {
         actor_rollout_ref.actor.ppo_mini_batch_size=2 \
         actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
         actor_rollout_ref.actor.ppo_epochs=1 \
+        actor_rollout_ref.actor.use_dynamic_bsz=false \
         actor_rollout_ref.actor.use_kl_loss=false \
         actor_rollout_ref.rollout.name=vllm \
         actor_rollout_ref.rollout.n=1 \
@@ -116,13 +128,15 @@ run_target() {
         critic.ppo_mini_batch_size=2 \
         critic.ppo_micro_batch_size_per_gpu=1 \
         critic.forward_micro_batch_size_per_gpu=1 \
+        critic.use_dynamic_bsz="$dynamic_critic" \
+        "${dynamic_overrides[@]}" \
         critic.ppo_epochs=1 \
         reward.reward_model.enable=false \
         trainer.use_legacy_worker_impl=enable \
         trainer.critic_warmup=1 \
         trainer.logger='["console"]' \
         trainer.project_name=intermediate_mc_value_smoke \
-        trainer.experiment_name="${cell}_${backend}_critiques${num_critiques}" \
+        trainer.experiment_name="${cell}_${backend}_critiques${num_critiques}_dynamic${dynamic_critic}" \
         trainer.default_local_dir="$checkpoint_dir" \
         trainer.n_gpus_per_node="$GPU_COUNT" \
         trainer.nnodes=1 \
@@ -134,41 +148,96 @@ run_target() {
         trainer.resume_mode=auto 2>&1 | tee "$log_file"
 }
 
-for cell in $CELLS; do
+run_case() {
+    local cell=$1
+    local backend=$2
+    local num_critiques=$3
+    local dynamic_critic=$4
+    local critic_head mark_selector suffix run_dir done_marker
     read -r critic_head mark_selector < <(cell_config "$cell")
+    if ! [[ "$num_critiques" =~ ^[0-9]+$ ]]; then
+        echo "Invalid non-negative critique count: $num_critiques" >&2
+        exit 2
+    fi
+    if [[ "$dynamic_critic" != "true" && "$dynamic_critic" != "false" ]]; then
+        echo "Invalid dynamic critic flag: $dynamic_critic" >&2
+        exit 2
+    fi
+    suffix=""
+    if [[ "$dynamic_critic" == "true" ]]; then
+        suffix="_dynamic_critic"
+    fi
+    run_dir="$SMOKE_ROOT/${cell}_${backend}_critiques${num_critiques}${suffix}"
+    done_marker="$run_dir/verified-${TARGET_UPDATES}.done"
+    mkdir -p "$run_dir"
+    if [[ -f "$done_marker" ]]; then
+        echo "[$cell/$backend/critiques=$num_critiques/dynamic_critic=$dynamic_critic] already verified; skipping"
+        return
+    fi
+
+    run_target "$cell" "$backend" "$num_critiques" "$dynamic_critic" "$run_dir" 2
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "[$cell/$backend/critiques=$num_critiques/dynamic_critic=$dynamic_critic] configuration dry-run complete"
+        return
+    fi
+    if [[ "$RUN_RESUME" == "1" ]]; then
+        run_target "$cell" "$backend" "$num_critiques" "$dynamic_critic" "$run_dir" 3
+    fi
+
+    python3 smoke_tests/intermediate_mc_value/verify_audit.py \
+        --audit-file "$run_dir/audit/intermediate_mc_value.jsonl" \
+        --checkpoint-root "$run_dir/checkpoints" \
+        --critic-head "$critic_head" \
+        --mark-selector "$mark_selector" \
+        --num-critiques "$num_critiques" \
+        --critic-warmup 1 \
+        --expected-global-step "$TARGET_UPDATES"
+    touch "$done_marker"
+    echo "[$cell/$backend/critiques=$num_critiques/dynamic_critic=$dynamic_critic] verified"
+}
+
+run_dynamic_parity() {
+    if [[ "$RUN_DYNAMIC_PARITY" != "1" ]]; then
+        return
+    fi
+    if [[ "$DRY_RUN" == "1" ]]; then
+        echo "Dynamic critic parity requires GPUs and is skipped during Hydra configuration dry-runs"
+        return
+    fi
+    if ! command -v torchrun >/dev/null 2>&1; then
+        echo "torchrun is required for dynamic critic update parity." >&2
+        exit 2
+    fi
+    for backend in $BACKENDS; do
+        local parity_dir="$SMOKE_ROOT/dynamic_critic_update_${backend}"
+        local result_file="$parity_dir/result.json"
+        local done_marker="$parity_dir/verified.done"
+        mkdir -p "$parity_dir"
+        if [[ -f "$done_marker" ]]; then
+            echo "[dynamic critic parity/$backend] already verified; skipping"
+            continue
+        fi
+        torchrun --standalone --nproc-per-node=2 --module \
+            smoke_tests.intermediate_mc_value.dynamic_critic_update_smoke \
+            --strategy "$backend" \
+            --output-json "$result_file" 2>&1 | tee "$parity_dir/run.log"
+        touch "$done_marker"
+    done
+}
+
+run_dynamic_parity
+
+for cell in $CELLS; do
     for backend in $BACKENDS; do
         for num_critiques in $CRITIQUE_COUNTS; do
-            if ! [[ "$num_critiques" =~ ^[0-9]+$ ]]; then
-                echo "Invalid non-negative critique count: $num_critiques" >&2
-                exit 2
-            fi
-            run_dir="$SMOKE_ROOT/${cell}_${backend}_critiques${num_critiques}"
-            done_marker="$run_dir/verified-${TARGET_UPDATES}.done"
-            mkdir -p "$run_dir"
-            if [[ -f "$done_marker" ]]; then
-                echo "[$cell/$backend/critiques=$num_critiques] already verified; skipping"
-                continue
-            fi
-
-            run_target "$cell" "$backend" "$num_critiques" "$run_dir" 2
-            if [[ "$DRY_RUN" == "1" ]]; then
-                echo "[$cell/$backend/critiques=$num_critiques] configuration dry-run complete"
-                continue
-            fi
-            if [[ "$RUN_RESUME" == "1" ]]; then
-                run_target "$cell" "$backend" "$num_critiques" "$run_dir" 3
-            fi
-
-            python3 smoke_tests/intermediate_mc_value/verify_audit.py \
-                --audit-file "$run_dir/audit/intermediate_mc_value.jsonl" \
-                --checkpoint-root "$run_dir/checkpoints" \
-                --critic-head "$critic_head" \
-                --mark-selector "$mark_selector" \
-                --num-critiques "$num_critiques" \
-                --expected-global-step "$TARGET_UPDATES"
-            touch "$done_marker"
-            echo "[$cell/$backend/critiques=$num_critiques] verified"
+            run_case "$cell" "$backend" "$num_critiques" false
         done
+    done
+done
+
+for cell in $DYNAMIC_CELLS; do
+    for backend in $BACKENDS; do
+        run_case "$cell" "$backend" "$DYNAMIC_CRITIQUE_COUNT" true
     done
 done
 
