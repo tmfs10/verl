@@ -126,7 +126,7 @@ validation, checkpoints, detailed audit JSONL, and rollout dumps are disabled
 in the measurement window.
 
 Check state and collect completed benchmark artifacts through the pinned
-`iad-1` route:
+`iad-2` route:
 
 ```bash
 python3 -m smoke_tests.intermediate_mc_value.topology.submit_oci_iad status \
@@ -185,6 +185,8 @@ python3 -m smoke_tests.intermediate_mc_value.topology.matrix four-node-finalists
   --output "$RUN_ROOT/four_node_finalist.jsonl"
 ```
 
-Do not substitute another OCI login alias or cluster route silently. If the
-configured direct `iad-1` route is unavailable, stop before the remote dry-run
-and restore that route or obtain explicit approval for a replacement.
+The submitter resolves `iad-2` to login node 02 and writes a data-owned
+execution copy of `oci-iad.yaml` under each local run directory. That copy
+changes only `ssh_tunnel.host`; its source and generated hashes are recorded in
+`cluster_config/provenance.json`. The authoritative source YAML is never
+modified. Do not substitute another OCI login alias or cluster route silently.

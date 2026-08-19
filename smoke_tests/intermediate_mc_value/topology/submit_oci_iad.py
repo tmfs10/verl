@@ -37,7 +37,60 @@ TRAIN_DATA = "/data/rl/opsd_openthoughts_compmath/openthoughts_math_30k_opsd_ful
 VAL_DATA = "/data/rl/mathgen/comp_math_verl.jsonl"
 TRAIN_ROWS = 29427
 TRAIN_SHA256 = "f79a42fe155218db2f1927ee903afd101929724f2d0516352bdbb91cdb139178"
-SSH_ALIAS = "iad-1"
+SSH_ALIAS = "iad-2"
+
+
+def _resolve_ssh_hostname(alias: str) -> str:
+    result = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise RuntimeError(f"could not resolve SSH alias {alias!r}: {result.stderr.strip()}")
+    hostnames = [
+        line.split(maxsplit=1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("hostname ") and len(line.split(maxsplit=1)) == 2
+    ]
+    if len(hostnames) != 1:
+        raise ValueError(f"SSH alias {alias!r} resolved to {len(hostnames)} hostnames: {hostnames!r}")
+    return hostnames[0]
+
+
+def _replace_ssh_tunnel_host(config_text: str, target_host: str) -> tuple[str, str]:
+    pattern = re.compile(r"(?m)^(  host:\s*)([^#\s]+)(\s*(?:#.*)?)$")
+    matches = pattern.findall(config_text)
+    if len(matches) != 1:
+        raise ValueError(f"expected exactly one two-space-indented SSH host in oci-iad.yaml, found {len(matches)}")
+    original_host = matches[0][1]
+    updated = pattern.sub(lambda match: f"{match.group(1)}{target_host}{match.group(3)}", config_text, count=1)
+    return updated, original_host
+
+
+def _prepare_execution_config(source_dir: Path, local_run_dir: Path) -> Path:
+    source = source_dir.expanduser().resolve() / "oci-iad.yaml"
+    if not source.is_file():
+        raise FileNotFoundError(f"missing authoritative OCI-IAD config: {source}")
+    target_host = _resolve_ssh_hostname(SSH_ALIAS)
+    updated, original_host = _replace_ssh_tunnel_host(source.read_text(encoding="utf-8"), target_host)
+    destination_dir = local_run_dir / "cluster_config"
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / source.name
+    destination.write_text(updated, encoding="utf-8")
+    (destination_dir / "provenance.json").write_text(
+        json.dumps(
+            {
+                "source": str(source),
+                "source_sha256": _sha256(source),
+                "source_host": original_host,
+                "ssh_alias": SSH_ALIAS,
+                "resolved_host": target_host,
+                "execution_config_sha256": _sha256(destination),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return destination_dir
 
 
 def _sha256(path: Path) -> str:
@@ -450,6 +503,11 @@ def main() -> None:
     if local_run_dir == repo_root or repo_root in local_run_dir.parents:
         raise ValueError("runtime benchmark artifacts must be outside the VeRL workspace")
     local_run_dir.mkdir(parents=True, exist_ok=True)
+    execution_config_dir = args.config_dir
+    execution_config_sha256 = None
+    if args.action in {"render", "dry-run", "submit"}:
+        execution_config_dir = _prepare_execution_config(args.config_dir, local_run_dir)
+        execution_config_sha256 = _sha256(execution_config_dir / "oci-iad.yaml")
     candidates = _selected(_load_manifest(args.manifest), set(args.candidate_id), args.max_candidates)
     manifest_sha = _sha256(args.manifest)
     selection_ids = [candidate["candidate_id"] for candidate in candidates]
@@ -471,7 +529,7 @@ def main() -> None:
                     launcher=args.launcher,
                     verl_root=args.verl_root,
                     reward_file=args.reward_file,
-                    config_dir=args.config_dir,
+                    config_dir=execution_config_dir,
                     allow_memory_gated=args.allow_memory_gated,
                 )
                 handle.write(
@@ -499,7 +557,7 @@ def main() -> None:
                 launcher=args.launcher,
                 verl_root=args.verl_root,
                 reward_file=args.reward_file,
-                config_dir=args.config_dir,
+                config_dir=execution_config_dir,
                 allow_memory_gated=args.allow_memory_gated,
             )
             result = _run(command, local_run_dir / "dry_run_logs" / f"{candidate_id}.log")
@@ -513,7 +571,7 @@ def main() -> None:
                 launcher=args.launcher,
                 verl_root=args.verl_root,
                 reward_file=args.reward_file,
-                config_dir=args.config_dir,
+                config_dir=execution_config_dir,
                 allow_memory_gated=args.allow_memory_gated,
             )
             command_hashes[candidate_id] = _command_sha256(submit_command)
@@ -521,6 +579,8 @@ def main() -> None:
             json.dumps(
                 {
                     "manifest_sha256": manifest_sha,
+                    "ssh_alias": SSH_ALIAS,
+                    "execution_config_sha256": execution_config_sha256,
                     "allow_memory_gated": args.allow_memory_gated,
                     "git": git_provenance,
                     "command_sha256": command_hashes,
@@ -540,6 +600,10 @@ def main() -> None:
         git_provenance = _git_provenance(args.verl_root)
         if marker.get("manifest_sha256") != manifest_sha:
             raise ValueError("dry-run marker does not match the current manifest")
+        if marker.get("ssh_alias") != SSH_ALIAS:
+            raise ValueError("dry-run marker does not match the current SSH alias")
+        if marker.get("execution_config_sha256") != execution_config_sha256:
+            raise ValueError("dry-run marker does not match the current execution-only cluster config")
         if marker.get("allow_memory_gated") != args.allow_memory_gated:
             raise ValueError("dry-run marker does not match the current memory-gate setting")
         if marker.get("git") != git_provenance:
@@ -565,7 +629,7 @@ def main() -> None:
                 launcher=args.launcher,
                 verl_root=args.verl_root,
                 reward_file=args.reward_file,
-                config_dir=args.config_dir,
+                config_dir=execution_config_dir,
                 allow_memory_gated=args.allow_memory_gated,
             )
             if _command_sha256(command) != dry_run_hashes[candidate_id]:
