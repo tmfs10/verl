@@ -199,3 +199,7 @@ kernel was exercised successfully on an A100-SXM4-80GB before topology runs;
 the source/generated hashes and both explicit replacements are recorded in
 `cluster_config/provenance.json`. The authoritative source YAML is never
 modified. Do not substitute another OCI login alias or cluster route silently.
+The benchmark also disables the shared launcher's unconditional runtime
+`one-logger-utils` upgrade because W&B is disabled and that upgrade changes the
+container's Ray dependency set. The dry-run marker binds the launcher file hash
+as well as the VeRL commit and execution config.

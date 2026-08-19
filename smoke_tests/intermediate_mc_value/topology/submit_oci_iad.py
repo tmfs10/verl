@@ -420,6 +420,7 @@ def build_command(
         "--no_requeue",
         "--disable_val_before_train",
         "--omit_noncore_algorithm_overrides",
+        "--skip_runtime_package_install",
         "--extra_args",
         _extra_args(candidate, remote_output, allow_memory_gated=allow_memory_gated),
     ]
@@ -628,6 +629,7 @@ def main() -> None:
                     "manifest_sha256": manifest_sha,
                     "ssh_alias": SSH_ALIAS,
                     "execution_config_sha256": execution_config_sha256,
+                    "launcher_sha256": _sha256(args.launcher),
                     "allow_memory_gated": args.allow_memory_gated,
                     "git": git_provenance,
                     "command_sha256": command_hashes,
@@ -651,6 +653,8 @@ def main() -> None:
             raise ValueError("dry-run marker does not match the current SSH alias")
         if marker.get("execution_config_sha256") != execution_config_sha256:
             raise ValueError("dry-run marker does not match the current execution-only cluster config")
+        if marker.get("launcher_sha256") != _sha256(args.launcher):
+            raise ValueError("dry-run marker does not match the current cluster launcher")
         if marker.get("allow_memory_gated") != args.allow_memory_gated:
             raise ValueError("dry-run marker does not match the current memory-gate setting")
         if marker.get("git") != git_provenance:
