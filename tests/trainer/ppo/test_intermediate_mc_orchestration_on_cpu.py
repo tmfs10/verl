@@ -217,6 +217,59 @@ def test_no_self_critique_uses_one_unconditioned_critic_stream_and_solution_only
     assert actor_batch.batch["response_mask"].sum().item() == len(bundle.solution_ids)
 
 
+def test_throughput_token_metrics_cover_all_generation_and_training_lanes() -> None:
+    controller = _controller()
+    bundle = _bundle()
+    bundle.continuations = [
+        ContinuationGeneration(mark=1, sample_index=0, token_ids=(61, 62, 63)),
+        ContinuationGeneration(mark=2, sample_index=0, token_ids=(71, 72)),
+    ]
+    bundle.failed_continuations = [(2, 1)]
+    critic_batch = controller._make_critic_batch([bundle])
+    actor_batch = controller._make_actor_batch(_source(), [bundle])
+
+    metrics = controller._token_metrics(
+        [bundle],
+        critic_batch=critic_batch,
+        actor_batch=actor_batch,
+    )
+
+    assert metrics == {
+        "intermediate_mc/tokens/prompt": 2.0,
+        "intermediate_mc/tokens/solution_output": 3.0,
+        "intermediate_mc/tokens/critique_input": 14.0,
+        "intermediate_mc/tokens/critique_output": 4.0,
+        "intermediate_mc/tokens/continuation_input": 11.0,
+        "intermediate_mc/tokens/continuation_output": 5.0,
+        "intermediate_mc/tokens/generation_input": 27.0,
+        "intermediate_mc/tokens/generation_output": 12.0,
+        "intermediate_mc/tokens/critic_input": 18.0,
+        "intermediate_mc/tokens/actor_input": 23.0,
+        "intermediate_mc/tokens/actor_train": 7.0,
+        "intermediate_mc/continuation_attempts": 3.0,
+    }
+
+
+def test_no_self_critique_token_metrics_have_no_critique_lane() -> None:
+    controller = _controller(num_critiques=0)
+    bundle = _bundle(num_critiques=0)
+    bundle.continuations = [ContinuationGeneration(mark=2, sample_index=0, token_ids=(71,))]
+    critic_batch = controller._make_critic_batch([bundle])
+    actor_batch = controller._make_actor_batch(_source(), [bundle])
+
+    metrics = controller._token_metrics(
+        [bundle],
+        critic_batch=critic_batch,
+        actor_batch=actor_batch,
+    )
+
+    assert metrics["intermediate_mc/tokens/critique_input"] == 0.0
+    assert metrics["intermediate_mc/tokens/critique_output"] == 0.0
+    assert metrics["intermediate_mc/tokens/critic_input"] == 6.0
+    assert metrics["intermediate_mc/tokens/actor_input"] == 5.0
+    assert metrics["intermediate_mc/tokens/actor_train"] == 3.0
+
+
 def test_no_self_critique_builds_one_unconditioned_context_from_empty_child_record() -> None:
     controller = _controller(num_critiques=0)
     record = IntermediateMCGenerationRecord(

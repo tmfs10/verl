@@ -1121,6 +1121,63 @@ class IntermediateMCValueController:
         )
         return actor_batch
 
+    def _token_metrics(
+        self,
+        bundles: list[_Bundle],
+        *,
+        critic_batch: DataProto,
+        actor_batch: DataProto | None,
+    ) -> dict[str, float]:
+        """Return aggregate token-volume counters for throughput comparisons.
+
+        These counters intentionally avoid per-example audit output. They make it
+        possible to distinguish a genuinely faster iteration from one that only
+        sampled shorter solutions, critiques, or continuations.
+        """
+
+        prompt_tokens = sum(len(bundle.prompt_ids) for bundle in bundles)
+        solution_tokens = sum(len(bundle.solution_ids) for bundle in bundles)
+        critique_tokens = sum(len(tokens) for bundle in bundles for tokens in bundle.critique_ids)
+        continuation_tokens = sum(
+            len(continuation.token_ids) for bundle in bundles for continuation in bundle.continuations
+        )
+        critique_input_tokens = sum(
+            len(bundle.prompt_ids) + len(bundle.solution_ids) + len(self.critique_instruction_ids)
+            for bundle in bundles
+            for _ in bundle.critique_ids
+        )
+        continuation_input_tokens = 0
+        continuation_attempts = 0
+        for bundle in bundles:
+            attempted_marks = [continuation.mark for continuation in bundle.continuations]
+            attempted_marks.extend(mark for mark, _ in bundle.failed_continuations)
+            continuation_attempts += len(attempted_marks)
+            continuation_input_tokens += sum(len(bundle.prompt_ids) + mark for mark in attempted_marks)
+
+        critic_input_tokens = int(critic_batch.batch["attention_mask"].sum().item())
+        actor_input_tokens = 0
+        actor_train_tokens = 0
+        if actor_batch is not None:
+            actor_input_tokens = int(actor_batch.batch["attention_mask"].sum().item())
+            actor_train_tokens = int(actor_batch.batch["response_mask"].sum().item())
+
+        generation_input_tokens = prompt_tokens + critique_input_tokens + continuation_input_tokens
+        generation_output_tokens = solution_tokens + critique_tokens + continuation_tokens
+        return {
+            "intermediate_mc/tokens/prompt": float(prompt_tokens),
+            "intermediate_mc/tokens/solution_output": float(solution_tokens),
+            "intermediate_mc/tokens/critique_input": float(critique_input_tokens),
+            "intermediate_mc/tokens/critique_output": float(critique_tokens),
+            "intermediate_mc/tokens/continuation_input": float(continuation_input_tokens),
+            "intermediate_mc/tokens/continuation_output": float(continuation_tokens),
+            "intermediate_mc/tokens/generation_input": float(generation_input_tokens),
+            "intermediate_mc/tokens/generation_output": float(generation_output_tokens),
+            "intermediate_mc/tokens/critic_input": float(critic_input_tokens),
+            "intermediate_mc/tokens/actor_input": float(actor_input_tokens),
+            "intermediate_mc/tokens/actor_train": float(actor_train_tokens),
+            "intermediate_mc/continuation_attempts": float(continuation_attempts),
+        }
+
     def run_update(
         self,
         source: DataProto,
@@ -1170,6 +1227,7 @@ class IntermediateMCValueController:
         self._add_solution_gae(source, bundles)
 
         actor_updated = False
+        actor_batch = None
         if not in_warmup:
             actor_batch = self._make_actor_batch(source, bundles)
             self._validate_optimizer_batch(actor_batch, role="actor", worker_group=self.trainer.actor_rollout_wg)
@@ -1186,6 +1244,13 @@ class IntermediateMCValueController:
             metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
             actor_updated = True
 
+        metrics.update(
+            self._token_metrics(
+                bundles,
+                critic_batch=critic_batch,
+                actor_batch=actor_batch,
+            )
+        )
         metrics.update(
             {
                 "intermediate_mc/warmup": float(in_warmup),

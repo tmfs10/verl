@@ -70,3 +70,11 @@ intended production tokenizer/model pair and synchronous reward function,
 preserve temperature `1.0`, inspect EMA/variance selection and continuation
 failure metrics, confirm actor and critic row divisibility for the production
 DP sizes, and perform one native checkpoint resume before scaling out.
+
+## OCI-IAD production topology optimization
+
+The production-shaped, synchronous Qwen3-1.7B/Qwen3-4B OPSD math 30K search,
+including the feature-enabled M0 no-self-critique baseline, is documented in
+[`topology/README.md`](topology/README.md). Its runtime artifacts and reports
+are written under `/home/siddjain/data/intermediate_mc_value_model/verl/topology`,
+not into this repository.
