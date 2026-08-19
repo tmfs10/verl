@@ -21,6 +21,7 @@ import torch
 from omegaconf import OmegaConf
 
 from verl import DataProto
+from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, AgentLoopWorker, _InternalAgentLoopOutput
 from verl.experimental.agent_loop.intermediate_mc_agent_loop import (
     INTERMEDIATE_MC_CHILD_FIELD,
     ContinuationGeneration,
@@ -307,6 +308,7 @@ def _runtime_config():
                     "reward_loop_source": None,
                     "reward_loop_module_path": None,
                     "reward_loop_class_name": None,
+                    "enable_resource_pool": False,
                 }
             },
             "data": {
@@ -334,6 +336,38 @@ def test_disabled_runtime_config_is_a_strict_noop() -> None:
     assert config.critic.enable is None
     assert config.actor_rollout_ref.rollout.calculate_log_probs is False
     assert config.actor_rollout_ref.actor.use_rollout_log_probs is False
+
+
+def test_intermediate_mc_disables_streaming_reward_loop_and_preserves_rollout_identity() -> None:
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.config = _runtime_config()
+    trainer.reward_fn = SimpleNamespace()
+    trainer.use_rm = False
+    trainer.intermediate_mc_controller = object()
+    assert trainer._should_enable_agent_reward_loop() is False
+
+    worker = AgentLoopWorker.__new__(AgentLoopWorker)
+    worker.reward_loop_worker_handles = None
+    output = _InternalAgentLoopOutput(
+        prompt_ids=torch.tensor([[1, 2]]),
+        response_ids=torch.tensor([[3, 0]]),
+        response_mask=torch.tensor([[1, 0]]),
+        response_logprobs=torch.tensor([[-0.1, 0.0]]),
+        input_ids=torch.tensor([[1, 2, 3, 0]]),
+        attention_mask=torch.tensor([[1, 1, 1, 0]]),
+        position_ids=torch.tensor([[0, 1, 2, 0]]),
+        num_turns=1,
+        metrics=AgentLoopMetrics(),
+        extra_fields={},
+    )
+    processed = worker._postprocess(
+        [output],
+        input_non_tensor_batch={"intermediate_mc_rollout_id": np.array(["rollout:0"], dtype=object)},
+    )
+    assert processed.non_tensor_batch["intermediate_mc_rollout_id"].tolist() == ["rollout:0"]
+
+    trainer.intermediate_mc_controller = None
+    assert trainer._should_enable_agent_reward_loop() is True
 
 
 @pytest.mark.parametrize(
@@ -435,3 +469,37 @@ def test_individual_continuation_failure_is_omitted_after_drain() -> None:
     assert critiques == ()
     assert [(item.mark, item.sample_index) for item in continuations] == [(1, 1)]
     assert failures == ((1, 0),)
+
+
+def test_variance_continuation_stage_profiles_and_cleans_up_on_failure() -> None:
+    controller = _controller(critic_head="beta", mark_selector="variance")
+    bundle = _bundle()
+    bundle.marks = [1]
+    events: list[str] = []
+
+    def fail_generation(_request):
+        events.append("generate")
+        raise RuntimeError("injected variance generation failure")
+
+    controller.trainer = SimpleNamespace(
+        checkpoint_manager=SimpleNamespace(
+            wake_up_replicas=lambda: events.append("wake"),
+            sleep_replicas=lambda: events.append("sleep"),
+        ),
+        async_rollout_manager=SimpleNamespace(
+            start_profile=lambda: events.append("start_profile"),
+            stop_profile=lambda: events.append("stop_profile"),
+            generate_sequences=fail_generation,
+        ),
+    )
+    controller._make_variance_request = lambda _source, _bundles: DataProto.from_dict(
+        non_tensors={"request": np.array([1])}
+    )
+    with pytest.raises(RuntimeError, match="injected variance"):
+        controller._generate_variance_continuations(
+            _source(),
+            [bundle],
+            {},
+            profile_rollout=True,
+        )
+    assert events == ["wake", "start_profile", "generate", "sleep", "stop_profile"]

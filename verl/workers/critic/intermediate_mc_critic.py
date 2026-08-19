@@ -10,6 +10,7 @@ import torch
 from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.intermediate_mc_value import (
+    FP32_EPSILON,
     beta_value_loss_components,
     scalar_value_loss_components,
 )
@@ -126,8 +127,8 @@ class DataParallelIntermediateMCCritic(DataParallelPPOCritic):
                 f"Beta critic expected two logits, got critic_head={self.critic_head} shape={tuple(logits.shape)}"
             )
         normalized_mean = torch.sigmoid(logits[..., 0].float()).clamp(
-            self.beta_target_epsilon,
-            1.0 - self.beta_target_epsilon,
+            FP32_EPSILON,
+            1.0 - FP32_EPSILON,
         )
         mean = self.max_reward * normalized_mean
         q = torch.sigmoid(logits[..., 1].float())

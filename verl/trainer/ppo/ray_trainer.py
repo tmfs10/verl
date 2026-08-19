@@ -1209,6 +1209,21 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
+    def _should_enable_agent_reward_loop(self) -> bool:
+        """Return whether rollout workers may stream reward computation.
+
+        Intermediate MC evaluates every solution and continuation through the
+        blocking driver-side reward path. Keeping the streaming reward loop
+        disabled also preserves rollout identity columns in AgentLoop output.
+        """
+
+        if self.intermediate_mc_controller is not None:
+            return False
+        disable_agent_reward_loop = bool(getattr(self.reward_fn, "disable_async_reward_loop", False))
+        return (
+            not self.use_rm or self.config.reward.reward_model.enable_resource_pool
+        ) and not disable_agent_reward_loop
+
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -1363,11 +1378,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
         # infrastructure overview: https://verl.readthedocs.io/en/latest/advance/reward_loop.html#architecture-design
         # agent_reward_loop: streaming reward computation with actor rollout
-        # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
-        disable_agent_reward_loop = bool(getattr(self.reward_fn, "disable_async_reward_loop", False))
-        enable_agent_reward_loop = (
-            not self.use_rm or self.config.reward.reward_model.enable_resource_pool
-        ) and not disable_agent_reward_loop
+        # Native streaming is used when (1) no reward model, or (2) a reward model
+        # has an extra resource pool. Intermediate MC deliberately disables it.
+        enable_agent_reward_loop = self._should_enable_agent_reward_loop()
 
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
@@ -2123,6 +2136,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                                 reward_tensor,
                                 metrics,
                                 timing_raw,
+                                profile_rollout=curr_step_profile,
                             )
                             metrics["intermediate_mc/actor_updated"] = float(actor_updated)
                         else:

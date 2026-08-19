@@ -23,6 +23,7 @@ from hydra import compose, initialize_config_dir
 from verl.trainer.config import INTERMEDIATE_MC_CRITIQUE_PROMPT, IntermediateMCValueConfig
 from verl.trainer.ppo.core_algos import compute_gae_advantage_return
 from verl.trainer.ppo.intermediate_mc_value import (
+    FP32_EPSILON,
     BetaValueLossComponents,
     VarianceCandidate,
     aggregate_mark_targets,
@@ -169,6 +170,40 @@ def test_ema_rejects_nonfinite_behavior_log_probability() -> None:
         )
 
 
+def test_ema_keeps_configured_baseline_when_candidate_window_starts_later() -> None:
+    probabilities = [0.9] * 49 + [0.1] * 51
+    selections, _ = select_ema_marks(
+        [math.log(value) for value in probabilities],
+        k=1,
+        min_gap=1,
+        start_fraction=0.5,
+        end_fraction=0.8,
+        alpha=1.0,
+        baseline_token=2,
+        floor=1e-4,
+        ratio_up=2.0,
+        ratio_down=0.5,
+    )
+    assert [selection.token for selection in selections] == [50]
+    assert selections[0].reference == pytest.approx(0.9)
+
+
+def test_ema_min_gap_is_anchored_at_the_configured_baseline() -> None:
+    selections, _ = select_ema_marks(
+        [math.log(value) for value in [0.2, 0.8, 0.8, 0.8, 0.8]],
+        k=1,
+        min_gap=3,
+        start_fraction=0.0,
+        end_fraction=1.0,
+        alpha=1.0,
+        baseline_token=1,
+        floor=1e-4,
+        ratio_up=2.0,
+        ratio_down=0.5,
+    )
+    assert [selection.token for selection in selections] == [4]
+
+
 def test_variance_selection_ties_gap_and_random_fallback() -> None:
     candidates = [
         VarianceCandidate(0, "a", 10, 0.3),
@@ -258,7 +293,7 @@ def test_beta_parameterization_mean_only_clip_and_gradients() -> None:
         cliprange_value=0.2,
         beta_target_epsilon=1e-4,
     )
-    assert torch.all((components.mean >= 1e-4) & (components.mean <= 1.0 - 1e-4))
+    assert torch.all((components.mean >= FP32_EPSILON) & (components.mean <= 1.0 - FP32_EPSILON))
     torch.testing.assert_close(components.q, torch.sigmoid(logits[..., 1].float()))
     torch.testing.assert_close(components.variance, components.q * components.mean * (1.0 - components.mean))
     torch.testing.assert_close(components.alpha + components.beta, components.kappa)
@@ -268,6 +303,22 @@ def test_beta_parameterization_mean_only_clip_and_gradients() -> None:
     assert torch.isfinite(loss)
     loss.backward()
     assert logits.grad is not None and torch.isfinite(logits.grad).all()
+
+
+def test_beta_prediction_clamp_is_independent_of_target_transform_epsilon() -> None:
+    logits = torch.tensor([[[-10.0, 0.0]]], requires_grad=True)
+    components = beta_value_loss_components(
+        logits,
+        torch.tensor([[0.0]]),
+        torch.tensor([[0.5]]),
+        max_reward=1.0,
+        cliprange_value=0.2,
+        beta_target_epsilon=0.1,
+    )
+    torch.testing.assert_close(components.mean, torch.sigmoid(logits[..., 0]))
+    components.mean.sum().backward()
+    assert logits.grad is not None
+    assert logits.grad[..., 0].item() > 0.0
 
 
 def test_exact_critic_boundaries_include_s0_and_solution_states() -> None:

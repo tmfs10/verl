@@ -631,17 +631,26 @@ class IntermediateMCValueController:
         source: DataProto,
         bundles: list[_Bundle],
         timing_raw: dict[str, float],
+        profile_rollout: bool,
     ) -> None:
         request = self._make_variance_request(source, bundles)
         if request is None:
             return
         self.trainer.checkpoint_manager.wake_up_replicas()
+        profile_started = False
         try:
+            if profile_rollout:
+                self.trainer.async_rollout_manager.start_profile()
+                profile_started = True
             with marked_timer("intermediate_mc_continuations", timing_raw, color="red"):
                 output = self.trainer.async_rollout_manager.generate_sequences(request)
                 records = self.extract_generation_records(output)
         finally:
-            self.trainer.checkpoint_manager.sleep_replicas()
+            try:
+                self.trainer.checkpoint_manager.sleep_replicas()
+            finally:
+                if profile_started:
+                    self.trainer.async_rollout_manager.stop_profile()
         expected = {bundle.rollout_id for bundle in bundles if bundle.marks}
         if set(records) != expected:
             raise RuntimeError("variance continuation stage returned an unexpected rollout-id set")
@@ -910,6 +919,7 @@ class IntermediateMCValueController:
         reward_tensor: torch.Tensor,
         metrics: dict[str, Any],
         timing_raw: dict[str, float],
+        profile_rollout: bool = False,
     ) -> bool:
         terminal_rewards = [
             validate_reward(value, self.feature.max_reward)
@@ -932,7 +942,12 @@ class IntermediateMCValueController:
         if not in_warmup:
             if self.feature.mark_selector == "variance":
                 self._select_variance_marks(bundles)
-                self._generate_variance_continuations(source, bundles, timing_raw)
+                self._generate_variance_continuations(
+                    source,
+                    bundles,
+                    timing_raw,
+                    profile_rollout=profile_rollout,
+                )
             self._evaluate_continuations(source, bundles)
         else:
             self._audit("warmup", continuations=0)

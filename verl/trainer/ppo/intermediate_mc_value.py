@@ -26,6 +26,7 @@ import torch.nn.functional as F
 
 CRITIQUE_DELIMITER = "\n\nCritique:\n"
 SOLUTION_DELIMITER = "\n\nSolution:\n"
+FP32_EPSILON = torch.finfo(torch.float32).eps
 
 
 @dataclass(frozen=True)
@@ -235,13 +236,13 @@ def select_ema_marks(
         ema_values.append(alpha * probability + (1.0 - alpha) * ema_values[-1])
 
     low, high = candidate_bounds(len(probabilities), start_fraction, end_fraction)
-    reference_token = max(low, baseline_token)
-    if k == 0 or reference_token > high:
+    if k == 0 or baseline_token > len(ema_values):
         return [], ema_values
-    reference = ema_values[reference_token - 1]
+    reference = ema_values[baseline_token - 1]
+    last_mark = baseline_token
     selected: list[EMASelection] = []
-    for token in range(reference_token + 1, high + 1):
-        if selected and token - selected[-1].token < min_gap:
+    for token in range(max(low, baseline_token + 1), high + 1):
+        if token - last_mark < min_gap:
             continue
         current = ema_values[token - 1]
         ratio = max(current, floor) / max(reference, floor)
@@ -263,6 +264,7 @@ def select_ema_marks(
             )
         )
         reference = current
+        last_mark = token
         if len(selected) == k:
             break
     return selected, ema_values
@@ -365,7 +367,7 @@ def beta_value_loss_components(
         raise ValueError(f"Beta critic logits must end in width 2, got {tuple(critic_logits.shape)}")
     z_mu = critic_logits[..., 0].float()
     z_q = critic_logits[..., 1].float()
-    normalized_mean = torch.sigmoid(z_mu).clamp(beta_target_epsilon, 1.0 - beta_target_epsilon)
+    normalized_mean = torch.sigmoid(z_mu).clamp(FP32_EPSILON, 1.0 - FP32_EPSILON)
     mean = max_reward * normalized_mean
     q = torch.sigmoid(z_q)
     variance = q * mean * (max_reward - mean)
@@ -376,7 +378,7 @@ def beta_value_loss_components(
     raw_clipped = old_predictions.float() + torch.clamp(
         mean - old_predictions.float(), -cliprange_value, cliprange_value
     )
-    clipped_normalized_mean = (raw_clipped / max_reward).clamp(beta_target_epsilon, 1.0 - beta_target_epsilon)
+    clipped_normalized_mean = (raw_clipped / max_reward).clamp(FP32_EPSILON, 1.0 - FP32_EPSILON)
     clipped_values = max_reward * clipped_normalized_mean
     clipped_alpha = clipped_normalized_mean * kappa
     clipped_beta = (1.0 - clipped_normalized_mean) * kappa
