@@ -38,7 +38,7 @@ VAL_DATA = "/data/rl/mathgen/comp_math_verl.jsonl"
 TRAIN_ROWS = 29427
 TRAIN_SHA256 = "f79a42fe155218db2f1927ee903afd101929724f2d0516352bdbb91cdb139178"
 SSH_ALIAS = "iad-2"
-VERL_CONTAINER = "/lustre/fsw/portfolios/llmservice/users/siddjain/containers/verl_vllm012_flashattn_20260321.sqsh"
+VERL_CONTAINER = "/lustre/fsw/portfolios/llmservice/users/igitman/llm/images/nemo-skills-verl-0.7.0.sqsh"
 
 
 def _resolve_ssh_hostname(alias: str) -> str:

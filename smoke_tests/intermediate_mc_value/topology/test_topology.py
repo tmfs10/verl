@@ -156,6 +156,12 @@ containers:
     assert updated == source.replace(original, target).replace(original_container, container)
 
 
+def test_oci_runtime_is_the_a100_preflighted_shared_verl_image() -> None:
+    assert submit_module.VERL_CONTAINER == (
+        "/lustre/fsw/portfolios/llmservice/users/igitman/llm/images/nemo-skills-verl-0.7.0.sqsh"
+    )
+
+
 def test_scheduler_requeue_contract_parser() -> None:
     assert _requeue_value("JobId=123 JobState=PENDING Requeue=0 Restarts=0") == 0
     assert _requeue_value("JobId=123 JobState=PENDING Requeue=1 Restarts=0") == 1

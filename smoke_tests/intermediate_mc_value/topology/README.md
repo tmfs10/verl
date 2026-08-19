@@ -193,7 +193,9 @@ python3 -m smoke_tests.intermediate_mc_value.topology.matrix four-node-finalists
 
 The submitter resolves `iad-2` to login node 02 and writes a data-owned
 execution copy of `oci-iad.yaml` under each local run directory. That copy
-changes `ssh_tunnel.host` and selects the existing OCI VeRL/vLLM 0.12 image;
+changes `ssh_tunnel.host` and selects the shared OCI VeRL 0.7.0 image
+(`vllm==0.8.5.post1`, `flash-attn==2.7.4.post1`, `torch==2.6.0`), whose varlen
+kernel was exercised successfully on an A100-SXM4-80GB before topology runs;
 the source/generated hashes and both explicit replacements are recorded in
 `cluster_config/provenance.json`. The authoritative source YAML is never
 modified. Do not substitute another OCI login alias or cluster route silently.
