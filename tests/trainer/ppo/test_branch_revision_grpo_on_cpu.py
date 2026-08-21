@@ -115,6 +115,7 @@ def test_critique_prompt_is_bounded_and_has_no_copyable_placeholder_values() -> 
     assert "three short numbered paragraphs" in BRANCH_REVISION_CRITIQUE_PROMPT
     assert "open <branch> before the numbered critique" in BRANCH_REVISION_CRITIQUE_PROMPT
     assert "inside <branch> is not analysis" in BRANCH_REVISION_CRITIQUE_PROMPT
+    assert "Do not paraphrase, correct, normalize, or reformat" in BRANCH_REVISION_CRITIQUE_PROMPT
     assert "the exact quoted section to replace" not in BRANCH_REVISION_CRITIQUE_PROMPT
     assert "the replacement text" not in BRANCH_REVISION_CRITIQUE_PROMPT
     assert "not write anything after" in BRANCH_REVISION_CRITIQUE_PROMPT
@@ -209,6 +210,7 @@ def test_terminal_eos_stripping_preserves_interior_special_token() -> None:
         (_structured("", "new"), "empty_branch"),
         (_structured("x", "   "), "empty_new_continuation"),
         (_structured("same", "new"), "branch_not_unique"),
+        (_structured("invented", "new"), "branch_not_found"),
         (_structured("x", "new") + " trailing", "text_after_tags"),
         ("<branch>x</branch> not whitespace <new continuation>new</new continuation>", "text_between_tags"),
     ],

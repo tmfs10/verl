@@ -741,11 +741,14 @@ algorithm:
       \ the\n   remaining token budget.\n\nAfter those three short numbered paragraphs,\
       \ end with exactly one <branch> tag\npair followed by exactly one <new continuation>\
       \ tag pair, with at most\nwhitespace between the pairs. The text inside <branch>\
-      \ is not analysis: copy\nit character-for-character from a short\nsection of\
-      \ the attempted solution that occurs exactly once. The text inside\n<new continuation>\
-      \ is the replacement reasoning to use at that point. Do not\nopen <branch> before\
-      \ the numbered critique. Do not write anything after the\nclosing </new continuation>\
-      \ tag.\n--- END CRITIQUE TASK ---"
+      \ is not analysis: copy\nand paste it character-for-character from one complete\
+      \ line or a short span of\nthe attempted solution. Include enough adjacent distinctive\
+      \ text that the span\noccurs exactly once. Do not paraphrase, correct, normalize,\
+      \ or reformat anything\ninside <branch>; put every correction only inside <new\
+      \ continuation>. The text inside\n<new continuation> is the replacement reasoning\
+      \ to use at that point. Do not\nopen <branch> before the numbered critique.\
+      \ Do not write anything after the\nclosing </new continuation> tag.\n--- END\
+      \ CRITIQUE TASK ---"
     audit_output_dir: null
 trainer:
   balance_batch: true

@@ -200,7 +200,10 @@ def parse_branch_revision(
         return _invalid("branch_token_cap", solution_text, critique_text)
     if not replacement_ids or len(replacement_ids) > new_continuation_max_tokens:
         return _invalid("new_continuation_token_cap", solution_text, critique_text)
-    if solution_text.count(branch_text) != 1:
+    branch_occurrences = solution_text.count(branch_text)
+    if branch_occurrences == 0:
+        return _invalid("branch_not_found", solution_text, critique_text)
+    if branch_occurrences != 1:
         return _invalid("branch_not_unique", solution_text, critique_text)
 
     branch_start = solution_text.index(branch_text)

@@ -53,8 +53,10 @@ exact labels in this order:
 After those three short numbered paragraphs, end with exactly one <branch> tag
 pair followed by exactly one <new continuation> tag pair, with at most
 whitespace between the pairs. The text inside <branch> is not analysis: copy
-it character-for-character from a short
-section of the attempted solution that occurs exactly once. The text inside
+and paste it character-for-character from one complete line or a short span of
+the attempted solution. Include enough adjacent distinctive text that the span
+occurs exactly once. Do not paraphrase, correct, normalize, or reformat anything
+inside <branch>; put every correction only inside <new continuation>. The text inside
 <new continuation> is the replacement reasoning to use at that point. Do not
 open <branch> before the numbered critique. Do not write anything after the
 closing </new continuation> tag.

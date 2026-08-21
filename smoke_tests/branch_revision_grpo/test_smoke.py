@@ -41,6 +41,7 @@ def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(t
     assert "actor_rollout_ref.rollout.val_kwargs.temperature=1.0" in rendered
     assert "actor_rollout_ref.actor.policy_loss.loss_mode=dppo_tv" in rendered
     assert "algorithm.branch_revision_grpo.num_critiques=4" in rendered
+    assert "actor_rollout_ref.rollout.n=4" in rendered
     assert "algorithm.branch_revision_grpo.min_continuation_tokens=128" in rendered
     assert "data.max_response_length=2048" in rendered
     assert "reward.reward_model.launch_reward_fn_async=false" in rendered

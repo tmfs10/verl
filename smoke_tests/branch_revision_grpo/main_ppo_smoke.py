@@ -35,7 +35,7 @@ EXPECTED = {
     "data.train_batch_size": 8,
     "data.max_prompt_length": 1024,
     "data.max_response_length": 2048,
-    "actor_rollout_ref.rollout.n": 2,
+    "actor_rollout_ref.rollout.n": 4,
     "actor_rollout_ref.actor.ppo_mini_batch_size": 8,
     "actor_rollout_ref.actor.ppo_epochs": 1,
     "actor_rollout_ref.rollout.max_model_len": 6144,
