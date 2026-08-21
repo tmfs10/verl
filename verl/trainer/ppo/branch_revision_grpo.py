@@ -24,6 +24,7 @@ BRANCH_OPEN = "<branch>"
 BRANCH_CLOSE = "</branch>"
 NEW_CONTINUATION_OPEN = "<new continuation>"
 NEW_CONTINUATION_CLOSE = "</new continuation>"
+_FOLLOWUP_SENTINEL = "__VERL_BRANCH_REVISION_PREVIOUS_ASSISTANT_7F4E65C1__"
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,38 @@ def decode_exact(token_ids: Iterable[int], tokenizer: Any) -> str:
             clean_up_tokenization_spaces=False,
         )
     )
+
+
+def encode_followup_user_turn(instruction: str, tokenizer: Any) -> list[int]:
+    """Encode a genuine user follow-up plus assistant generation boundary.
+
+    Deriving the suffix from the tokenizer's own chat template avoids hard-coding
+    model-specific role tokens. Disabling hidden thinking for this turn keeps the
+    generated critique itself visible and trainable; it does not change sampling
+    temperature or the original solution rollout.
+    """
+
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if not callable(apply_chat_template):
+        raise ValueError("branch-revision GRPO requires a tokenizer chat template")
+    rendered = apply_chat_template(
+        [
+            {"role": "assistant", "content": _FOLLOWUP_SENTINEL},
+            {"role": "user", "content": instruction},
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    if not isinstance(rendered, str) or rendered.count(_FOLLOWUP_SENTINEL) != 1:
+        raise ValueError("tokenizer chat template did not preserve the branch-revision boundary sentinel exactly")
+    suffix = rendered.split(_FOLLOWUP_SENTINEL, 1)[1]
+    if not suffix:
+        raise ValueError("tokenizer chat template produced an empty branch-revision follow-up boundary")
+    suffix_ids = [int(token) for token in tokenizer.encode(suffix, add_special_tokens=False)]
+    if not suffix_ids or decode_exact(suffix_ids, tokenizer) != suffix:
+        raise ValueError("branch-revision follow-up boundary does not round-trip through the tokenizer exactly")
+    return suffix_ids
 
 
 def _invalid(reason: str, solution_text: str, critique_text: str) -> ParsedBranchRevision:

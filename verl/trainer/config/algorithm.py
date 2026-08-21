@@ -37,23 +37,25 @@ __all__ = [
 
 
 BRANCH_REVISION_CRITIQUE_PROMPT = """--- BEGIN CRITIQUE TASK ---
-The text above is a completed, incorrect attempted solution. Critique that
-attempt; do not continue it or re-solve the problem from scratch. Be concise
-enough to complete every requirement below.
+The immediately preceding assistant turn is a completed, incorrect attempted
+solution. Critique that attempt; do not continue it or solve the problem again.
 
-In at most three short numbered paragraphs:
-1. Identify which parts meaningfully pruned the search space and which did not.
-2. State when the solution should have switched direction and what direction it
-   should have taken.
-3. Identify the earliest useful edit that would move the remaining reasoning
-   away from a dead end and improve its chance of success in the remaining
-   token budget.
+Your entire response must be concise and use this order:
+1. PRUNING: State which steps meaningfully pruned the search space and which
+   steps did not.
+2. SWITCH: State the earliest point where the attempt should have changed
+   direction and the better direction it should have taken.
+3. EDIT: Identify the earliest useful replacement that would move the remaining
+   reasoning away from a dead end and improve its chance of success within the
+   remaining token budget.
 
-As the final content, emit exactly one <branch> tag pair containing a verbatim
-section of the attempted solution that occurs exactly once, immediately followed
-by exactly one <new continuation> tag pair containing its replacement. Do not
-copy placeholder text, and do not write anything after the closing
-</new continuation> tag.
+After those three short numbered paragraphs, end with exactly one <branch> tag
+pair immediately followed by exactly one <new continuation> tag pair. The text
+inside <branch> is not analysis: copy it character-for-character from a short
+section of the attempted solution that occurs exactly once. The text inside
+<new continuation> is the replacement reasoning to use at that point. Do not
+open <branch> before the numbered critique. Do not write anything after the
+closing </new continuation> tag.
 --- END CRITIQUE TASK ---"""
 
 

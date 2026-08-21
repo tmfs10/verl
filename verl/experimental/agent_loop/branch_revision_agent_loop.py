@@ -22,7 +22,11 @@ from typing import Any
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.trainer.config import BRANCH_REVISION_CRITIQUE_PROMPT, BranchRevisionGRPOConfig
-from verl.trainer.ppo.branch_revision_grpo import parse_branch_revision, strip_terminal_eos
+from verl.trainer.ppo.branch_revision_grpo import (
+    encode_followup_user_turn,
+    parse_branch_revision,
+    strip_terminal_eos,
+)
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.replica import TokenOutput
@@ -83,13 +87,10 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         )
         self.response_length = int(self.rollout_config.response_length)
         self.max_model_len = int(self.rollout_config.max_model_len)
-        self.critique_instruction_ids = [
-            int(token)
-            for token in self.tokenizer.encode(
-                "\n\n" + BRANCH_REVISION_CRITIQUE_PROMPT,
-                add_special_tokens=False,
-            )
-        ]
+        self.critique_instruction_ids = encode_followup_user_turn(
+            BRANCH_REVISION_CRITIQUE_PROMPT,
+            self.tokenizer,
+        )
         if not self.critique_instruction_ids:
             raise ValueError("branch-revision critique instruction must tokenize non-empty")
 

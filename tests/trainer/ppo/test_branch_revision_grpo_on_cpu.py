@@ -33,6 +33,7 @@ from verl.trainer.config import BRANCH_REVISION_CRITIQUE_PROMPT, BranchRevisionG
 from verl.trainer.ppo import ray_trainer_branch_revision as branch_controller_module
 from verl.trainer.ppo.branch_revision_grpo import (
     decode_exact,
+    encode_followup_user_turn,
     parse_branch_revision,
     strip_terminal_eos,
     validate_binary_reward_row,
@@ -58,6 +59,21 @@ class _CharTokenizer:
     def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
         del skip_special_tokens, clean_up_tokenization_spaces
         return "".join("<eos>" if int(token) == self.eos_token_id else chr(int(token) - 100) for token in token_ids)
+
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking=True,
+    ):
+        rendered = "".join(f"<{message['role']}>{message['content']}</{message['role']}>" for message in messages)
+        if add_generation_prompt:
+            rendered += "<assistant>"
+            if not enable_thinking:
+                rendered += "<think>\n\n</think>\n\n"
+        return self.encode(rendered) if tokenize else rendered
 
 
 TOKENIZER = _CharTokenizer()
@@ -88,11 +104,20 @@ def _structured(branch: str, replacement: str, prefix: str = "analysis\n") -> st
 
 
 def test_critique_prompt_is_bounded_and_has_no_copyable_placeholder_values() -> None:
-    assert "do not continue it or re-solve the problem from scratch" in BRANCH_REVISION_CRITIQUE_PROMPT
-    assert "at most three short numbered paragraphs" in BRANCH_REVISION_CRITIQUE_PROMPT
+    assert "do not continue it or solve the problem again" in BRANCH_REVISION_CRITIQUE_PROMPT
+    assert "three short numbered paragraphs" in BRANCH_REVISION_CRITIQUE_PROMPT
+    assert "open <branch> before the numbered critique" in BRANCH_REVISION_CRITIQUE_PROMPT
+    assert "inside <branch> is not analysis" in BRANCH_REVISION_CRITIQUE_PROMPT
     assert "the exact quoted section to replace" not in BRANCH_REVISION_CRITIQUE_PROMPT
     assert "the replacement text" not in BRANCH_REVISION_CRITIQUE_PROMPT
-    assert "do not write anything after" in BRANCH_REVISION_CRITIQUE_PROMPT
+    assert "not write anything after" in BRANCH_REVISION_CRITIQUE_PROMPT
+
+
+def test_critique_instruction_is_a_new_user_turn_with_visible_assistant_output() -> None:
+    ids = encode_followup_user_turn(BRANCH_REVISION_CRITIQUE_PROMPT, TOKENIZER)
+    text = decode_exact(ids, TOKENIZER)
+    assert text.startswith("</assistant><user>--- BEGIN CRITIQUE TASK ---")
+    assert text.endswith("</user><assistant><think>\n\n</think>\n\n")
 
 
 def test_exact_parser_preserves_whitespace_unicode_and_truncates_at_unique_branch() -> None:
@@ -275,7 +300,7 @@ def _loop() -> BranchRevisionAgentLoop:
     loop.response_length = 256
     loop.max_model_len = 2048
     loop.tokenizer = TOKENIZER
-    loop.critique_instruction_ids = _ids("\n\n" + BRANCH_REVISION_CRITIQUE_PROMPT)
+    loop.critique_instruction_ids = encode_followup_user_turn(BRANCH_REVISION_CRITIQUE_PROMPT, TOKENIZER)
     return loop
 
 
@@ -293,6 +318,10 @@ def test_agent_loop_generates_all_critiques_then_one_continuation_per_valid_edit
 
     async def fake_generate(_route, prompt, params, *, max_tokens, kind):
         calls.append((kind, max_tokens, params.get("temperature", 1.0), params.get("logprobs", True)))
+        if kind.startswith("critique"):
+            decoded_prompt = decode_exact(prompt, TOKENIZER)
+            assert "</assistant><user>--- BEGIN CRITIQUE TASK ---" in decoded_prompt
+            assert decoded_prompt.endswith("</user><assistant><think>\n\n</think>\n\n")
         if kind == "critique[0]":
             text = _structured("dead", "better")
             return TokenOutput(token_ids=_ids(text), log_probs=[-0.2] * len(_ids(text)))
@@ -370,7 +399,7 @@ def _controller() -> BranchRevisionGRPOController:
         }
     )
     controller.tokenizer = TOKENIZER
-    controller.critique_instruction_ids = _ids("\n\n" + BRANCH_REVISION_CRITIQUE_PROMPT)
+    controller.critique_instruction_ids = encode_followup_user_turn(BRANCH_REVISION_CRITIQUE_PROMPT, TOKENIZER)
     controller.audit_dir = None
     controller._initialized_audit_steps = set()
     controller.trainer = SimpleNamespace(

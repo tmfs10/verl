@@ -686,20 +686,23 @@ algorithm:
     branch_max_tokens: 128
     new_continuation_max_tokens: 256
     reward_tolerance: 1.0e-06
-    critique_prompt: "--- BEGIN CRITIQUE TASK ---\nThe text above is a completed,\
-      \ incorrect attempted solution. Critique that\nattempt; do not continue it or\
-      \ re-solve the problem from scratch. Be concise\nenough to complete every requirement\
-      \ below.\n\nIn at most three short numbered paragraphs:\n1. Identify which parts\
-      \ meaningfully pruned the search space and which did not.\n2. State when the\
-      \ solution should have switched direction and what direction it\n   should have\
-      \ taken.\n3. Identify the earliest useful edit that would move the remaining\
-      \ reasoning\n   away from a dead end and improve its chance of success in the\
-      \ remaining\n   token budget.\n\nAs the final content, emit exactly one <branch>\
-      \ tag pair containing a verbatim\nsection of the attempted solution that occurs\
-      \ exactly once, immediately followed\nby exactly one <new continuation> tag\
-      \ pair containing its replacement. Do not\ncopy placeholder text, and do not\
-      \ write anything after the closing\n</new continuation> tag.\n--- END CRITIQUE\
-      \ TASK ---"
+    critique_prompt: "--- BEGIN CRITIQUE TASK ---\nThe immediately preceding assistant\
+      \ turn is a completed, incorrect attempted\nsolution. Critique that attempt;\
+      \ do not continue it or solve the problem again.\n\nYour entire response must\
+      \ be concise and use this order:\n1. PRUNING: State which steps meaningfully\
+      \ pruned the search space and which\n   steps did not.\n2. SWITCH: State the\
+      \ earliest point where the attempt should have changed\n   direction and the\
+      \ better direction it should have taken.\n3. EDIT: Identify the earliest useful\
+      \ replacement that would move the remaining\n   reasoning away from a dead end\
+      \ and improve its chance of success within the\n   remaining token budget.\n\
+      \nAfter those three short numbered paragraphs, end with exactly one <branch>\
+      \ tag\npair immediately followed by exactly one <new continuation> tag pair.\
+      \ The text\ninside <branch> is not analysis: copy it character-for-character\
+      \ from a short\nsection of the attempted solution that occurs exactly once.\
+      \ The text inside\n<new continuation> is the replacement reasoning to use at\
+      \ that point. Do not\nopen <branch> before the numbered critique. Do not write\
+      \ anything after the\nclosing </new continuation> tag.\n--- END CRITIQUE TASK\
+      \ ---"
     audit_output_dir: null
 trainer:
   balance_batch: true

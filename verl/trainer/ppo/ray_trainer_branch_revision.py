@@ -36,7 +36,11 @@ from verl.experimental.agent_loop.branch_revision_agent_loop import (
 )
 from verl.trainer.config import BRANCH_REVISION_CRITIQUE_PROMPT, BranchRevisionGRPOConfig
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.branch_revision_grpo import strip_terminal_eos, validate_binary_reward_row
+from verl.trainer.ppo.branch_revision_grpo import (
+    encode_followup_user_turn,
+    strip_terminal_eos,
+    validate_binary_reward_row,
+)
 from verl.trainer.ppo.reward import compute_reward
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.metric import reduce_metrics
@@ -153,9 +157,9 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
         raise ValueError("branch-revision GRPO does not support off-policy dataset responses")
 
     if actor_tokenizer is not None:
-        instruction_ids = actor_tokenizer.encode(
-            "\n\n" + BRANCH_REVISION_CRITIQUE_PROMPT,
-            add_special_tokens=False,
+        instruction_ids = encode_followup_user_turn(
+            BRANCH_REVISION_CRITIQUE_PROMPT,
+            actor_tokenizer,
         )
         if not instruction_ids:
             raise ValueError("branch-revision critique instruction must tokenize non-empty")
@@ -226,7 +230,10 @@ class BranchRevisionGRPOController:
             raise ValueError("branch-revision GRPO currently supports only text-only models and datasets")
         if trainer.reward_fn is None:
             raise ValueError("branch-revision GRPO requires a synchronous environment reward function")
-        self.critique_instruction_ids = self._encode("\n\n" + BRANCH_REVISION_CRITIQUE_PROMPT)
+        self.critique_instruction_ids = encode_followup_user_turn(
+            BRANCH_REVISION_CRITIQUE_PROMPT,
+            self.tokenizer,
+        )
         self.audit_dir = None
         self._initialized_audit_steps: set[int] = set()
         if self.feature.audit_output_dir:
