@@ -1,0 +1,832 @@
+# Copyright 2026 NVIDIA Corporation
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Native RayPPOTrainer integration for synchronous branch-revision GRPO."""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from typing import Any
+
+import numpy as np
+import torch
+from omegaconf import OmegaConf, open_dict
+from transformers import AutoConfig
+
+from verl import DataProto
+from verl.experimental.agent_loop.branch_revision_agent_loop import (
+    BRANCH_REVISION_AGENT_NAME,
+    BRANCH_REVISION_CHILD_FIELD,
+    BranchRevisionCritiqueGeneration,
+    BranchRevisionGenerationRecord,
+)
+from verl.trainer.config import BRANCH_REVISION_CRITIQUE_PROMPT, BranchRevisionGRPOConfig
+from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.branch_revision_grpo import strip_terminal_eos, validate_binary_reward_row
+from verl.trainer.ppo.reward import compute_reward
+from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.metric import reduce_metrics
+from verl.utils.model import compute_position_id_with_mask
+from verl.utils.profiler import marked_timer
+
+
+def _add_exception_note(error: BaseException, note: str) -> None:
+    add_note = getattr(error, "add_note", None)
+    if callable(add_note):
+        add_note(note)
+        return
+    notes = getattr(error, "__notes__", None)
+    if notes is None:
+        notes = []
+        error.__notes__ = notes
+    notes.append(note)
+
+
+def _is_moe_model(model_config) -> bool:
+    for name in ("num_experts", "num_local_experts", "n_routed_experts"):
+        value = getattr(model_config, name, None)
+        if isinstance(value, int) and value > 1:
+            return True
+    return getattr(model_config, "moe_intermediate_size", None) is not None
+
+
+def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_model_path: str | None = None) -> None:
+    """Fail closed before allocation for unsupported or ambiguous combinations."""
+
+    feature = omega_conf_to_dataclass(
+        config.algorithm.branch_revision_grpo,
+        dataclass_type=BranchRevisionGRPOConfig,
+    )
+    if not feature.enable:
+        return
+    if bool(OmegaConf.select(config, "algorithm.intermediate_mc_value.enable", default=False)):
+        raise ValueError("branch-revision GRPO and intermediate MC are mutually exclusive")
+    if bool(OmegaConf.select(config, "algorithm.opsd.enable", default=False)):
+        raise ValueError("branch-revision GRPO and OPSD cannot be enabled together")
+    if config.trainer.get("use_legacy_worker_impl", "auto") == "disable":
+        raise ValueError("branch-revision GRPO currently supports only VeRL's legacy FSDP/FSDP2 workers")
+    if config.actor_rollout_ref.actor.strategy not in {"fsdp", "fsdp2"}:
+        raise ValueError("branch-revision actor strategy must be fsdp or fsdp2")
+    if config.actor_rollout_ref.rollout.name != "vllm":
+        raise ValueError("branch-revision GRPO currently supports only the dense vLLM rollout engine")
+    if config.critic.get("enable", None) is not False:
+        raise ValueError("branch-revision GRPO is actor-only and requires critic.enable=false")
+    if str(config.algorithm.adv_estimator).lower() != "grpo":
+        raise ValueError("branch-revision GRPO requires algorithm.adv_estimator=grpo")
+    rollout_n = config.actor_rollout_ref.rollout.n
+    if isinstance(rollout_n, bool) or not isinstance(rollout_n, int) or rollout_n < 2:
+        raise ValueError("branch-revision solution GRPO requires actor_rollout_ref.rollout.n>=2")
+    loss_mode = str(config.actor_rollout_ref.actor.policy_loss.loss_mode)
+    if loss_mode not in {"dppo_tv", "vanilla"}:
+        raise ValueError("branch-revision GRPO supports policy loss modes dppo_tv and vanilla")
+    from verl.trainer.ppo.core_algos import get_policy_loss_fn
+
+    get_policy_loss_fn(loss_mode)
+    if config.algorithm.use_kl_in_reward or config.actor_rollout_ref.actor.use_kl_loss:
+        raise ValueError("branch-revision GRPO does not support reference-policy or reward KL")
+    rollout_correction = config.algorithm.get("rollout_correction", None)
+    if rollout_correction is not None and any(
+        (
+            rollout_correction.get("rollout_is", None) is not None,
+            rollout_correction.get("rollout_rs", None) is not None,
+            bool(rollout_correction.get("bypass_mode", False)),
+        )
+    ):
+        raise ValueError("branch-revision GRPO rejects rollout correction and uses recorded behavior log probabilities")
+    rollout = config.actor_rollout_ref.rollout
+    if float(rollout.temperature) != 1.0 or float(rollout.val_kwargs.temperature) != 1.0:
+        raise ValueError("all branch-revision generation, including validation, requires temperature=1.0")
+    if rollout.max_model_len is None or int(rollout.max_model_len) <= 0:
+        raise ValueError("branch-revision GRPO requires an explicit positive rollout.max_model_len")
+    if str(rollout.get("logprobs_mode", "")) != "processed_logprobs":
+        raise ValueError("branch-revision GRPO requires rollout.logprobs_mode=processed_logprobs")
+    if int(config.data.max_prompt_length) + int(config.data.max_response_length) > int(rollout.max_model_len):
+        raise ValueError("configured prompt plus response lengths exceed rollout.max_model_len")
+    if bool(rollout.multi_turn.enable):
+        raise ValueError("branch-revision GRPO supports only text-only single-turn rollouts")
+    if bool(rollout.get("skip_rollout", False)):
+        raise ValueError("branch-revision GRPO cannot use precomputed or skipped rollouts")
+    if bool(rollout.get("enable_rollout_routing_replay", False)):
+        raise ValueError("branch-revision GRPO does not support rollout routing replay")
+    router_replay = config.actor_rollout_ref.actor.get("router_replay", {})
+    if str(router_replay.get("mode", "none")).lower() not in {"none", "disabled"}:
+        raise ValueError("branch-revision GRPO does not support actor router replay")
+    if bool(config.actor_rollout_ref.actor.get("use_prefix_grouper", False)):
+        raise ValueError("branch-revision GRPO does not yet support actor prefix grouping")
+    if bool(config.reward.reward_model.get("launch_reward_fn_async", False)):
+        raise ValueError("branch-revision reward evaluation is a blocking iteration barrier")
+    if bool(config.reward.reward_model.get("enable", False)):
+        raise ValueError("branch-revision GRPO requires a synchronous environment reward, not a reward model")
+    reward_loop_keys = ("reward_loop_source", "reward_loop_module_path", "reward_loop_class_name")
+    if any(config.reward.reward_model.get(key, None) is not None for key in reward_loop_keys):
+        raise ValueError("branch-revision GRPO does not support rollout-time reward loops")
+    reward_source = str(OmegaConf.select(config, "reward.reward_manager.source", default="register"))
+    reward_name = str(OmegaConf.select(config, "reward.reward_manager.name", default=""))
+    if reward_source == "register" and reward_name == "conditional_logprob":
+        raise ValueError("branch-revision GRPO does not support conditional_logprob training rewards")
+    grouped_reward_keys = (
+        "use_response_logprob_reward_for_uniform_outcome_groups",
+        "use_shortest_success_reward",
+        "use_longest_success_penalty_reward",
+    )
+    reward_kwargs = config.reward.get("reward_kwargs", {}) or {}
+    enabled_grouped_rewards = [key for key in grouped_reward_keys if bool(reward_kwargs.get(key, False))]
+    if enabled_grouped_rewards:
+        raise ValueError(
+            "branch-revision GRPO rejects native grouped-reward transformations: " + repr(enabled_grouped_rewards)
+        )
+    if config.data.get("use_dataset_responses", False):
+        raise ValueError("branch-revision GRPO does not support off-policy dataset responses")
+
+    if actor_tokenizer is not None:
+        instruction_ids = actor_tokenizer.encode(
+            "\n\n" + BRANCH_REVISION_CRITIQUE_PROMPT,
+            add_special_tokens=False,
+        )
+        if not instruction_ids:
+            raise ValueError("branch-revision critique instruction must tokenize non-empty")
+        required = int(config.data.max_prompt_length) + int(config.data.max_response_length) + len(instruction_ids) + 1
+        if required > int(rollout.max_model_len):
+            raise ValueError(
+                "rollout.max_model_len leaves no guaranteed critique output token at configured prompt/response caps: "
+                f"required={required} limit={int(rollout.max_model_len)}"
+            )
+    if actor_model_path is not None:
+        actor_hf_config = AutoConfig.from_pretrained(
+            actor_model_path,
+            trust_remote_code=config.actor_rollout_ref.model.get("trust_remote_code", False),
+        )
+        if _is_moe_model(actor_hf_config):
+            raise ValueError("branch-revision GRPO currently supports only dense actor models")
+        override = config.actor_rollout_ref.model.get("override_config", {})
+        actor_limit = override.get(
+            "max_position_embeddings",
+            getattr(actor_hf_config, "max_position_embeddings", None),
+        )
+        if isinstance(actor_limit, int) and int(rollout.max_model_len) > actor_limit:
+            raise ValueError("rollout.max_model_len exceeds the actor model's effective context limit")
+
+    with open_dict(config):
+        config.critic.enable = False
+        config.actor_rollout_ref.rollout.calculate_log_probs = True
+        config.actor_rollout_ref.actor.use_rollout_log_probs = True
+
+
+@dataclass
+class _Bundle:
+    source_row: int
+    rollout_id: str
+    prompt_group_id: str
+    prompt_ids: list[int]
+    solution_ids: list[int]
+    solution_log_probs: list[float]
+    original_reward: float
+    record: BranchRevisionGenerationRecord | None = None
+    continuation_rewards: dict[int, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _ActorRow:
+    full_ids: list[int]
+    train_start: int
+    behavior_log_probs: list[float]
+    reward: float
+    group_id: str
+    kind: str
+
+
+class BranchRevisionGRPOController:
+    """Own one synchronous post-reward child phase and one native actor update."""
+
+    def __init__(self, trainer):
+        self.trainer = trainer
+        self.config = trainer.config
+        self.tokenizer = trainer.tokenizer
+        self.feature = omega_conf_to_dataclass(
+            self.config.algorithm.branch_revision_grpo,
+            dataclass_type=BranchRevisionGRPOConfig,
+        )
+        if not self.feature.enable:
+            raise ValueError("BranchRevisionGRPOController requires enable=true")
+        if trainer.processor is not None:
+            raise ValueError("branch-revision GRPO currently supports only text-only models and datasets")
+        if trainer.reward_fn is None:
+            raise ValueError("branch-revision GRPO requires a synchronous environment reward function")
+        self.critique_instruction_ids = self._encode("\n\n" + BRANCH_REVISION_CRITIQUE_PROMPT)
+        self.audit_dir = None
+        self._initialized_audit_steps: set[int] = set()
+        if self.feature.audit_output_dir:
+            self.audit_dir = os.path.abspath(os.path.expanduser(self.feature.audit_output_dir))
+            os.makedirs(self.audit_dir, exist_ok=True)
+
+    def _encode(self, text: str) -> list[int]:
+        result = [int(token) for token in self.tokenizer.encode(text, add_special_tokens=False)]
+        if not result:
+            raise ValueError(f"branch-revision boundary tokenized empty: {text!r}")
+        return result
+
+    def _audit(self, event: str, **payload: object) -> None:
+        if self.audit_dir is None:
+            return
+        step = int(self.trainer.global_steps)
+        path = os.path.join(self.audit_dir, f"step_{step:08d}.jsonl")
+        if step not in self._initialized_audit_steps:
+            with open(path, "x", encoding="utf-8") as handle:
+                handle.write("")
+            self._initialized_audit_steps.add(step)
+        record = {"event": event, "global_step": step, **payload}
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True, default=str, ensure_ascii=False) + "\n")
+
+    def _pad_token_id(self) -> int:
+        token_id = self.tokenizer.pad_token_id
+        if token_id is None:
+            token_id = self.tokenizer.eos_token_id
+        if token_id is None:
+            raise ValueError("branch-revision GRPO requires a tokenizer pad or EOS token")
+        return int(token_id)
+
+    @staticmethod
+    def _object_array(values: list[Any]) -> np.ndarray:
+        result = np.empty(len(values), dtype=object)
+        result[:] = values
+        return result
+
+    @staticmethod
+    def _valid_prompt_ids(batch: DataProto, row: int) -> list[int]:
+        prompt_width = batch.batch["prompts"].shape[1]
+        mask = batch.batch["attention_mask"][row, :prompt_width].bool()
+        result = [int(token) for token in batch.batch["prompts"][row][mask].tolist()]
+        if not result:
+            raise ValueError("branch-revision prompt must contain at least one token")
+        return result
+
+    @staticmethod
+    def _valid_solution(batch: DataProto, row: int) -> tuple[list[int], list[float]]:
+        mask = batch.batch["response_mask"][row].bool()
+        length = int(mask.sum().item())
+        if length <= 0 or not torch.all(mask[:length]) or torch.any(mask[length:]):
+            raise ValueError("branch-revision requires a non-empty contiguous single-turn response mask")
+        if "rollout_log_probs" not in batch.batch:
+            raise RuntimeError("branch-revision requires sampling-time processed rollout_log_probs")
+        tokens = [int(token) for token in batch.batch["responses"][row, :length].tolist()]
+        log_probs = [float(value) for value in batch.batch["rollout_log_probs"][row, :length].tolist()]
+        if len(log_probs) != len(tokens) or not all(math.isfinite(value) for value in log_probs):
+            raise RuntimeError("branch-revision solution behavior log probabilities are missing or non-finite")
+        return tokens, log_probs
+
+    def prepare_original_generation_batch(self, batch: DataProto) -> None:
+        """Attach stable rollout ids without replacing VeRL's native initial agent."""
+
+        group_values = batch.non_tensor_batch.get("prompt_group_id", batch.non_tensor_batch.get("uid"))
+        if group_values is None:
+            raise RuntimeError("branch-revision generation requires prompt_group_id or uid")
+        counts: dict[str, int] = {}
+        rollout_ids: list[str] = []
+        for value in group_values:
+            key = str(value)
+            index = counts.get(key, 0)
+            counts[key] = index + 1
+            rollout_ids.append(f"{key}:{index}")
+        batch.non_tensor_batch["branch_revision_rollout_id"] = np.array(rollout_ids, dtype=object)
+
+    def _original_rewards(self, reward_tensor: torch.Tensor) -> list[float]:
+        return [
+            validate_binary_reward_row(row, tolerance=self.feature.reward_tolerance)
+            for row in reward_tensor.detach().cpu().tolist()
+        ]
+
+    def _build_bundles(self, source: DataProto, rewards: list[float]) -> list[_Bundle]:
+        if len(source) != len(rewards):
+            raise RuntimeError("branch-revision original reward count does not match rollout count")
+        group_values = source.non_tensor_batch.get("prompt_group_id")
+        rollout_values = source.non_tensor_batch.get("branch_revision_rollout_id")
+        if group_values is None or rollout_values is None:
+            raise RuntimeError("branch-revision rollout identity columns were lost")
+        bundles: list[_Bundle] = []
+        for row, reward in enumerate(rewards):
+            solution_ids, solution_log_probs = self._valid_solution(source, row)
+            bundles.append(
+                _Bundle(
+                    source_row=row,
+                    rollout_id=str(rollout_values[row]),
+                    prompt_group_id=str(group_values[row]),
+                    prompt_ids=self._valid_prompt_ids(source, row),
+                    solution_ids=solution_ids,
+                    solution_log_probs=solution_log_probs,
+                    original_reward=reward,
+                )
+            )
+        return bundles
+
+    def _make_child_request(self, source: DataProto, bundles: list[_Bundle]) -> DataProto | None:
+        selected = [bundle for bundle in bundles if bundle.original_reward == 0.0]
+        if not selected:
+            return None
+        rows = [bundle.source_row for bundle in selected]
+        non_tensors = {
+            key: np.take(values, rows, axis=0).copy()
+            for key, values in source.non_tensor_batch.items()
+            if key != BRANCH_REVISION_CHILD_FIELD
+        }
+        non_tensors["agent_name"] = np.array([BRANCH_REVISION_AGENT_NAME] * len(selected), dtype=object)
+        non_tensors["branch_revision_rollout_id"] = np.array([bundle.rollout_id for bundle in selected], dtype=object)
+        non_tensors["branch_revision_parent_prompt_ids"] = self._object_array(
+            [bundle.prompt_ids for bundle in selected]
+        )
+        non_tensors["branch_revision_parent_solution_ids"] = self._object_array(
+            [bundle.solution_ids for bundle in selected]
+        )
+        non_tensors["branch_revision_parent_solution_log_probs"] = self._object_array(
+            [bundle.solution_log_probs for bundle in selected]
+        )
+        return DataProto.from_dict(
+            non_tensors=non_tensors,
+            meta_info={"global_steps": self.trainer.global_steps},
+        )
+
+    def _generate_sequences_with_lifecycle(self, request: DataProto, *, profile_rollout: bool) -> DataProto:
+        primary_error: BaseException | None = None
+        profile_cleanup_required = False
+        try:
+            self.trainer.checkpoint_manager.update_weights(self.trainer.global_steps)
+            if profile_rollout:
+                profile_cleanup_required = True
+                self.trainer.async_rollout_manager.start_profile()
+            return self.trainer.async_rollout_manager.generate_sequences(request)
+        except BaseException as error:
+            primary_error = error
+            raise
+        finally:
+            cleanup_errors: list[tuple[str, BaseException]] = []
+            try:
+                self.trainer.checkpoint_manager.sleep_replicas()
+            except BaseException as error:
+                cleanup_errors.append(("rollout sleep cleanup", error))
+            if profile_cleanup_required:
+                try:
+                    self.trainer.async_rollout_manager.stop_profile()
+                except BaseException as error:
+                    cleanup_errors.append(("rollout profile cleanup", error))
+            if cleanup_errors:
+                if primary_error is not None:
+                    for label, error in cleanup_errors:
+                        _add_exception_note(primary_error, f"{label} also failed: {error!r}")
+                else:
+                    _, first_error = cleanup_errors[0]
+                    for label, error in cleanup_errors[1:]:
+                        _add_exception_note(first_error, f"{label} also failed: {error!r}")
+                    raise first_error
+
+    @staticmethod
+    def _coerce_critique(value: Any) -> BranchRevisionCritiqueGeneration:
+        if isinstance(value, BranchRevisionCritiqueGeneration):
+            return value
+        if not isinstance(value, dict):
+            raise TypeError(f"invalid branch-revision critique record {type(value)!r}")
+        return BranchRevisionCritiqueGeneration(
+            token_ids=tuple(int(token) for token in value["token_ids"]),
+            log_probs=tuple(float(item) for item in value["log_probs"]),
+            finish_reason=value.get("finish_reason"),
+            parse_reason=str(value["parse_reason"]),
+            branch_text=str(value.get("branch_text", "")),
+            new_continuation_text=str(value.get("new_continuation_text", "")),
+            revised_prefix_ids=tuple(int(token) for token in value.get("revised_prefix_ids", ())),
+            continuation_ids=tuple(int(token) for token in value.get("continuation_ids", ())),
+            continuation_log_probs=tuple(float(item) for item in value.get("continuation_log_probs", ())),
+            continuation_finish_reason=value.get("continuation_finish_reason"),
+        )
+
+    @classmethod
+    def _coerce_record(cls, value: Any) -> BranchRevisionGenerationRecord:
+        if isinstance(value, BranchRevisionGenerationRecord):
+            return value
+        if not isinstance(value, dict):
+            raise TypeError(f"invalid branch-revision child record {type(value)!r}")
+        return BranchRevisionGenerationRecord(
+            rollout_id=str(value["rollout_id"]),
+            critiques=tuple(cls._coerce_critique(item) for item in value["critiques"]),
+        )
+
+    def _extract_records(self, output: DataProto) -> dict[str, BranchRevisionGenerationRecord]:
+        raw = output.non_tensor_batch.pop(BRANCH_REVISION_CHILD_FIELD, None)
+        if raw is None or len(raw) != len(output):
+            raise RuntimeError("branch-revision child rollout did not return one record per incorrect solution")
+        records: dict[str, BranchRevisionGenerationRecord] = {}
+        for value in raw:
+            record = self._coerce_record(value)
+            if record.rollout_id in records:
+                raise RuntimeError(f"duplicate branch-revision rollout id {record.rollout_id!r}")
+            if len(record.critiques) != self.feature.num_critiques:
+                raise RuntimeError(
+                    f"rollout {record.rollout_id!r} returned {len(record.critiques)} critiques; "
+                    f"expected {self.feature.num_critiques}"
+                )
+            records[record.rollout_id] = record
+        return records
+
+    def _attach_records(self, bundles: list[_Bundle], records: dict[str, BranchRevisionGenerationRecord]) -> None:
+        expected = {bundle.rollout_id for bundle in bundles if bundle.original_reward == 0.0}
+        if set(records) != expected:
+            raise RuntimeError("branch-revision child stage returned an unexpected rollout-id set")
+        for bundle in bundles:
+            if bundle.original_reward == 0.0:
+                bundle.record = records[bundle.rollout_id]
+            elif bundle.rollout_id in records:
+                raise RuntimeError("correct original solution unexpectedly received branch critiques")
+
+    def _make_reward_batch(
+        self,
+        source: DataProto,
+        rows: list[int],
+        prompts: list[list[int]],
+        responses: list[list[int]],
+    ) -> DataProto:
+        prompt_width = int(self.config.actor_rollout_ref.rollout.prompt_length)
+        response_width = int(self.config.actor_rollout_ref.rollout.response_length)
+        if any(len(tokens) > prompt_width for tokens in prompts):
+            raise ValueError("branch-revision reward prompt exceeds rollout.prompt_length")
+        if any(not tokens or len(tokens) > response_width for tokens in responses):
+            raise ValueError("branch-revision completed response must fit rollout.response_length")
+        pad_id = self._pad_token_id()
+        prompt_tensor = torch.full((len(rows), prompt_width), pad_id, dtype=torch.long)
+        response_tensor = torch.full((len(rows), response_width), pad_id, dtype=torch.long)
+        prompt_mask = torch.zeros((len(rows), prompt_width), dtype=torch.long)
+        response_mask = torch.zeros((len(rows), response_width), dtype=torch.long)
+        for row, (prompt, response) in enumerate(zip(prompts, responses, strict=True)):
+            prompt_tensor[row, -len(prompt) :] = torch.tensor(prompt, dtype=torch.long)
+            prompt_mask[row, -len(prompt) :] = 1
+            response_tensor[row, : len(response)] = torch.tensor(response, dtype=torch.long)
+            response_mask[row, : len(response)] = 1
+        attention_mask = torch.cat([prompt_mask, response_mask], dim=1)
+        non_tensors = {
+            key: np.take(values, rows, axis=0).copy()
+            for key, values in source.non_tensor_batch.items()
+            if key != BRANCH_REVISION_CHILD_FIELD
+        }
+        return DataProto.from_dict(
+            tensors={
+                "prompts": prompt_tensor,
+                "responses": response_tensor,
+                "response_mask": response_mask,
+                "input_ids": torch.cat([prompt_tensor, response_tensor], dim=1),
+                "attention_mask": attention_mask,
+                "position_ids": compute_position_id_with_mask(attention_mask),
+            },
+            non_tensors=non_tensors,
+        )
+
+    def _evaluate_continuations(self, source: DataProto, bundles: list[_Bundle]) -> None:
+        rows: list[int] = []
+        prompts: list[list[int]] = []
+        responses: list[list[int]] = []
+        mapping: list[tuple[int, int]] = []
+        for bundle_index, bundle in enumerate(bundles):
+            if bundle.record is None:
+                continue
+            for critique_index, critique in enumerate(bundle.record.critiques):
+                if not critique.token_ids or len(critique.token_ids) != len(critique.log_probs):
+                    raise RuntimeError("branch-revision critique tokens and behavior log probabilities misalign")
+                if not all(math.isfinite(value) for value in critique.log_probs):
+                    raise RuntimeError("branch-revision critique contains non-finite behavior log probabilities")
+                if critique.valid:
+                    if (
+                        not critique.revised_prefix_ids
+                        or not critique.continuation_ids
+                        or len(critique.continuation_ids) != len(critique.continuation_log_probs)
+                    ):
+                        raise RuntimeError("valid branch revision lacks one complete continuation record")
+                    if not all(math.isfinite(value) for value in critique.continuation_log_probs):
+                        raise RuntimeError(
+                            "branch-revision continuation contains non-finite behavior log probabilities"
+                        )
+                    rows.append(bundle.source_row)
+                    prompts.append(bundle.prompt_ids)
+                    responses.append([*critique.revised_prefix_ids, *critique.continuation_ids])
+                    mapping.append((bundle_index, critique_index))
+                elif critique.revised_prefix_ids or critique.continuation_ids or critique.continuation_log_probs:
+                    raise RuntimeError("invalid branch revision unexpectedly launched or retained a continuation")
+        if not mapping:
+            return
+        reward_batch = self._make_reward_batch(source, rows, prompts, responses)
+        reward_tensor, _ = compute_reward(
+            reward_batch,
+            self.trainer.reward_fn,
+            actor_wg=self.trainer.actor_rollout_wg,
+        )
+        reward_rows = reward_tensor.detach().cpu().tolist()
+        if len(reward_rows) != len(mapping):
+            raise RuntimeError("branch-revision continuation reward count does not match generated continuations")
+        for (bundle_index, critique_index), row in zip(mapping, reward_rows, strict=True):
+            reward = validate_binary_reward_row(row, tolerance=self.feature.reward_tolerance)
+            bundles[bundle_index].continuation_rewards[critique_index] = reward
+            critique = bundles[bundle_index].record.critiques[critique_index]
+            self._audit(
+                "continuation",
+                rollout_id=bundles[bundle_index].rollout_id,
+                critique_index=critique_index,
+                reward=reward,
+                revised_prefix_ids=list(critique.revised_prefix_ids),
+                continuation_ids=list(critique.continuation_ids),
+                continuation_log_probs=list(critique.continuation_log_probs),
+                finish_reason=critique.continuation_finish_reason,
+            )
+
+    def _actor_rows(self, bundles: list[_Bundle]) -> list[_ActorRow]:
+        rows: list[_ActorRow] = []
+        prompt_rewards: defaultdict[str, list[float]] = defaultdict(list)
+        for bundle in bundles:
+            prompt_rewards[bundle.prompt_group_id].append(bundle.original_reward)
+        prompt_pass_at_1 = {
+            prompt_group_id: sum(rewards) / len(rewards) for prompt_group_id, rewards in prompt_rewards.items()
+        }
+        for bundle in bundles:
+            solution_group = f"solution:{bundle.prompt_group_id}"
+            rows.append(
+                _ActorRow(
+                    full_ids=[*bundle.prompt_ids, *bundle.solution_ids],
+                    train_start=len(bundle.prompt_ids),
+                    behavior_log_probs=bundle.solution_log_probs,
+                    reward=bundle.original_reward,
+                    group_id=solution_group,
+                    kind="original",
+                )
+            )
+            if bundle.record is None:
+                continue
+            editable_solution = strip_terminal_eos(bundle.solution_ids, self.tokenizer)
+            critique_prompt = [*bundle.prompt_ids, *editable_solution, *self.critique_instruction_ids]
+            for critique_index, critique in enumerate(bundle.record.critiques):
+                continuation_outcome = bundle.continuation_rewards.get(critique_index, 0.0)
+                baseline = prompt_pass_at_1[bundle.prompt_group_id]
+                critique_reward = continuation_outcome - baseline
+                rows.append(
+                    _ActorRow(
+                        full_ids=[*critique_prompt, *critique.token_ids],
+                        train_start=len(critique_prompt),
+                        behavior_log_probs=list(critique.log_probs),
+                        reward=critique_reward,
+                        group_id=f"critique:{bundle.rollout_id}",
+                        kind="critique",
+                    )
+                )
+                if not critique.valid:
+                    continue
+                rows.append(
+                    _ActorRow(
+                        full_ids=[*bundle.prompt_ids, *critique.revised_prefix_ids, *critique.continuation_ids],
+                        train_start=len(bundle.prompt_ids) + len(critique.revised_prefix_ids),
+                        behavior_log_probs=list(critique.continuation_log_probs),
+                        reward=critique_reward,
+                        group_id=solution_group,
+                        kind="continuation",
+                    )
+                )
+                self._audit(
+                    "critique",
+                    rollout_id=bundle.rollout_id,
+                    critique_index=critique_index,
+                    reward=critique_reward,
+                    continuation_outcome=continuation_outcome,
+                    prompt_pass_at_1=baseline,
+                    parse_reason=critique.parse_reason,
+                    branch=critique.branch_text,
+                    new_continuation=critique.new_continuation_text,
+                    critique_ids=list(critique.token_ids),
+                    critique_log_probs=list(critique.log_probs),
+                    finish_reason=critique.finish_reason,
+                )
+            for critique_index, critique in enumerate(bundle.record.critiques):
+                if critique.valid:
+                    continue
+                self._audit(
+                    "critique",
+                    rollout_id=bundle.rollout_id,
+                    critique_index=critique_index,
+                    reward=-prompt_pass_at_1[bundle.prompt_group_id],
+                    continuation_outcome=0.0,
+                    prompt_pass_at_1=prompt_pass_at_1[bundle.prompt_group_id],
+                    parse_reason=critique.parse_reason,
+                    branch=critique.branch_text,
+                    new_continuation=critique.new_continuation_text,
+                    critique_ids=list(critique.token_ids),
+                    critique_log_probs=list(critique.log_probs),
+                    finish_reason=critique.finish_reason,
+                )
+        return rows
+
+    def _make_actor_batch(self, bundles: list[_Bundle]) -> tuple[DataProto, int]:
+        rows = self._actor_rows(bundles)
+        if not rows:
+            raise RuntimeError("branch-revision actor batch has no trainable rows")
+        max_sequence = max(len(row.full_ids) for row in rows)
+        if max_sequence > int(self.config.actor_rollout_ref.rollout.max_model_len):
+            raise ValueError("branch-revision packed actor sequence exceeds rollout.max_model_len")
+        response_width = max_sequence - 1
+        if response_width <= 0:
+            raise ValueError("branch-revision actor sequence needs at least two context tokens")
+        dp_size = self.trainer._get_dp_size(self.trainer.actor_rollout_wg, "actor")
+        padding_rows = (-len(rows)) % dp_size
+        total_rows = len(rows) + padding_rows
+        pad_id = self._pad_token_id()
+        prompts = torch.full((total_rows, 1), pad_id, dtype=torch.long)
+        responses = torch.full((total_rows, response_width), pad_id, dtype=torch.long)
+        response_mask = torch.zeros((total_rows, response_width), dtype=torch.long)
+        attention_mask = torch.zeros((total_rows, max_sequence), dtype=torch.long)
+        old_log_probs = torch.zeros((total_rows, response_width), dtype=torch.float32)
+        rollout_log_probs = torch.zeros_like(old_log_probs)
+        token_level_rewards = torch.zeros_like(old_log_probs)
+        group_ids: list[str] = []
+        kinds: list[str] = []
+        scalar_rewards: list[float] = []
+        for row_index, row in enumerate(rows):
+            behavior = row.behavior_log_probs
+            if not behavior or row.train_start <= 0 or row.train_start + len(behavior) != len(row.full_ids):
+                raise RuntimeError("branch-revision actor behavior span is inconsistent with packed context")
+            if not all(math.isfinite(value) for value in behavior):
+                raise RuntimeError("branch-revision actor row contains non-finite behavior log probabilities")
+            prompts[row_index, 0] = row.full_ids[0]
+            responses[row_index, : len(row.full_ids) - 1] = torch.tensor(row.full_ids[1:], dtype=torch.long)
+            attention_mask[row_index, : len(row.full_ids)] = 1
+            start = row.train_start - 1
+            stop = start + len(behavior)
+            response_mask[row_index, start:stop] = 1
+            values = torch.tensor(behavior, dtype=torch.float32)
+            old_log_probs[row_index, start:stop] = values
+            rollout_log_probs[row_index, start:stop] = values
+            token_level_rewards[row_index, stop - 1] = row.reward
+            group_ids.append(row.group_id)
+            kinds.append(row.kind)
+            scalar_rewards.append(row.reward)
+        for padding_index in range(padding_rows):
+            row_index = len(rows) + padding_index
+            attention_mask[row_index, 0] = 1
+            group_ids.append(f"padding:{padding_index}")
+            kinds.append("padding")
+            scalar_rewards.append(0.0)
+
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_rewards,
+            response_mask=response_mask,
+            index=np.array(group_ids, dtype=object),
+            norm_adv_by_std_in_grpo=bool(self.config.algorithm.norm_adv_by_std_in_grpo),
+            config=self.config.algorithm,
+        )
+        input_ids = torch.cat([prompts, responses], dim=1)
+        actor_batch = DataProto.from_dict(
+            tensors={
+                "prompts": prompts,
+                "responses": responses,
+                "response_mask": response_mask,
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "position_ids": compute_position_id_with_mask(attention_mask),
+                "old_log_probs": old_log_probs,
+                "rollout_log_probs": rollout_log_probs,
+                "token_level_rewards": token_level_rewards,
+                "advantages": advantages,
+                "returns": returns,
+            },
+            non_tensors={
+                "uid": np.array(group_ids, dtype=object),
+                "branch_revision_actor_kind": np.array(kinds, dtype=object),
+                "branch_revision_reward": np.array(scalar_rewards, dtype=np.float32),
+            },
+        )
+        actor_batch.meta_info.update(
+            {
+                "temperature": 1.0,
+                "global_token_num": attention_mask.sum(dim=-1).tolist(),
+                "use_global_loss_normalization": True,
+            }
+        )
+        self._audit(
+            "actor_batch",
+            rows=len(rows),
+            original=sum(row.kind == "original" for row in rows),
+            critiques=sum(row.kind == "critique" for row in rows),
+            continuations=sum(row.kind == "continuation" for row in rows),
+            padding=padding_rows,
+            policy_loss_mode=str(self.config.actor_rollout_ref.actor.policy_loss.loss_mode),
+            clip_ratio=float(self.config.actor_rollout_ref.actor.clip_ratio),
+            clip_ratio_low=self.config.actor_rollout_ref.actor.clip_ratio_low,
+            clip_ratio_high=self.config.actor_rollout_ref.actor.clip_ratio_high,
+            clip_ratio_c=float(self.config.actor_rollout_ref.actor.clip_ratio_c),
+        )
+        return actor_batch, padding_rows
+
+    def _metrics(self, bundles: list[_Bundle], actor_batch: DataProto, padding_rows: int) -> dict[str, float]:
+        originals = [bundle.original_reward for bundle in bundles]
+        incorrect = [bundle for bundle in bundles if bundle.original_reward == 0.0]
+        critiques = [critique for bundle in incorrect for critique in bundle.record.critiques]
+        valid_count = sum(critique.valid for critique in critiques)
+        successes = sum(sum(bundle.continuation_rewards.values()) for bundle in incorrect)
+        incorrect_any = sum(any(value == 1.0 for value in bundle.continuation_rewards.values()) for bundle in incorrect)
+        prompts_with_incorrect = {bundle.prompt_group_id for bundle in incorrect}
+        prompts_with_success = {
+            bundle.prompt_group_id
+            for bundle in incorrect
+            if any(value == 1.0 for value in bundle.continuation_rewards.values())
+        }
+        all_prompts = {bundle.prompt_group_id for bundle in bundles}
+        parse_counts = Counter(critique.parse_reason for critique in critiques)
+        actor_kinds = actor_batch.non_tensor_batch["branch_revision_actor_kind"]
+        global_minibatch = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * int(
+            self.config.actor_rollout_ref.rollout.n
+        )
+        metrics = {
+            "branch_revision/original/pass_at_1": float(sum(originals) / len(originals)),
+            "branch_revision/flip/success_per_all_critiques": float(successes / len(critiques)) if critiques else 0.0,
+            "branch_revision/flip/success_per_valid_continuation": (
+                float(successes / valid_count) if valid_count else 0.0
+            ),
+            "branch_revision/flip/incorrect_originals_with_any_success": (
+                float(incorrect_any / len(incorrect)) if incorrect else 0.0
+            ),
+            "branch_revision/flip/prompts_with_any_success": (
+                float(len(prompts_with_success) / len(prompts_with_incorrect)) if prompts_with_incorrect else 0.0
+            ),
+            "branch_revision/flip/prompts_with_any_success_all_prompts": float(
+                len(prompts_with_success) / len(all_prompts)
+            ),
+            "branch_revision/originals": float(len(bundles)),
+            "branch_revision/incorrect_originals": float(len(incorrect)),
+            "branch_revision/critiques": float(len(critiques)),
+            "branch_revision/valid_edits": float(valid_count),
+            "branch_revision/continuations": float(valid_count),
+            "branch_revision/actor_rows": float(len(actor_batch) - padding_rows),
+            "branch_revision/padding_rows": float(padding_rows),
+            "branch_revision/actor_optimizer_minibatches": float(
+                math.ceil(len(actor_batch) / global_minibatch) * int(self.config.actor_rollout_ref.actor.ppo_epochs)
+            ),
+            "branch_revision/tokens/actor_input": float(actor_batch.batch["attention_mask"].sum().item()),
+            "branch_revision/tokens/actor_train": float(actor_batch.batch["response_mask"].sum().item()),
+            "branch_revision/actor_original_rows": float(np.sum(actor_kinds == "original")),
+            "branch_revision/actor_critique_rows": float(np.sum(actor_kinds == "critique")),
+            "branch_revision/actor_continuation_rows": float(np.sum(actor_kinds == "continuation")),
+            "branch_revision/policy_loss_is_dppo_tv": float(
+                str(self.config.actor_rollout_ref.actor.policy_loss.loss_mode) == "dppo_tv"
+            ),
+        }
+        denominator = len(critiques) or 1
+        for reason, count in sorted(parse_counts.items()):
+            metrics[f"branch_revision/parser/{reason}"] = float(count / denominator)
+        return metrics
+
+    def run_update(
+        self,
+        source: DataProto,
+        reward_tensor: torch.Tensor,
+        metrics: dict[str, Any],
+        timing_raw: dict[str, float],
+        *,
+        profile_rollout: bool = False,
+    ) -> bool:
+        rewards = self._original_rewards(reward_tensor)
+        bundles = self._build_bundles(source, rewards)
+        request = self._make_child_request(source, bundles)
+        if request is not None:
+            with marked_timer("branch_revision_children", timing_raw, color="red"):
+                output = self._generate_sequences_with_lifecycle(request, profile_rollout=profile_rollout)
+                timing_raw.update(output.meta_info.get("timing", {}))
+                records = self._extract_records(output)
+            self._attach_records(bundles, records)
+        else:
+            self._attach_records(bundles, {})
+
+        with marked_timer("branch_revision_rewards", timing_raw, color="yellow"):
+            self._evaluate_continuations(source, bundles)
+        actor_batch, padding_rows = self._make_actor_batch(bundles)
+        if self.config.trainer.balance_batch:
+            self.trainer._balance_batch(
+                actor_batch,
+                metrics=metrics,
+                logging_prefix="branch_revision_actor_global_seqlen",
+                worker_group=self.trainer.actor_rollout_wg,
+                role="actor",
+            )
+        with marked_timer("update_actor", timing_raw, color="red"):
+            actor_output = self.trainer._update_actor(actor_batch)
+        metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+        metrics.update(self._metrics(bundles, actor_batch, padding_rows))
+        self._audit(
+            "iteration",
+            originals=len(bundles),
+            incorrect=sum(bundle.original_reward == 0.0 for bundle in bundles),
+            original_rewards=rewards,
+        )
+        return True

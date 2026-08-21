@@ -542,13 +542,16 @@ class AgentLoopWorker:
                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
-        drain_on_error = bool(OmegaConf.select(self.config, "algorithm.intermediate_mc_value.enable", default=False))
+        drain_on_error = bool(
+            OmegaConf.select(self.config, "algorithm.intermediate_mc_value.enable", default=False)
+            or OmegaConf.select(self.config, "algorithm.branch_revision_grpo.enable", default=False)
+        )
         if drain_on_error:
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
             errors = [result for result in gathered if isinstance(result, BaseException)]
             if errors:
                 raise RuntimeError(
-                    "intermediate MC rollout failed after draining every parent task: "
+                    "synchronous feature rollout failed after draining every parent task: "
                     + "; ".join(repr(error) for error in errors)
                 ) from errors[0]
             outputs = gathered
@@ -1145,13 +1148,16 @@ class AgentLoopManager:
             worker.generate_sequences.remote(chunk)
             for worker, chunk in zip(self.agent_loop_workers[: len(chunkes)], chunkes, strict=True)
         ]
-        drain_on_error = bool(OmegaConf.select(self.config, "algorithm.intermediate_mc_value.enable", default=False))
+        drain_on_error = bool(
+            OmegaConf.select(self.config, "algorithm.intermediate_mc_value.enable", default=False)
+            or OmegaConf.select(self.config, "algorithm.branch_revision_grpo.enable", default=False)
+        )
         if drain_on_error:
             gathered = await asyncio.gather(*calls, return_exceptions=True)
             errors = [result for result in gathered if isinstance(result, BaseException)]
             if errors:
                 raise RuntimeError(
-                    "intermediate MC rollout failed after draining every agent-loop worker: "
+                    "synchronous feature rollout failed after draining every agent-loop worker: "
                     + "; ".join(repr(error) for error in errors)
                 ) from errors[0]
             outputs = gathered

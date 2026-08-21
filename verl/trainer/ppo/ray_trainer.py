@@ -538,6 +538,13 @@ class RayPPOTrainer(OneLoggerInstrumented):
             from verl.trainer.ppo.ray_trainer_intermediate_mc import IntermediateMCValueController
 
             self.intermediate_mc_controller = IntermediateMCValueController(self)
+        self.branch_revision_controller = None
+        if bool(OmegaConf.select(self.config, "algorithm.branch_revision_grpo.enable", default=False)):
+            from verl.trainer.ppo.ray_trainer_branch_revision import BranchRevisionGRPOController
+
+            self.branch_revision_controller = BranchRevisionGRPOController(self)
+        if self.intermediate_mc_controller is not None and self.branch_revision_controller is not None:
+            raise ValueError("intermediate MC and branch-revision GRPO controllers are mutually exclusive")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -554,6 +561,12 @@ class RayPPOTrainer(OneLoggerInstrumented):
         with open_dict(self.config):
             self.config.actor_rollout_ref.rollout.calculate_log_probs = True
         print("Enabled actor_rollout_ref.rollout.calculate_log_probs because generation dump JSONLs are configured.")
+
+    def _has_custom_synchronous_actor_update(self) -> bool:
+        return (
+            getattr(self, "intermediate_mc_controller", None) is not None
+            or getattr(self, "branch_revision_controller", None) is not None
+        )
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """
@@ -1212,12 +1225,12 @@ class RayPPOTrainer(OneLoggerInstrumented):
     def _should_enable_agent_reward_loop(self) -> bool:
         """Return whether rollout workers may stream reward computation.
 
-        Intermediate MC evaluates every solution and continuation through the
+        Synchronous custom actor modes evaluate child continuations through the
         blocking driver-side reward path. Keeping the streaming reward loop
         disabled also preserves rollout identity columns in AgentLoop output.
         """
 
-        if self.intermediate_mc_controller is not None:
+        if self._has_custom_synchronous_actor_update():
             return False
         disable_agent_reward_loop = bool(getattr(self.reward_fn, "disable_async_reward_loop", False))
         return (
@@ -1932,6 +1945,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 intermediate_mc_records = None
                 if self.intermediate_mc_controller is not None:
                     self.intermediate_mc_controller.prepare_generation_batch(gen_batch_output)
+                elif self.branch_revision_controller is not None:
+                    self.branch_revision_controller.prepare_original_generation_batch(gen_batch_output)
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -2050,7 +2065,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                     #   Note: π_old computed once per data batch, serves as stable reference during mini-batch updates
                     rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
                     bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if self.intermediate_mc_controller is not None:
+                    if self._has_custom_synchronous_actor_update():
                         batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"].clone()
                     elif bypass_recomputing_logprobs:  # Use `rollout_log_probs`
                         from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
@@ -2095,14 +2110,14 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
-                    if self.use_reference_policy and self.intermediate_mc_controller is None:
+                    if self.use_reference_policy and not self._has_custom_synchronous_actor_update():
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
                     # compute values
-                    if self.use_critic and self.intermediate_mc_controller is None:
+                    if self.use_critic and not self._has_custom_synchronous_actor_update():
                         with marked_timer("values", timing_raw, color="cyan"):
                             values = self._compute_values(batch)
                             batch = batch.union(values)
@@ -2142,6 +2157,15 @@ class RayPPOTrainer(OneLoggerInstrumented):
                                 profile_rollout=curr_step_profile,
                             )
                             metrics["intermediate_mc/actor_updated"] = float(actor_updated)
+                        elif self.branch_revision_controller is not None:
+                            actor_updated = self.branch_revision_controller.run_update(
+                                batch,
+                                reward_tensor,
+                                metrics,
+                                timing_raw,
+                                profile_rollout=curr_step_profile,
+                            )
+                            metrics["branch_revision/actor_updated"] = float(actor_updated)
                         else:
                             # Compute rollout correction: IS weights, rejection sampling, and metrics
                             # Only runs in decoupled mode (computes once per batch using stable π_old)
@@ -2175,7 +2199,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                             )
 
                     # update critic
-                    if self.use_critic and self.intermediate_mc_controller is None:
+                    if self.use_critic and not self._has_custom_synchronous_actor_update():
                         with marked_timer("update_critic", timing_raw, color="pink"):
                             critic_output = self._update_critic(batch)
                         critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
@@ -2183,7 +2207,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
 
                     # implement critic warmup
                     if (
-                        self.intermediate_mc_controller is None
+                        not self._has_custom_synchronous_actor_update()
                         and self.config.trainer.critic_warmup <= self.global_steps
                     ):
                         # update actor
@@ -2225,7 +2249,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
-                    if self.intermediate_mc_controller is not None:
+                    if self._has_custom_synchronous_actor_update():
                         # Keep VeRL's native checkpoint cadence and timeout handling during both
                         # critic-only warmup and joint actor/critic updates.
                         esi_close_to_expiration = should_save_ckpt_esi(

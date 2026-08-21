@@ -21,6 +21,8 @@ from verl.base_config import BaseConfig
 
 __all__ = [
     "AlgoConfig",
+    "BRANCH_REVISION_CRITIQUE_PROMPT",
+    "BranchRevisionGRPOConfig",
     "FilterGroupsConfig",
     "INTERMEDIATE_MC_CRITIQUE_PROMPT",
     "IntermediateMCValueConfig",
@@ -32,6 +34,60 @@ __all__ = [
     "OPSDTokenKLLoggingConfig",
     "RolloutCorrectionConfig",
 ]
+
+
+BRANCH_REVISION_CRITIQUE_PROMPT = """Analyze the attempted solution with the goal of improving its chance of solving
+the problem within the remaining token budget.
+
+1. Identify which parts meaningfully pruned the search space and which did not.
+2. Explain when the solution should have switched direction and what direction
+   it should have taken.
+3. Select a unique section of the attempted solution that should be changed to
+   move away from a dead end.
+4. State what that section should be changed to.
+
+End with exactly:
+
+<branch>the exact quoted section to replace</branch>
+<new continuation>the replacement text</new continuation>"""
+
+
+@dataclass
+class BranchRevisionGRPOConfig(BaseConfig):
+    """Synchronous actor-only GRPO over branch critiques and revised rollouts."""
+
+    enable: bool = False
+    num_critiques: int = 4
+    critique_max_response_length: Optional[int] = 8192
+    branch_max_tokens: int = 128
+    new_continuation_max_tokens: int = 256
+    reward_tolerance: float = 1e-6
+    critique_prompt: str = BRANCH_REVISION_CRITIQUE_PROMPT
+    audit_output_dir: Optional[str] = None
+
+    def __post_init__(self):
+        positive_ints = {
+            "num_critiques": self.num_critiques,
+            "branch_max_tokens": self.branch_max_tokens,
+            "new_continuation_max_tokens": self.new_continuation_max_tokens,
+        }
+        for name, value in positive_ints.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"algorithm.branch_revision_grpo.{name} must be a positive integer")
+        if self.num_critiques < 2:
+            raise ValueError("algorithm.branch_revision_grpo.num_critiques must be at least 2 for GRPO")
+        if self.critique_max_response_length is not None and (
+            not isinstance(self.critique_max_response_length, int)
+            or isinstance(self.critique_max_response_length, bool)
+            or self.critique_max_response_length <= 0
+        ):
+            raise ValueError(
+                "algorithm.branch_revision_grpo.critique_max_response_length must be positive or null"
+            )
+        if not math.isfinite(self.reward_tolerance) or self.reward_tolerance <= 0.0:
+            raise ValueError("algorithm.branch_revision_grpo.reward_tolerance must be finite and positive")
+        if self.critique_prompt != BRANCH_REVISION_CRITIQUE_PROMPT:
+            raise ValueError("branch_revision_grpo.critique_prompt must exactly match the branch-revision instruction")
 
 
 INTERMEDIATE_MC_CRITIQUE_PROMPT = """You have been given above a question, the thought process, and the resulting
@@ -1413,6 +1469,7 @@ class AlgoConfig(BaseConfig):
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
+    branch_revision_grpo: BranchRevisionGRPOConfig = field(default_factory=BranchRevisionGRPOConfig)
     intermediate_mc_value: IntermediateMCValueConfig = field(default_factory=IntermediateMCValueConfig)
     opsd: OPSDConfig = field(default_factory=OPSDConfig)
     # GDPO (Group reward-Decoupled Normalization Policy Optimization) settings.

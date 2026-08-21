@@ -19,6 +19,8 @@ Single Process Actor
 
 import logging
 import os
+from functools import wraps
+from typing import Any
 
 import torch
 from torch import nn
@@ -44,6 +46,50 @@ __all__ = ["DataParallelPPOActor"]
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _set_global_loss_normalization(config: ActorConfig, response_mask: torch.Tensor, dp_group):
+    """Install exact global denominators for one distributed optimizer minibatch."""
+
+    previous = dict(config.global_batch_info)
+    local_tokens = int(response_mask.sum().item())
+    local_sequences = int((response_mask.sum(dim=-1) > 0).sum().item())
+    counts = torch.tensor([local_tokens, local_sequences], dtype=torch.long, device=get_device_id())
+    torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+    global_tokens, global_sequences = (int(value) for value in counts.tolist())
+    if global_tokens <= 0 or global_sequences <= 0:
+        raise ValueError("global actor optimizer minibatch must contain at least one valid response token")
+    config.global_batch_info.clear()
+    config.global_batch_info.update(
+        {
+            "dp_size": torch.distributed.get_world_size(group=dp_group),
+            "batch_num_tokens": global_tokens,
+            "global_batch_size": global_sequences,
+            "loss_scale_factor": config.loss_scale_factor,
+        }
+    )
+    return previous, global_tokens, global_sequences
+
+
+def _restore_global_loss_normalization(config: ActorConfig, previous: dict[str, Any]) -> None:
+    config.global_batch_info.clear()
+    config.global_batch_info.update(previous)
+
+
+def _restore_global_loss_normalization_on_exit(method):
+    """Keep feature-scoped denominators from leaking after a failed actor update."""
+
+    @wraps(method)
+    def wrapped(self, data: DataProto, *args, **kwargs):
+        if not bool(data.meta_info.get("use_global_loss_normalization", False)):
+            return method(self, data, *args, **kwargs)
+        previous = dict(self.config.global_batch_info)
+        try:
+            return method(self, data, *args, **kwargs)
+        finally:
+            _restore_global_loss_normalization(self.config, previous)
+
+    return wrapped
 
 
 class DataParallelPPOActor(BasePPOActor):
@@ -221,9 +267,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # pad and slice the inputs if sp > 1
                 if self.use_ulysses_sp:
-                    is_vlm_model = hasattr(
-                        getattr(model_module, "module", model_module).config, "vision_config"
-                    )
+                    is_vlm_model = hasattr(getattr(model_module, "module", model_module).config, "vision_config")
                     if is_vlm_model:
                         # vlm model's inputs will be sliced after embedding
                         input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(
@@ -275,7 +319,9 @@ class DataParallelPPOActor(BasePPOActor):
                     if calculate_token_topk > 0:
                         topk_token_ids_rmpad = torch.topk(logits_rmpad, k=calculate_token_topk, dim=-1).indices
                     if calculate_token_mrr:
-                        gt_logits_rmpad = logits_rmpad.gather(dim=-1, index=input_ids_rmpad_rolled.unsqueeze(-1)).squeeze(-1)
+                        gt_logits_rmpad = logits_rmpad.gather(
+                            dim=-1, index=input_ids_rmpad_rolled.unsqueeze(-1)
+                        ).squeeze(-1)
                         better_token_counts_rmpad = (logits_rmpad > gt_logits_rmpad.unsqueeze(-1)).sum(dim=-1)
                         token_reciprocal_ranks_rmpad = (better_token_counts_rmpad.to(torch.float32) + 1.0).reciprocal()
 
@@ -621,12 +667,16 @@ class DataParallelPPOActor(BasePPOActor):
         return outputs
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
+    @_restore_global_loss_normalization_on_exit
     def update_policy(self, data: DataProto, dp_group=None, same_micro_num_in_dp: bool = True):
         # make sure we are in training mode
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         pad_token_id = data.meta_info.get("pad_token_id", 0)
+        use_global_loss_normalization = bool(data.meta_info.get("use_global_loss_normalization", False))
+        if use_global_loss_normalization and self.config.use_kl_loss:
+            raise ValueError("global branch-revision loss normalization does not support actor KL loss")
 
         select_keys = [
             "responses",
@@ -670,6 +720,17 @@ class DataParallelPPOActor(BasePPOActor):
         }
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
+                previous_global_batch_info = None
+                if use_global_loss_normalization:
+                    previous_global_batch_info, global_valid_tokens, global_valid_sequences = (
+                        _set_global_loss_normalization(
+                            self.config,
+                            mini_batch.batch["response_mask"],
+                            dp_group,
+                        )
+                    )
+                    append_to_dict(metrics, {"actor/global_valid_tokens": global_valid_tokens})
+                    append_to_dict(metrics, {"actor/global_valid_sequences": global_valid_sequences})
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(
@@ -699,7 +760,9 @@ class DataParallelPPOActor(BasePPOActor):
 
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
 
-                    if self.config.use_dynamic_bsz:
+                    if use_global_loss_normalization:
+                        loss_scale_factor = 1.0
+                    elif self.config.use_dynamic_bsz:
                         loss_scale_factor = response_mask.shape[0] / self.config.ppo_mini_batch_size
                     else:
                         loss_scale_factor = 1 / self.gradient_accumulation
@@ -767,7 +830,12 @@ class DataParallelPPOActor(BasePPOActor):
 
                     policy_loss = pg_loss
                     if calculate_entropy and entropy is not None:
-                        entropy_agg = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        entropy_agg = agg_loss(
+                            loss_mat=entropy,
+                            loss_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            **self.config.global_batch_info,
+                        )
                         micro_batch_metrics["actor/entropy"] = entropy_agg.detach().item()
                         if entropy_coeff != 0:
                             policy_loss -= entropy_agg * entropy_coeff
@@ -778,7 +846,12 @@ class DataParallelPPOActor(BasePPOActor):
                         kld = kl_penalty(
                             logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=self.config.kl_loss_type
                         )
-                        kl_loss = agg_loss(loss_mat=kld, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        kl_loss = agg_loss(
+                            loss_mat=kld,
+                            loss_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            **self.config.global_batch_info,
+                        )
 
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         metrics["actor/kl_loss"] += kl_loss.detach().item() * loss_scale_factor
@@ -800,5 +873,7 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+                if previous_global_batch_info is not None:
+                    _restore_global_loss_normalization(self.config, previous_global_batch_info)
         self.actor_optimizer.zero_grad()
         return metrics

@@ -383,10 +383,17 @@ class TaskRunner:
         intermediate_mc_enabled = bool(
             OmegaConf.select(config, "algorithm.intermediate_mc_value.enable", default=False)
         )
+        branch_revision_enabled = bool(
+            OmegaConf.select(config, "algorithm.branch_revision_grpo.enable", default=False)
+        )
         if intermediate_mc_enabled:
             from verl.trainer.ppo.ray_trainer_intermediate_mc import validate_intermediate_mc_runtime_config
 
             validate_intermediate_mc_runtime_config(config)
+        if branch_revision_enabled:
+            from verl.trainer.ppo.ray_trainer_branch_revision import validate_branch_revision_runtime_config
+
+            validate_branch_revision_runtime_config(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critic_worker(config)
@@ -431,6 +438,14 @@ class TaskRunner:
                 critic_tokenizer=critic_tokenizer,
                 actor_model_path=local_path,
             )
+        if branch_revision_enabled:
+            from verl.trainer.ppo.ray_trainer_branch_revision import validate_branch_revision_runtime_config
+
+            validate_branch_revision_runtime_config(
+                config,
+                actor_tokenizer=tokenizer,
+                actor_model_path=local_path,
+            )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 
@@ -462,6 +477,8 @@ class TaskRunner:
         trainer_cls = RayPPOTrainer
         if intermediate_mc_enabled:
             print("Using RayPPOTrainer with synchronous intermediate MC integration")
+        if branch_revision_enabled:
+            print("Using RayPPOTrainer with synchronous branch-revision GRPO integration")
         if bool(config.data.get("use_dataset_responses", False)):
             from verl.trainer.ppo.ray_trainer_off_policy import RayTrainerOffPolicy
 

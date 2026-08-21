@@ -184,15 +184,39 @@ algorithm:
     critique_normalization_epsilon: 1.0e-8
 
     # Exact instruction appended after the original question and solution.
-    critique_prompt: |-
-      You have been given above a question, the thought process, and the resulting
-      solution. The solution may or may not be correct. Analyze the thought process
-      and solution and at the end output your judgement on (a) whether the solution
-      is correct or not (b) what parts of the thought process were correct or led to
-      correct directions (c) what part of the thought process were dead-ends or
-      incorrect or didn't later enable moving in the correct direction.
+    critique_prompt: "You have been given above a question, the thought process, and the resulting\nsolution. The solution may or may not be correct. Analyze the thought process\nand solution and at the end output your judgement on (a) whether the solution\nis correct or not (b) what parts of the thought process were correct or led to\ncorrect directions (c) what part of the thought process were dead-ends or\nincorrect or didn't later enable moving in the correct direction."
 
     # Optional structural JSONL audit directory used by smoke verification.
+    audit_output_dir: null
+
+  # Synchronous actor-only branch-revision GRPO.
+  branch_revision_grpo:
+
+    # Structured configuration target.
+    _target_: verl.trainer.config.BranchRevisionGRPOConfig
+
+    # Enable branch-analysis critiques and exact-prefix revised continuations.
+    enable: false
+
+    # Number of IID critiques sampled for every incorrect original rollout.
+    num_critiques: 4
+
+    # Maximum generated critique tokens; null uses the rollout response length.
+    critique_max_response_length: 8192
+
+    # Maximum tokens permitted inside the quoted branch tag.
+    branch_max_tokens: 128
+
+    # Maximum tokens permitted inside the replacement continuation tag.
+    new_continuation_max_tokens: 256
+
+    # Absolute tolerance used when validating strict binary environment rewards.
+    reward_tolerance: 1.0e-6
+
+    # Exact instruction appended after an incorrect attempted solution.
+    critique_prompt: "Analyze the attempted solution with the goal of improving its chance of solving\nthe problem within the remaining token budget.\n\n1. Identify which parts meaningfully pruned the search space and which did not.\n2. Explain when the solution should have switched direction and what direction\n   it should have taken.\n3. Select a unique section of the attempted solution that should be changed to\n   move away from a dead end.\n4. State what that section should be changed to.\n\nEnd with exactly:\n\n<branch>the exact quoted section to replace</branch>\n<new continuation>the replacement text</new continuation>"
+
+    # Optional step-scoped structural JSONL audit directory.
     audit_output_dir: null
 
 # config for the trainer

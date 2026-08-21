@@ -678,6 +678,23 @@ algorithm:
 
       incorrect or didn''t later enable moving in the correct direction.'
     audit_output_dir: null
+  branch_revision_grpo:
+    _target_: verl.trainer.config.BranchRevisionGRPOConfig
+    enable: false
+    num_critiques: 4
+    critique_max_response_length: 8192
+    branch_max_tokens: 128
+    new_continuation_max_tokens: 256
+    reward_tolerance: 1.0e-06
+    critique_prompt: "Analyze the attempted solution with the goal of improving its\
+      \ chance of solving\nthe problem within the remaining token budget.\n\n1. Identify\
+      \ which parts meaningfully pruned the search space and which did not.\n2. Explain\
+      \ when the solution should have switched direction and what direction\n   it\
+      \ should have taken.\n3. Select a unique section of the attempted solution that\
+      \ should be changed to\n   move away from a dead end.\n4. State what that section\
+      \ should be changed to.\n\nEnd with exactly:\n\n<branch>the exact quoted section\
+      \ to replace</branch>\n<new continuation>the replacement text</new continuation>"
+    audit_output_dir: null
 trainer:
   balance_batch: true
   total_epochs: 30
