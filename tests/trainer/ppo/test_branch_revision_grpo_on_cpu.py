@@ -99,7 +99,14 @@ def test_agent_loop_package_registers_branch_revision_in_a_fresh_worker_process(
     assert result.returncode == 0, result.stderr
 
 
-def _structured(branch: str, replacement: str, prefix: str = "analysis\n") -> str:
+VALID_ANALYSIS = (
+    "1. PRUNING: The setup pruned candidates; the algebra did not.\n"
+    "2. SWITCH: Switch at the equality and use an invariant.\n"
+    "3. EDIT: Replace the equality with the invariant.\n"
+)
+
+
+def _structured(branch: str, replacement: str, prefix: str = VALID_ANALYSIS) -> str:
     return f"{prefix}<branch>{branch}</branch>\n<new continuation>{replacement}</new continuation>"
 
 
@@ -118,6 +125,42 @@ def test_critique_instruction_is_a_new_user_turn_with_visible_assistant_output()
     text = decode_exact(ids, TOKENIZER)
     assert text.startswith("</assistant><user>--- BEGIN CRITIQUE TASK ---")
     assert text.endswith("</user><assistant><think>\n\n</think>\n\n")
+
+
+def test_followup_boundary_uses_the_actual_conversation_context() -> None:
+    class ContextSensitiveTokenizer(_CharTokenizer):
+        def apply_chat_template(
+            self,
+            messages,
+            *,
+            tokenize=False,
+            add_generation_prompt=False,
+            enable_thinking=True,
+        ):
+            rendered = "".join(
+                f"<{index}:{message['role']}>{message['content']}</{message['role']}>"
+                for index, message in enumerate(messages)
+            )
+            if add_generation_prompt:
+                rendered += f"<{len(messages)}:assistant>"
+                if not enable_thinking:
+                    rendered += "<think>\n\n</think>\n\n"
+            return self.encode(rendered) if tokenize else rendered
+
+    tokenizer = ContextSensitiveTokenizer()
+    default_suffix = decode_exact(encode_followup_user_turn("review", tokenizer), tokenizer)
+    contextual_suffix = decode_exact(
+        encode_followup_user_turn(
+            "review",
+            tokenizer,
+            prior_messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "q"}],
+            assistant_content="attempt",
+        ),
+        tokenizer,
+    )
+    assert default_suffix.startswith("</assistant><1:user>")
+    assert contextual_suffix.startswith("</assistant><3:user>")
+    assert default_suffix != contextual_suffix
 
 
 def test_exact_parser_preserves_whitespace_unicode_and_truncates_at_unique_branch() -> None:
@@ -148,6 +191,21 @@ def test_terminal_eos_stripping_preserves_interior_special_token() -> None:
     ("critique", "reason"),
     [
         ("<branch>x</branch>", "tag_count"),
+        ("<branch>x</branch>\n<new continuation>new</new continuation>", "critique_section_count"),
+        (
+            "2. SWITCH: switch\n1. PRUNING: prune\n3. EDIT: edit\n"
+            "<branch>x</branch><new continuation>new</new continuation>",
+            "critique_section_order",
+        ),
+        (
+            "preamble\n" + VALID_ANALYSIS + "<branch>x</branch><new continuation>new</new continuation>",
+            "text_before_critique",
+        ),
+        (
+            "1. PRUNING: \n2. SWITCH: switch\n3. EDIT: edit\n"
+            "<branch>x</branch><new continuation>new</new continuation>",
+            "empty_pruning",
+        ),
         (_structured("", "new"), "empty_branch"),
         (_structured("x", "   "), "empty_new_continuation"),
         (_structured("same", "new"), "branch_not_unique"),
@@ -201,6 +259,7 @@ def _runtime_config(loss_mode="dppo_tv"):
                     "critique_max_response_length": 16,
                     "branch_max_tokens": 8,
                     "new_continuation_max_tokens": 8,
+                    "min_continuation_tokens": 8,
                     "reward_tolerance": 1e-6,
                     "critique_prompt": BRANCH_REVISION_CRITIQUE_PROMPT,
                     "audit_output_dir": None,
@@ -279,6 +338,7 @@ def test_runtime_config_accepts_both_native_policy_losses_and_forces_behavior_lo
         ("actor_rollout_ref.rollout.temperature", 0.9, "temperature=1.0"),
         ("actor_rollout_ref.actor.use_kl_loss", True, "does not support"),
         ("reward.reward_model.launch_reward_fn_async", True, "blocking iteration barrier"),
+        ("algorithm.branch_revision_grpo.min_continuation_tokens", 33, "smaller than"),
     ],
 )
 def test_runtime_config_rejects_unsafe_interactions(path, value, message) -> None:
@@ -296,11 +356,11 @@ def _loop() -> BranchRevisionAgentLoop:
         critique_max_response_length=256,
         branch_max_tokens=128,
         new_continuation_max_tokens=256,
+        min_continuation_tokens=128,
     )
     loop.response_length = 256
     loop.max_model_len = 2048
     loop.tokenizer = TOKENIZER
-    loop.critique_instruction_ids = encode_followup_user_turn(BRANCH_REVISION_CRITIQUE_PROMPT, TOKENIZER)
     return loop
 
 
@@ -341,13 +401,52 @@ def test_agent_loop_generates_all_critiques_then_one_continuation_per_valid_edit
             branch_revision_parent_prompt_ids=_ids("q"),
             branch_revision_parent_solution_ids=solution_ids,
             branch_revision_parent_solution_log_probs=[-0.1] * len(solution_ids),
+            raw_prompt=[{"role": "user", "content": "q"}],
         )
     )
     record = output.extra_fields[BRANCH_REVISION_CHILD_FIELD]
+    assert list(record.critique_prompt_ids[: len(_ids("qstart dead and waste"))]) == _ids("qstart dead and waste")
+    assert decode_exact(record.critique_prompt_ids, TOKENIZER).endswith(
+        "</assistant><user>--- BEGIN CRITIQUE TASK ---"
+        + BRANCH_REVISION_CRITIQUE_PROMPT.removeprefix("--- BEGIN CRITIQUE TASK ---")
+        + "</user><assistant><think>\n\n</think>\n\n"
+    )
     assert [critique.parse_reason for critique in record.critiques] == ["valid", "tag_count"]
     assert len(record.critiques[0].continuation_ids) > 0
+    assert record.critiques[0].continuation_max_tokens >= loop.feature.min_continuation_tokens
     assert record.critiques[1].continuation_ids == ()
     assert [call[0] for call in calls] == ["critique[0]", "critique[1]", "continuation[0]"]
+
+
+def test_agent_loop_rejects_edits_without_the_configured_continuation_budget() -> None:
+    loop = _loop()
+    loop.response_length = 100
+    calls: list[str] = []
+
+    async def fake_generate(_route, _prompt, _params, *, max_tokens, kind):
+        del max_tokens
+        calls.append(kind)
+        text = _structured("dead", "better")
+        return TokenOutput(token_ids=_ids(text), log_probs=[-0.2] * len(_ids(text)))
+
+    loop._generate = fake_generate
+    solution_ids = _ids("start dead and waste")
+    output = asyncio.run(
+        loop.run(
+            {},
+            branch_revision_rollout_id="p:0",
+            branch_revision_parent_prompt_ids=_ids("q"),
+            branch_revision_parent_solution_ids=solution_ids,
+            branch_revision_parent_solution_log_probs=[-0.1] * len(solution_ids),
+            raw_prompt=[{"role": "user", "content": "q"}],
+        )
+    )
+    record = output.extra_fields[BRANCH_REVISION_CHILD_FIELD]
+    assert [critique.parse_reason for critique in record.critiques] == [
+        "insufficient_continuation_budget",
+        "insufficient_continuation_budget",
+    ]
+    assert calls == ["critique[0]", "critique[1]"]
 
 
 def test_agent_loop_drains_all_sibling_failures_before_raising() -> None:
@@ -372,6 +471,7 @@ def test_agent_loop_drains_all_sibling_failures_before_raising() -> None:
                 branch_revision_parent_prompt_ids=_ids("q"),
                 branch_revision_parent_solution_ids=solution_ids,
                 branch_revision_parent_solution_log_probs=[-0.1] * len(solution_ids),
+                raw_prompt=[{"role": "user", "content": "q"}],
             )
         )
     assert sorted(completed) == ["critique[0]", "critique[1]"]
@@ -399,7 +499,6 @@ def _controller() -> BranchRevisionGRPOController:
         }
     )
     controller.tokenizer = TOKENIZER
-    controller.critique_instruction_ids = encode_followup_user_turn(BRANCH_REVISION_CRITIQUE_PROMPT, TOKENIZER)
     controller.audit_dir = None
     controller._initialized_audit_steps = set()
     controller.trainer = SimpleNamespace(
@@ -424,6 +523,7 @@ def _critique(text: str, *, valid: bool, continuation: str = "") -> BranchRevisi
             continuation_ids=tuple(_ids(continuation)),
             continuation_log_probs=tuple([-0.3] * len(_ids(continuation))),
             continuation_finish_reason="stop",
+            continuation_max_tokens=128,
         )
     return BranchRevisionCritiqueGeneration(
         token_ids=tuple(critique_ids),
@@ -448,7 +548,11 @@ def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revis
         solution_ids=_ids("start dead and waste"),
         solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
         original_reward=0.0,
-        record=BranchRevisionGenerationRecord("p:0", (valid, invalid)),
+        record=BranchRevisionGenerationRecord(
+            "p:0",
+            (valid, invalid),
+            tuple([*_ids("q"), *_ids("start dead and waste"), *_ids("<followup>")]),
+        ),
         continuation_rewards={0: 1.0},
     )
     correct = _Bundle(
@@ -472,6 +576,11 @@ def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revis
     assert actor_batch.batch["response_mask"][-1].sum().item() == 0
     assert actor_batch.batch["advantages"][-1].abs().sum().item() == 0
     critique_rows = [index for index, kind in enumerate(kinds) if kind == "critique"]
+    expected_critique_prompt = list(wrong.record.critique_prompt_ids)
+    packed_critique = actor_batch.batch["input_ids"][critique_rows[0]][
+        actor_batch.batch["attention_mask"][critique_rows[0]].bool()
+    ].tolist()
+    assert packed_critique == [*expected_critique_prompt, *valid.token_ids]
     critique_rewards = actor_batch.non_tensor_batch["branch_revision_reward"][critique_rows].tolist()
     assert critique_rewards == pytest.approx([0.5, -0.5])
     assert actor_batch.non_tensor_batch["branch_revision_reward"][continuation_row] == pytest.approx(1.0)
@@ -588,7 +697,11 @@ def test_full_controller_update_critiques_only_incorrect_and_trains_one_combined
     source, original_rewards = _source_batch()
     valid = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
     invalid = _critique("invalid", valid=False)
-    record = BranchRevisionGenerationRecord("p:0", (valid, invalid))
+    record = BranchRevisionGenerationRecord(
+        "p:0",
+        (valid, invalid),
+        tuple([*_ids("q"), *_ids("start dead and waste"), *_ids("<followup>")]),
+    )
     child_values = np.empty(1, dtype=object)
     child_values[0] = record
     from verl import DataProto

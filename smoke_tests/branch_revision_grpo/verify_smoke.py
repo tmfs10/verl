@@ -63,6 +63,13 @@ def verify(root: Path) -> dict[str, Any]:
         raise ValueError(f"training did not complete: {completed!r}")
     if (root / "failed.json").exists():
         raise ValueError("failed.json exists beside completed.json")
+    resolved_config = _read_json(root / "resolved_config.json")
+    branch_config = resolved_config["algorithm"]["branch_revision_grpo"]
+    num_critiques = int(branch_config["num_critiques"])
+    min_continuation_tokens = int(branch_config["min_continuation_tokens"])
+    expected_originals = int(resolved_config["data"]["train_batch_size"]) * int(
+        resolved_config["actor_rollout_ref"]["rollout"]["n"]
+    )
 
     audit_files = sorted((root / "audit").glob("step_*.jsonl"))
     if len(audit_files) != 1:
@@ -71,23 +78,24 @@ def verify(root: Path) -> dict[str, Any]:
     event_counts = Counter(str(event.get("event")) for event in events)
     iteration = _only(events, "iteration")
     actor_batch = _only(events, "actor_batch")
-    if int(iteration["originals"]) != 16:
-        raise ValueError(f"expected 16 original rollouts, got {iteration['originals']!r}")
+    if int(iteration["originals"]) != expected_originals:
+        raise ValueError(f"expected {expected_originals} original rollouts, got {iteration['originals']!r}")
     original_rewards = [_require_binary(value, "original reward") for value in iteration["original_rewards"]]
-    if len(original_rewards) != 16:
-        raise ValueError("iteration audit must retain all 16 original binary rewards")
+    if len(original_rewards) != expected_originals:
+        raise ValueError(f"iteration audit must retain all {expected_originals} original binary rewards")
     incorrect = int(iteration["incorrect"])
     if incorrect != original_rewards.count(0.0) or incorrect <= 0:
         raise ValueError("smoke must contain and exactly count at least one incorrect original rollout")
     audited_prompt_pass_at_1 = {str(key): float(value) for key, value in iteration.get("prompt_pass_at_1", {}).items()}
-    if len(audited_prompt_pass_at_1) != 8 or any(
+    expected_prompt_groups = expected_originals // int(resolved_config["actor_rollout_ref"]["rollout"]["n"])
+    if len(audited_prompt_pass_at_1) != expected_prompt_groups or any(
         not 0.0 <= value <= 1.0 for value in audited_prompt_pass_at_1.values()
     ):
         raise ValueError("iteration audit must retain one valid original-rollout pass@1 per prompt")
 
     critiques = [event for event in events if event.get("event") == "critique"]
     continuations = [event for event in events if event.get("event") == "continuation"]
-    expected_critiques = incorrect * 2
+    expected_critiques = incorrect * num_critiques
     if len(critiques) != expected_critiques:
         raise ValueError(f"expected {expected_critiques} IID critiques, got {len(critiques)}")
     if not continuations:
@@ -96,12 +104,21 @@ def verify(root: Path) -> dict[str, Any]:
     critique_keys: set[tuple[str, int]] = set()
     valid_keys: set[tuple[str, int]] = set()
     per_rollout: defaultdict[str, set[int]] = defaultdict(set)
+    critique_prompts: defaultdict[str, set[tuple[int, ...]]] = defaultdict(set)
     for critique in critiques:
         key = (str(critique["rollout_id"]), int(critique["critique_index"]))
         if key in critique_keys:
             raise ValueError(f"duplicate critique evidence for {key!r}")
         critique_keys.add(key)
         per_rollout[key[0]].add(key[1])
+        critique_prompt_ids = tuple(int(token) for token in critique.get("critique_prompt_ids", ()))
+        critique_ids = tuple(int(token) for token in critique.get("critique_ids", ()))
+        critique_log_probs = tuple(float(value) for value in critique.get("critique_log_probs", ()))
+        if not critique_prompt_ids:
+            raise ValueError(f"critique {key!r} omitted its exact behavior-policy prompt IDs")
+        if not critique_ids or len(critique_ids) != len(critique_log_probs):
+            raise ValueError(f"critique {key!r} token/log-prob lengths differ")
+        critique_prompts[key[0]].add(critique_prompt_ids)
         outcome = _require_binary(critique["continuation_outcome"], "critique continuation outcome")
         prompt_group_id = str(critique.get("prompt_group_id"))
         baseline = float(critique["prompt_pass_at_1"])
@@ -119,8 +136,13 @@ def verify(root: Path) -> dict[str, Any]:
             valid_keys.add(key)
             if not str(critique["branch"]).strip() or not str(critique["new_continuation"]).strip():
                 raise ValueError(f"valid critique {key!r} omitted an edit boundary")
-    if any(indices != {0, 1} for indices in per_rollout.values()):
-        raise ValueError(f"each incorrect rollout must have critique indices 0 and 1: {dict(per_rollout)!r}")
+    expected_indices = set(range(num_critiques))
+    if any(indices != expected_indices for indices in per_rollout.values()):
+        raise ValueError(
+            f"each incorrect rollout must have critique indices {sorted(expected_indices)}: {dict(per_rollout)!r}"
+        )
+    if any(len(prompts) != 1 for prompts in critique_prompts.values()):
+        raise ValueError("IID critiques for one original rollout used different behavior-policy prompt IDs")
 
     continuation_keys: set[tuple[str, int]] = set()
     for continuation in continuations:
@@ -133,13 +155,15 @@ def verify(root: Path) -> dict[str, Any]:
             raise ValueError(f"continuation {key!r} lacks its revised prefix or generated suffix")
         if len(continuation["continuation_ids"]) != len(continuation["continuation_log_probs"]):
             raise ValueError(f"continuation {key!r} token/log-prob lengths differ")
+        if int(continuation.get("continuation_max_tokens", 0)) < min_continuation_tokens:
+            raise ValueError(f"continuation {key!r} did not receive its configured minimum token budget")
     if continuation_keys != valid_keys:
         raise ValueError("valid critiques and continuation evidence must be one-to-one")
 
-    expected_actor_rows = 16 + expected_critiques + len(continuations)
+    expected_actor_rows = expected_originals + expected_critiques + len(continuations)
     expected_batch = {
         "rows": expected_actor_rows,
-        "original": 16,
+        "original": expected_originals,
         "critiques": expected_critiques,
         "continuations": len(continuations),
         "policy_loss_mode": "dppo_tv",
@@ -151,7 +175,11 @@ def verify(root: Path) -> dict[str, Any]:
     if not isinstance(actor_rows, list) or len(actor_rows) != expected_actor_rows:
         raise ValueError("actor-batch audit must retain every non-padding row's kind, group, and reward")
     actor_kind_counts = Counter(str(row.get("kind")) for row in actor_rows)
-    if actor_kind_counts != Counter(original=16, critique=expected_critiques, continuation=len(continuations)):
+    if actor_kind_counts != Counter(
+        original=expected_originals,
+        critique=expected_critiques,
+        continuation=len(continuations),
+    ):
         raise ValueError(f"actor-row kind counts mismatch: {actor_kind_counts!r}")
     original_actor_rows = [row for row in actor_rows if row["kind"] == "original"]
     critique_actor_rows = [row for row in actor_rows if row["kind"] == "critique"]
@@ -172,10 +200,19 @@ def verify(root: Path) -> dict[str, Any]:
     ):
         raise ValueError("critique actor rows do not use continuation_outcome - prompt_pass_at_1")
     original_solution_groups = Counter(str(row["group_id"]) for row in original_actor_rows)
-    if len(original_solution_groups) != 8 or any(count != 2 for count in original_solution_groups.values()):
+    rollout_n = int(resolved_config["actor_rollout_ref"]["rollout"]["n"])
+    expected_prompt_groups = expected_originals // rollout_n
+    if len(original_solution_groups) != expected_prompt_groups or any(
+        count != rollout_n for count in original_solution_groups.values()
+    ):
         raise ValueError(
-            f"original solution GRPO groups must contain two rollouts per prompt: {original_solution_groups!r}"
+            f"original solution GRPO groups must contain {rollout_n} rollouts per prompt: {original_solution_groups!r}"
         )
+    if not any(
+        len({float(row["reward"]) for row in original_actor_rows if str(row["group_id"]) == group_id}) > 1
+        for group_id in original_solution_groups
+    ):
+        raise ValueError("smoke has no nonuniform original-solution GRPO reward group")
     recomputed_prompt_pass_at_1: dict[str, float] = {}
     for group_id in original_solution_groups:
         prompt_group_id = group_id.removeprefix("solution:")
@@ -186,10 +223,16 @@ def verify(root: Path) -> dict[str, Any]:
     if any(str(row["group_id"]) not in original_solution_groups for row in continuation_actor_rows):
         raise ValueError("revised solutions must join their original prompt's solution GRPO group")
     critique_groups = Counter(str(row["group_id"]) for row in critique_actor_rows)
-    if len(critique_groups) != incorrect or any(count != 2 for count in critique_groups.values()):
+    if len(critique_groups) != incorrect or any(count != num_critiques for count in critique_groups.values()):
         raise ValueError(
-            f"critique GRPO groups must contain two IID critiques per incorrect rollout: {critique_groups!r}"
+            f"critique GRPO groups must contain {num_critiques} IID critiques per incorrect rollout: "
+            f"{critique_groups!r}"
         )
+    if not any(
+        len({float(row["reward"]) for row in critique_actor_rows if str(row["group_id"]) == group_id}) > 1
+        for group_id in critique_groups
+    ):
+        raise ValueError("smoke has no nonuniform self-critique GRPO reward group")
     padding = int(actor_batch["padding"])
     if not 0 <= padding < 8 or (expected_actor_rows + padding) % 8:
         raise ValueError(f"invalid data-parallel padding count: {padding}")
@@ -202,7 +245,7 @@ def verify(root: Path) -> dict[str, Any]:
     for row in step_rows:
         merged_metrics.update(row.get("data", {}))
     required_metrics = {
-        "branch_revision/originals": 16.0,
+        "branch_revision/originals": float(expected_originals),
         "branch_revision/incorrect_originals": float(incorrect),
         "branch_revision/critiques": float(expected_critiques),
         "branch_revision/valid_edits": float(len(continuations)),
@@ -216,8 +259,15 @@ def verify(root: Path) -> dict[str, Any]:
     grad_keys = [key for key in merged_metrics if key.endswith("actor/grad_norm") or key == "actor/grad_norm"]
     if not grad_keys:
         raise ValueError("optimizer-step grad_norm metric is missing")
-    if not any(math.isfinite(float(merged_metrics[key])) for key in grad_keys):
-        raise ValueError("optimizer-step grad_norm metrics are all non-finite")
+    finite_grad_norms = [float(merged_metrics[key]) for key in grad_keys if math.isfinite(float(merged_metrics[key]))]
+    if not finite_grad_norms or not any(value > 0.0 for value in finite_grad_norms):
+        raise ValueError("optimizer-step grad_norm metrics contain no finite positive learning signal")
+    pg_loss = float(merged_metrics.get("actor/pg_loss", float("nan")))
+    if not math.isfinite(pg_loss):
+        raise ValueError("optimizer-step actor/pg_loss metric is missing or non-finite")
+    successful_revisions = sum(float(event["reward"]) for event in continuations)
+    if successful_revisions <= 0.0:
+        raise ValueError("smoke has no successful revised continuation")
 
     return {
         "status": "verified",
@@ -225,7 +275,7 @@ def verify(root: Path) -> dict[str, Any]:
         "event_counts": dict(sorted(event_counts.items())),
         "incorrect_originals": incorrect,
         "valid_edits": len(continuations),
-        "successful_revisions": sum(float(event["reward"]) for event in continuations),
+        "successful_revisions": successful_revisions,
         "actor_rows": expected_actor_rows,
         "padding_rows": padding,
         "wall_seconds": float(completed["wall_seconds"]),

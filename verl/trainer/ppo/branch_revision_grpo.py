@@ -18,13 +18,18 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 BRANCH_OPEN = "<branch>"
 BRANCH_CLOSE = "</branch>"
 NEW_CONTINUATION_OPEN = "<new continuation>"
 NEW_CONTINUATION_CLOSE = "</new continuation>"
 _FOLLOWUP_SENTINEL = "__VERL_BRANCH_REVISION_PREVIOUS_ASSISTANT_7F4E65C1__"
+_CRITIQUE_SECTIONS = (
+    ("1. PRUNING:", "empty_pruning"),
+    ("2. SWITCH:", "empty_switch"),
+    ("3. EDIT:", "empty_edit"),
+)
 
 
 @dataclass(frozen=True)
@@ -69,7 +74,14 @@ def decode_exact(token_ids: Iterable[int], tokenizer: Any) -> str:
     )
 
 
-def encode_followup_user_turn(instruction: str, tokenizer: Any) -> list[int]:
+def encode_followup_user_turn(
+    instruction: str,
+    tokenizer: Any,
+    *,
+    prior_messages: Sequence[Mapping[str, Any]] | None = None,
+    assistant_content: str | None = None,
+    chat_template_kwargs: Mapping[str, Any] | None = None,
+) -> list[int]:
     """Encode a genuine user follow-up plus assistant generation boundary.
 
     Deriving the suffix from the tokenizer's own chat template avoids hard-coding
@@ -81,14 +93,30 @@ def encode_followup_user_turn(instruction: str, tokenizer: Any) -> list[int]:
     apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
     if not callable(apply_chat_template):
         raise ValueError("branch-revision GRPO requires a tokenizer chat template")
-    rendered = apply_chat_template(
-        [
+    if (prior_messages is None) != (assistant_content is None):
+        raise ValueError("prior_messages and assistant_content must be provided together")
+    if _FOLLOWUP_SENTINEL in instruction or (assistant_content is not None and _FOLLOWUP_SENTINEL in assistant_content):
+        raise ValueError("branch-revision text contains the reserved boundary sentinel")
+    if prior_messages is None:
+        messages: list[dict[str, Any]] = [
             {"role": "assistant", "content": _FOLLOWUP_SENTINEL},
             {"role": "user", "content": instruction},
-        ],
+        ]
+    else:
+        messages = [dict(message) for message in prior_messages]
+        messages.extend(
+            [
+                {"role": "assistant", "content": f"{assistant_content}{_FOLLOWUP_SENTINEL}"},
+                {"role": "user", "content": instruction},
+            ]
+        )
+    template_kwargs = dict(chat_template_kwargs or {})
+    template_kwargs["enable_thinking"] = False
+    rendered = apply_chat_template(
+        messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=False,
+        **template_kwargs,
     )
     if not isinstance(rendered, str) or rendered.count(_FOLLOWUP_SENTINEL) != 1:
         raise ValueError("tokenizer chat template did not preserve the branch-revision boundary sentinel exactly")
@@ -136,6 +164,28 @@ def parse_branch_revision(
         return _invalid("text_between_tags", solution_text, critique_text)
     if critique_text[new_close + len(NEW_CONTINUATION_CLOSE) :].strip():
         return _invalid("text_after_tags", solution_text, critique_text)
+
+    marker_counts = [critique_text.count(marker) for marker, _ in _CRITIQUE_SECTIONS]
+    if marker_counts != [1, 1, 1]:
+        return _invalid("critique_section_count", solution_text, critique_text)
+    marker_positions = [critique_text.index(marker) for marker, _ in _CRITIQUE_SECTIONS]
+    if not (marker_positions[0] < marker_positions[1] < marker_positions[2] < branch_open):
+        return _invalid("critique_section_order", solution_text, critique_text)
+    if critique_text[: marker_positions[0]].strip():
+        return _invalid("text_before_critique", solution_text, critique_text)
+    section_ends = [
+        marker_positions[1],
+        marker_positions[2],
+        branch_open,
+    ]
+    for (marker, empty_reason), start, end in zip(
+        _CRITIQUE_SECTIONS,
+        marker_positions,
+        section_ends,
+        strict=True,
+    ):
+        if not critique_text[start + len(marker) : end].strip():
+            return _invalid(empty_reason, solution_text, critique_text)
 
     branch_text = critique_text[branch_content_start:branch_close]
     replacement_text = critique_text[new_content_start:new_close]

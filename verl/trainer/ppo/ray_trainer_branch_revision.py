@@ -34,10 +34,9 @@ from verl.experimental.agent_loop.branch_revision_agent_loop import (
     BranchRevisionCritiqueGeneration,
     BranchRevisionGenerationRecord,
 )
-from verl.trainer.config import BRANCH_REVISION_CRITIQUE_PROMPT, BranchRevisionGRPOConfig
+from verl.trainer.config import BranchRevisionGRPOConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.branch_revision_grpo import (
-    encode_followup_user_turn,
     strip_terminal_eos,
     validate_binary_reward_row,
 )
@@ -118,8 +117,10 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
         raise ValueError("branch-revision GRPO requires an explicit positive rollout.max_model_len")
     if str(rollout.get("logprobs_mode", "")) != "processed_logprobs":
         raise ValueError("branch-revision GRPO requires rollout.logprobs_mode=processed_logprobs")
-    if int(config.data.max_prompt_length) + int(config.data.max_response_length) > int(rollout.max_model_len):
-        raise ValueError("configured prompt plus response lengths exceed rollout.max_model_len")
+    if int(config.data.max_prompt_length) + int(config.data.max_response_length) >= int(rollout.max_model_len):
+        raise ValueError("configured prompt plus response lengths must leave branch-critique context headroom")
+    if int(config.data.max_response_length) < feature.min_continuation_tokens:
+        raise ValueError("data.max_response_length is smaller than branch-revision min_continuation_tokens")
     if bool(rollout.multi_turn.enable):
         raise ValueError("branch-revision GRPO supports only text-only single-turn rollouts")
     if bool(rollout.get("skip_rollout", False)):
@@ -157,18 +158,8 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
         raise ValueError("branch-revision GRPO does not support off-policy dataset responses")
 
     if actor_tokenizer is not None:
-        instruction_ids = encode_followup_user_turn(
-            BRANCH_REVISION_CRITIQUE_PROMPT,
-            actor_tokenizer,
-        )
-        if not instruction_ids:
-            raise ValueError("branch-revision critique instruction must tokenize non-empty")
-        required = int(config.data.max_prompt_length) + int(config.data.max_response_length) + len(instruction_ids) + 1
-        if required > int(rollout.max_model_len):
-            raise ValueError(
-                "rollout.max_model_len leaves no guaranteed critique output token at configured prompt/response caps: "
-                f"required={required} limit={int(rollout.max_model_len)}"
-            )
+        if not callable(getattr(actor_tokenizer, "apply_chat_template", None)):
+            raise ValueError("branch-revision GRPO requires an actor tokenizer chat template")
     if actor_model_path is not None:
         actor_hf_config = AutoConfig.from_pretrained(
             actor_model_path,
@@ -230,10 +221,6 @@ class BranchRevisionGRPOController:
             raise ValueError("branch-revision GRPO currently supports only text-only models and datasets")
         if trainer.reward_fn is None:
             raise ValueError("branch-revision GRPO requires a synchronous environment reward function")
-        self.critique_instruction_ids = encode_followup_user_turn(
-            BRANCH_REVISION_CRITIQUE_PROMPT,
-            self.tokenizer,
-        )
         self.audit_dir = None
         self._initialized_audit_steps: set[int] = set()
         if self.feature.audit_output_dir:
@@ -416,6 +403,7 @@ class BranchRevisionGRPOController:
             continuation_ids=tuple(int(token) for token in value.get("continuation_ids", ())),
             continuation_log_probs=tuple(float(item) for item in value.get("continuation_log_probs", ())),
             continuation_finish_reason=value.get("continuation_finish_reason"),
+            continuation_max_tokens=int(value.get("continuation_max_tokens", 0)),
         )
 
     @classmethod
@@ -427,6 +415,7 @@ class BranchRevisionGRPOController:
         return BranchRevisionGenerationRecord(
             rollout_id=str(value["rollout_id"]),
             critiques=tuple(cls._coerce_critique(item) for item in value["critiques"]),
+            critique_prompt_ids=tuple(int(token) for token in value["critique_prompt_ids"]),
         )
 
     def _extract_records(self, output: DataProto) -> dict[str, BranchRevisionGenerationRecord]:
@@ -453,6 +442,17 @@ class BranchRevisionGRPOController:
         for bundle in bundles:
             if bundle.original_reward == 0.0:
                 bundle.record = records[bundle.rollout_id]
+                editable_solution = strip_terminal_eos(bundle.solution_ids, self.tokenizer)
+                expected_prefix = [*bundle.prompt_ids, *editable_solution]
+                critique_prompt = list(bundle.record.critique_prompt_ids)
+                if (
+                    len(critique_prompt) <= len(expected_prefix)
+                    or critique_prompt[: len(expected_prefix)] != expected_prefix
+                ):
+                    raise RuntimeError(
+                        "branch-revision worker critique prompt does not preserve the exact "
+                        "original prompt/solution prefix"
+                    )
             elif bundle.rollout_id in records:
                 raise RuntimeError("correct original solution unexpectedly received branch critiques")
 
@@ -515,6 +515,7 @@ class BranchRevisionGRPOController:
                         not critique.revised_prefix_ids
                         or not critique.continuation_ids
                         or len(critique.continuation_ids) != len(critique.continuation_log_probs)
+                        or critique.continuation_max_tokens < self.feature.min_continuation_tokens
                     ):
                         raise RuntimeError("valid branch revision lacks one complete continuation record")
                     if not all(math.isfinite(value) for value in critique.continuation_log_probs):
@@ -550,6 +551,7 @@ class BranchRevisionGRPOController:
                 revised_prefix_ids=list(critique.revised_prefix_ids),
                 continuation_ids=list(critique.continuation_ids),
                 continuation_log_probs=list(critique.continuation_log_probs),
+                continuation_max_tokens=critique.continuation_max_tokens,
                 finish_reason=critique.continuation_finish_reason,
             )
 
@@ -580,8 +582,7 @@ class BranchRevisionGRPOController:
             )
             if bundle.record is None:
                 continue
-            editable_solution = strip_terminal_eos(bundle.solution_ids, self.tokenizer)
-            critique_prompt = [*bundle.prompt_ids, *editable_solution, *self.critique_instruction_ids]
+            critique_prompt = list(bundle.record.critique_prompt_ids)
             for critique_index, critique in enumerate(bundle.record.critiques):
                 continuation_outcome = bundle.continuation_rewards.get(critique_index, 0.0)
                 baseline = prompt_pass_at_1[bundle.prompt_group_id]
@@ -621,6 +622,7 @@ class BranchRevisionGRPOController:
                     new_continuation=critique.new_continuation_text,
                     critique_ids=list(critique.token_ids),
                     critique_log_probs=list(critique.log_probs),
+                    critique_prompt_ids=critique_prompt,
                     finish_reason=critique.finish_reason,
                 )
             for critique_index, critique in enumerate(bundle.record.critiques):
@@ -639,6 +641,7 @@ class BranchRevisionGRPOController:
                     new_continuation=critique.new_continuation_text,
                     critique_ids=list(critique.token_ids),
                     critique_log_probs=list(critique.log_probs),
+                    critique_prompt_ids=critique_prompt,
                     finish_reason=critique.finish_reason,
                 )
         return rows

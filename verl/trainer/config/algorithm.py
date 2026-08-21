@@ -40,7 +40,8 @@ BRANCH_REVISION_CRITIQUE_PROMPT = """--- BEGIN CRITIQUE TASK ---
 The immediately preceding assistant turn is a completed, incorrect attempted
 solution. Critique that attempt; do not continue it or solve the problem again.
 
-Your entire response must be concise and use this order:
+Your entire response must be concise, have no preamble, and begin with these
+exact labels in this order:
 1. PRUNING: State which steps meaningfully pruned the search space and which
    steps did not.
 2. SWITCH: State the earliest point where the attempt should have changed
@@ -50,8 +51,9 @@ Your entire response must be concise and use this order:
    remaining token budget.
 
 After those three short numbered paragraphs, end with exactly one <branch> tag
-pair immediately followed by exactly one <new continuation> tag pair. The text
-inside <branch> is not analysis: copy it character-for-character from a short
+pair followed by exactly one <new continuation> tag pair, with at most
+whitespace between the pairs. The text inside <branch> is not analysis: copy
+it character-for-character from a short
 section of the attempted solution that occurs exactly once. The text inside
 <new continuation> is the replacement reasoning to use at that point. Do not
 open <branch> before the numbered critique. Do not write anything after the
@@ -68,6 +70,7 @@ class BranchRevisionGRPOConfig(BaseConfig):
     critique_max_response_length: Optional[int] = 8192
     branch_max_tokens: int = 128
     new_continuation_max_tokens: int = 256
+    min_continuation_tokens: int = 128
     reward_tolerance: float = 1e-6
     critique_prompt: str = BRANCH_REVISION_CRITIQUE_PROMPT
     audit_output_dir: Optional[str] = None
@@ -77,6 +80,7 @@ class BranchRevisionGRPOConfig(BaseConfig):
             "num_critiques": self.num_critiques,
             "branch_max_tokens": self.branch_max_tokens,
             "new_continuation_max_tokens": self.new_continuation_max_tokens,
+            "min_continuation_tokens": self.min_continuation_tokens,
         }
         for name, value in positive_ints.items():
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:

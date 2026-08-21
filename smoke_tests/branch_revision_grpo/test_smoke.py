@@ -40,6 +40,9 @@ def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(t
     assert "actor_rollout_ref.rollout.temperature=1.0" in rendered
     assert "actor_rollout_ref.rollout.val_kwargs.temperature=1.0" in rendered
     assert "actor_rollout_ref.actor.policy_loss.loss_mode=dppo_tv" in rendered
+    assert "algorithm.branch_revision_grpo.num_critiques=4" in rendered
+    assert "algorithm.branch_revision_grpo.min_continuation_tokens=128" in rendered
+    assert "data.max_response_length=2048" in rendered
     assert "reward.reward_model.launch_reward_fn_async=false" in rendered
     assert "--enable_wandb" not in command
     assert "--no_requeue" in command
@@ -58,6 +61,14 @@ def _write_jsonl(path: Path, rows) -> None:
 
 def _fixture(root: Path, *, include_continuation: bool = True) -> None:
     _write_json(root / "completed.json", {"status": "completed", "wall_seconds": 2.0})
+    _write_json(
+        root / "resolved_config.json",
+        {
+            "algorithm": {"branch_revision_grpo": {"num_critiques": 2, "min_continuation_tokens": 128}},
+            "data": {"train_batch_size": 8},
+            "actor_rollout_ref": {"rollout": {"n": 2}},
+        },
+    )
     events = []
     original_rewards = [0.0, 1.0, 0.0, 1.0] + [1.0] * 12
     actor_rows = [
@@ -86,6 +97,9 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                     "parse_reason": "valid" if valid else "tag_count",
                     "branch": "bad" if valid else "",
                     "new_continuation": "good" if valid else "",
+                    "critique_prompt_ids": [10, 11, original_index],
+                    "critique_ids": [20, critique_index],
+                    "critique_log_probs": [-0.2, -0.3],
                 }
             )
             actor_rows.append(
@@ -106,6 +120,7 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                         "revised_prefix_ids": [1],
                         "continuation_ids": [2],
                         "continuation_log_probs": [-0.2],
+                        "continuation_max_tokens": 128,
                     }
                 )
                 actor_rows.append(
@@ -156,6 +171,7 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                     "branch_revision/continuations": float(continuation_count),
                     "branch_revision/policy_loss_is_dppo_tv": 1.0,
                     "actor/grad_norm": 1.0,
+                    "actor/pg_loss": 0.1,
                 },
             }
         ],
@@ -172,6 +188,16 @@ def test_verifier_accepts_complete_live_contract(tmp_path: Path) -> None:
 def test_verifier_rejects_smoke_without_a_valid_revision(tmp_path: Path) -> None:
     _fixture(tmp_path, include_continuation=False)
     with pytest.raises(ValueError, match="no strictly parsed"):
+        verify(tmp_path)
+
+
+def test_verifier_rejects_zero_signal_optimizer_step(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    path = tmp_path / "metrics.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["data"]["actor/grad_norm"] = 0.0
+    _write_jsonl(path, rows)
+    with pytest.raises(ValueError, match="positive learning signal"):
         verify(tmp_path)
 
 
@@ -204,3 +230,4 @@ def test_extra_args_contains_no_async_or_critic_training() -> None:
     assert "launch_reward_fn_async=false" in rendered
     assert "actor_rollout_ref.rollout.temperature=1.0" in rendered
     assert "critique_max_response_length=2560" in rendered
+    assert "min_continuation_tokens=128" in rendered

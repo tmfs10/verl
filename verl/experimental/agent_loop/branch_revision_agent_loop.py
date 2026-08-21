@@ -23,6 +23,7 @@ from typing import Any
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.trainer.config import BRANCH_REVISION_CRITIQUE_PROMPT, BranchRevisionGRPOConfig
 from verl.trainer.ppo.branch_revision_grpo import (
+    decode_exact,
     encode_followup_user_turn,
     parse_branch_revision,
     strip_terminal_eos,
@@ -47,6 +48,7 @@ class BranchRevisionCritiqueGeneration:
     continuation_ids: tuple[int, ...] = ()
     continuation_log_probs: tuple[float, ...] = ()
     continuation_finish_reason: str | None = None
+    continuation_max_tokens: int = 0
 
     @property
     def valid(self) -> bool:
@@ -57,6 +59,7 @@ class BranchRevisionCritiqueGeneration:
 class BranchRevisionGenerationRecord:
     rollout_id: str
     critiques: tuple[BranchRevisionCritiqueGeneration, ...]
+    critique_prompt_ids: tuple[int, ...]
 
 
 def _as_int_list(value: Any, name: str) -> list[int]:
@@ -87,12 +90,6 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         )
         self.response_length = int(self.rollout_config.response_length)
         self.max_model_len = int(self.rollout_config.max_model_len)
-        self.critique_instruction_ids = encode_followup_user_turn(
-            BRANCH_REVISION_CRITIQUE_PROMPT,
-            self.tokenizer,
-        )
-        if not self.critique_instruction_ids:
-            raise ValueError("branch-revision critique instruction must tokenize non-empty")
 
     @staticmethod
     def _sampling_params(base: dict[str, Any], *, max_tokens: int) -> dict[str, Any]:
@@ -155,7 +152,17 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         editable_solution_ids = strip_terminal_eos(solution_ids, self.tokenizer)
         if not editable_solution_ids:
             raise ValueError("branch-revision solution is empty after removing its terminal EOS boundary")
-        critique_prompt = [*prompt_ids, *editable_solution_ids, *self.critique_instruction_ids]
+        raw_prompt = kwargs.get("raw_prompt")
+        if raw_prompt is None:
+            raise ValueError("branch-revision child generation requires the original raw_prompt messages")
+        critique_instruction_ids = encode_followup_user_turn(
+            BRANCH_REVISION_CRITIQUE_PROMPT,
+            self.tokenizer,
+            prior_messages=list(raw_prompt),
+            assistant_content=decode_exact(editable_solution_ids, self.tokenizer),
+            chat_template_kwargs=kwargs.get("chat_template_kwargs"),
+        )
+        critique_prompt = [*prompt_ids, *editable_solution_ids, *critique_instruction_ids]
         requested_cap = int(self.feature.critique_max_response_length or self.response_length)
         critique_cap = min(requested_cap, self.max_model_len - len(critique_prompt))
         if critique_cap <= 0:
@@ -209,12 +216,16 @@ class BranchRevisionAgentLoop(AgentLoopBase):
             )
             parse_reason = parsed.reason
             revised_prefix_ids = list(parsed.revised_prefix_ids)
-            if parsed.valid and len(revised_prefix_ids) >= self.response_length:
-                parse_reason = "no_response_budget"
-                revised_prefix_ids = []
-            if parsed.valid and revised_prefix_ids and len(prompt_ids) + len(revised_prefix_ids) >= self.max_model_len:
-                parse_reason = "no_context_budget"
-                revised_prefix_ids = []
+            continuation_max_tokens = 0
+            if parsed.valid:
+                continuation_max_tokens = min(
+                    self.response_length - len(revised_prefix_ids),
+                    self.max_model_len - len(prompt_ids) - len(revised_prefix_ids),
+                )
+                if continuation_max_tokens < self.feature.min_continuation_tokens:
+                    parse_reason = "insufficient_continuation_budget"
+                    revised_prefix_ids = []
+                    continuation_max_tokens = 0
             parsed_records.append(
                 {
                     "token_ids": critique_ids,
@@ -224,16 +235,14 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                     "branch_text": parsed.branch_text,
                     "new_continuation_text": parsed.new_continuation_text,
                     "revised_prefix_ids": revised_prefix_ids,
+                    "continuation_max_tokens": continuation_max_tokens,
                 }
             )
             if parse_reason != "valid":
                 continue
-            max_tokens = min(
-                self.response_length - len(revised_prefix_ids),
-                self.max_model_len - len(prompt_ids) - len(revised_prefix_ids),
-            )
-            if max_tokens <= 0:
-                raise RuntimeError("valid branch revision unexpectedly has no continuation capacity")
+            max_tokens = continuation_max_tokens
+            if max_tokens < self.feature.min_continuation_tokens:
+                raise RuntimeError("valid branch revision unexpectedly lacks its minimum continuation capacity")
             continuation_tasks.append(
                 asyncio.create_task(
                     self._generate(
@@ -267,7 +276,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
             max_tokens = self.response_length - len(parsed_records[index]["revised_prefix_ids"])
             continuation_ids, continuation_log_probs = self._validated_output(
                 raw_output,
-                cap=max_tokens,
+                cap=min(max_tokens, int(parsed_records[index]["continuation_max_tokens"])),
                 kind=f"continuation[{index}]",
             )
             parsed_records[index]["continuation_ids"] = continuation_ids
@@ -286,10 +295,15 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 continuation_ids=tuple(record.get("continuation_ids", ())),
                 continuation_log_probs=tuple(record.get("continuation_log_probs", ())),
                 continuation_finish_reason=record.get("continuation_finish_reason"),
+                continuation_max_tokens=int(record["continuation_max_tokens"]),
             )
             for record in parsed_records
         )
-        record = BranchRevisionGenerationRecord(rollout_id=rollout_id, critiques=critiques)
+        record = BranchRevisionGenerationRecord(
+            rollout_id=rollout_id,
+            critiques=critiques,
+            critique_prompt_ids=tuple(critique_prompt),
+        )
         extra_fields = {
             BRANCH_REVISION_CHILD_FIELD: record,
             "turn_scores": [],
