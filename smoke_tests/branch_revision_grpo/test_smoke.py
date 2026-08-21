@@ -65,11 +65,14 @@ def test_rendered_smoke_scales_dataset_batch_rollouts_and_critiques_together(tmp
         n_samples=4,
         num_critiques=6,
         seed=47,
+        model_path="/hf_models/Qwen3-4B",
     )
     rendered = " ".join(command)
     assert "--n_prompts 32" in rendered
     assert "--n_samples 4" in rendered
     assert "--seed 47" in rendered
+    assert "--actor_model /hf_models/Qwen3-4B" in rendered
+    assert "--critic_model /hf_models/Qwen3-4B" in rendered
     assert "data.train_batch_size=32" in rendered
     assert "++data.gen_batch_size=32" in rendered
     assert "actor_rollout_ref.rollout.n=4" in rendered
@@ -77,6 +80,7 @@ def test_rendered_smoke_scales_dataset_batch_rollouts_and_critiques_together(tmp
     assert "+branch_revision_smoke.n_prompts=32" in rendered
     assert "+branch_revision_smoke.n_samples=4" in rendered
     assert "+branch_revision_smoke.num_critiques=6" in rendered
+    assert "+branch_revision_smoke.model_path=/hf_models/Qwen3-4B" in rendered
 
 
 @pytest.mark.parametrize(
@@ -87,9 +91,10 @@ def test_rendered_smoke_scales_dataset_batch_rollouts_and_critiques_together(tmp
         ({"n_samples": 1}, "at least 2"),
         ({"num_critiques": 1}, "at least 2"),
         ({"seed": -1}, "nonnegative"),
+        ({"model_path": "/hf_models/not-supported"}, "model_path"),
     ],
 )
-def test_rendered_smoke_rejects_invalid_scale(overrides: dict[str, int], match: str, tmp_path: Path) -> None:
+def test_rendered_smoke_rejects_invalid_scale(overrides: dict[str, int | str], match: str, tmp_path: Path) -> None:
     kwargs = {
         "run_tag": "invalid",
         "dry_run": False,
@@ -144,7 +149,7 @@ def _scaled_runtime_config(tmp_path: Path):
                     "audit_output_dir": str(tmp_path / "audit"),
                 },
             },
-            "critic": {"enable": False},
+            "critic": {"enable": False, "model": {"path": str(model)}},
             "trainer": {
                 "nnodes": 1,
                 "n_gpus_per_node": 8,
@@ -162,13 +167,21 @@ def _scaled_runtime_config(tmp_path: Path):
 
 def test_scaled_runtime_contract_accepts_matching_resolved_dimensions(tmp_path: Path) -> None:
     config = _scaled_runtime_config(tmp_path)
-    _validate_contract(config, tmp_path, {"n_prompts": 32, "n_samples": 4, "num_critiques": 6})
+    _validate_contract(
+        config,
+        tmp_path,
+        {"model_path": str(tmp_path / "model"), "n_prompts": 32, "n_samples": 4, "num_critiques": 6},
+    )
 
 
 def test_scaled_runtime_contract_rejects_stale_fixed_dimension(tmp_path: Path) -> None:
     config = _scaled_runtime_config(tmp_path)
     with pytest.raises(ValueError, match="data.train_batch_size=8"):
-        _validate_contract(config, tmp_path, {"n_prompts": 8, "n_samples": 4, "num_critiques": 6})
+        _validate_contract(
+            config,
+            tmp_path,
+            {"model_path": str(tmp_path / "model"), "n_prompts": 8, "n_samples": 4, "num_critiques": 6},
+        )
 
 
 def _write_json(path: Path, value) -> None:

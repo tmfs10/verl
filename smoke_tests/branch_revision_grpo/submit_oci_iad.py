@@ -44,6 +44,7 @@ from smoke_tests.intermediate_mc_value.topology.submit_oci_iad import (
 DEFAULT_VERL = Path("/home/siddjain/workspace/verl/verl_branch_revision_grpo")
 DEFAULT_REWARD = Path("/home/siddjain/workspace/scripts/src/nemo_verl/reward/verl_code_reward.py")
 MODEL_PATH = "/hf_models/Qwen3-1.7B"
+SUPPORTED_MODEL_PATHS = {MODEL_PATH, "/hf_models/Qwen3-4B"}
 
 
 def _extra_args(
@@ -52,6 +53,7 @@ def _extra_args(
     n_prompts: int = 8,
     n_samples: int = 4,
     num_critiques: int = 4,
+    model_path: str = MODEL_PATH,
 ) -> str:
     overrides = [
         "~critic.append_solution_to_prompt",
@@ -124,6 +126,7 @@ def _extra_args(
         f"+branch_revision_smoke.n_prompts={n_prompts}",
         f"+branch_revision_smoke.n_samples={n_samples}",
         f"+branch_revision_smoke.num_critiques={num_critiques}",
+        f"+branch_revision_smoke.model_path={model_path}",
     ]
     return " ".join(overrides)
 
@@ -141,6 +144,7 @@ def build_command(
     n_samples: int = 4,
     num_critiques: int = 4,
     seed: int = 43,
+    model_path: str = MODEL_PATH,
 ) -> tuple[list[str], str]:
     positive = {
         "n_prompts": n_prompts,
@@ -156,6 +160,8 @@ def build_command(
         raise ValueError("num_critiques must be at least 2 for GRPO")
     if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
         raise ValueError("seed must be a nonnegative integer")
+    if model_path not in SUPPORTED_MODEL_PATHS:
+        raise ValueError(f"model_path must be one of {sorted(SUPPORTED_MODEL_PATHS)!r}")
     remote_output = f"/output/smoke_tests/branch_revision_grpo/{run_tag}"
     remote_evidence = f"{remote_output}/evidence"
     command = [
@@ -186,9 +192,9 @@ def build_command(
         "--gpus",
         "8",
         "--actor_model",
-        MODEL_PATH,
+        model_path,
         "--critic_model",
-        MODEL_PATH,
+        model_path,
         "--prompt_data",
         TRAIN_DATA,
         "--eval_data",
@@ -247,6 +253,7 @@ def build_command(
             n_prompts=n_prompts,
             n_samples=n_samples,
             num_critiques=num_critiques,
+            model_path=model_path,
         ),
     ]
     if dry_run:
@@ -277,6 +284,7 @@ def main() -> None:
     parser.add_argument("--n-samples", type=int, default=4)
     parser.add_argument("--num-critiques", type=int, default=4)
     parser.add_argument("--seed", type=int, default=43)
+    parser.add_argument("--model-path", choices=sorted(SUPPORTED_MODEL_PATHS), default=MODEL_PATH)
     args = parser.parse_args()
 
     local_run_dir = args.local_run_dir.expanduser().resolve()
@@ -330,6 +338,7 @@ def main() -> None:
         n_samples=args.n_samples,
         num_critiques=args.num_critiques,
         seed=args.seed,
+        model_path=args.model_path,
     )
     git = _git_provenance(repo_root)
     provenance = {
@@ -356,6 +365,7 @@ def main() -> None:
             n_samples=args.n_samples,
             num_critiques=args.num_critiques,
             seed=args.seed,
+            model_path=args.model_path,
         )
         result = _run(dry_command, local_run_dir / "dry_run.log")
         if result.returncode:

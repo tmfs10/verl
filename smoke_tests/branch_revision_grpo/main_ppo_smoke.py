@@ -66,7 +66,7 @@ def _configure_file_logger(config, path: Path) -> None:
 
 
 def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any]) -> None:
-    required_contract = {"n_prompts", "n_samples", "num_critiques"}
+    required_contract = {"model_path", "n_prompts", "n_samples", "num_critiques"}
     if set(smoke_contract) != required_contract:
         raise ValueError(
             f"branch-revision smoke contract must contain exactly {sorted(required_contract)!r}, "
@@ -77,10 +77,15 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "data.gen_batch_size": smoke_contract["n_prompts"],
         "actor_rollout_ref.rollout.n": smoke_contract["n_samples"],
         "algorithm.branch_revision_grpo.num_critiques": smoke_contract["num_critiques"],
+        "actor_rollout_ref.model.path": smoke_contract["model_path"],
+        "critic.model.path": smoke_contract["model_path"],
     }
-    for name, value in smoke_contract.items():
+    for name in ("n_prompts", "n_samples", "num_critiques"):
+        value = smoke_contract[name]
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"branch-revision smoke {name} must be a positive integer")
+    if not isinstance(smoke_contract["model_path"], str) or not smoke_contract["model_path"].startswith("/"):
+        raise ValueError("branch-revision smoke model_path must be an absolute string path")
     if smoke_contract["n_samples"] < 2:
         raise ValueError("branch-revision smoke n_samples must be at least 2 for a GRPO acceptance group")
     if smoke_contract["num_critiques"] < 2:
