@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import asyncio
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -62,6 +65,22 @@ TOKENIZER = _CharTokenizer()
 
 def _ids(text: str) -> list[int]:
     return TOKENIZER.encode(text, add_special_tokens=False)
+
+
+def test_agent_loop_package_registers_branch_revision_in_a_fresh_worker_process() -> None:
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "import verl.experimental.agent_loop; "
+            "from verl.experimental.agent_loop.agent_loop import _agent_loop_registry; "
+            "assert 'branch_revision_agent' in _agent_loop_registry, _agent_loop_registry"
+        ),
+    ]
+    environment = os.environ.copy()
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(command, capture_output=True, text=True, env=environment, check=False)
+    assert result.returncode == 0, result.stderr
 
 
 def _structured(branch: str, replacement: str, prefix: str = "analysis\n") -> str:

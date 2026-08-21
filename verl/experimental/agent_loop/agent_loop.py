@@ -54,6 +54,15 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 DEFAULT_ROUTING_CACHE_SIZE = 10000
 
 
+def _drain_synchronous_feature_tasks_on_error(config: DictConfig | None) -> bool:
+    if config is None:
+        return False
+    return bool(
+        OmegaConf.select(config, "algorithm.intermediate_mc_value.enable", default=False)
+        or OmegaConf.select(config, "algorithm.branch_revision_grpo.enable", default=False)
+    )
+
+
 @ray.remote
 class GlobalRequestLoadBalancer:
     """Global sticky-session + in-flight load balancer shared by all AgentLoopWorkers."""
@@ -542,10 +551,7 @@ class AgentLoopWorker:
                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
-        drain_on_error = bool(
-            OmegaConf.select(self.config, "algorithm.intermediate_mc_value.enable", default=False)
-            or OmegaConf.select(self.config, "algorithm.branch_revision_grpo.enable", default=False)
-        )
+        drain_on_error = _drain_synchronous_feature_tasks_on_error(self.config)
         if drain_on_error:
             gathered = await asyncio.gather(*tasks, return_exceptions=True)
             errors = [result for result in gathered if isinstance(result, BaseException)]
@@ -1148,10 +1154,7 @@ class AgentLoopManager:
             worker.generate_sequences.remote(chunk)
             for worker, chunk in zip(self.agent_loop_workers[: len(chunkes)], chunkes, strict=True)
         ]
-        drain_on_error = bool(
-            OmegaConf.select(self.config, "algorithm.intermediate_mc_value.enable", default=False)
-            or OmegaConf.select(self.config, "algorithm.branch_revision_grpo.enable", default=False)
-        )
+        drain_on_error = _drain_synchronous_feature_tasks_on_error(getattr(self, "config", None))
         if drain_on_error:
             gathered = await asyncio.gather(*calls, return_exceptions=True)
             errors = [result for result in gathered if isinstance(result, BaseException)]
