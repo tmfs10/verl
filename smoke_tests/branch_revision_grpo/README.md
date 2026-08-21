@@ -10,7 +10,7 @@ table { width: 100% !important; }
 
 # Branch-revision GRPO smoke
 
-This is a production-faithful, fully synchronous, one-step acceptance smoke for Qwen3-1.7B on the OPSD Math 30K training data. It uses one exclusive eight-GPU OCI-IAD node, four original rollouts per each of eight prompts, four IID branch critiques for every incorrect original, one revised continuation per strictly valid edit, a real actor optimizer step, temperature `1.0` for every generation, and no W&B logging. Original solutions have a 2,048-token cap, and a valid edit must leave at least 128 tokens of continuation capacity.
+This is a production-faithful, fully synchronous, one-step acceptance smoke for Qwen3-1.7B on the OPSD Math 30K training data. Its default cell uses one exclusive eight-GPU OCI-IAD node, four original rollouts per each of eight prompts, four IID branch critiques for every incorrect original, one revised continuation per strictly valid edit, a real actor optimizer step, temperature `1.0` for every generation, and no W&B logging. Original solutions have a 2,048-token cap, and a valid edit must leave at least 128 tokens of continuation capacity. `--n-prompts`, `--n-samples`, `--num-critiques`, and `--seed` may scale a timestamped acceptance retry; the launcher keeps the dataset batch, rollout multiplicity, and resolved verifier expectations synchronized.
 
 The smoke allows up to 2,560 critique tokens inside a 6,144-token context. The critique is encoded as a genuine, context-aware follow-up user turn using the rollout worker's actor tokenizer and exact original conversation. The worker records the exact prompt token IDs used for sampling, and the trainer reuses those IDs verbatim; Qwen's hidden-thinking prefill is disabled for that turn so the complete generated critique remains visible and trainable. The strict parser requires all three nonempty numbered findings before the edit tags. The larger hard cap is a fail-safe rather than permission to omit the structured edit.
 
@@ -26,10 +26,12 @@ RUN_TAG=branch-revision-smoke-YYYYMMDD-HHMMSS
 RUN_DIR=/home/siddjain/data/intermediate_mc_value_model/verl/branch_revision_grpo_smoke/$RUN_TAG
 
 python3 -m smoke_tests.branch_revision_grpo.submit_oci_iad dry-run \
-  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR" \
+  --n-prompts 8 --n-samples 4 --num-critiques 4 --seed 43
 
 python3 -m smoke_tests.branch_revision_grpo.submit_oci_iad submit \
-  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR" \
+  --n-prompts 8 --n-samples 4 --num-critiques 4 --seed 43
 
 python3 -m smoke_tests.branch_revision_grpo.submit_oci_iad status \
   --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"

@@ -46,21 +46,27 @@ DEFAULT_REWARD = Path("/home/siddjain/workspace/scripts/src/nemo_verl/reward/ver
 MODEL_PATH = "/hf_models/Qwen3-1.7B"
 
 
-def _extra_args(remote_evidence: str) -> str:
+def _extra_args(
+    remote_evidence: str,
+    *,
+    n_prompts: int = 8,
+    n_samples: int = 4,
+    num_critiques: int = 4,
+) -> str:
     overrides = [
         "~critic.append_solution_to_prompt",
         "algorithm.adv_estimator=grpo",
         "algorithm.use_kl_in_reward=false",
         "algorithm.intermediate_mc_value.enable=false",
         "algorithm.branch_revision_grpo.enable=true",
-        "algorithm.branch_revision_grpo.num_critiques=4",
+        f"algorithm.branch_revision_grpo.num_critiques={num_critiques}",
         "algorithm.branch_revision_grpo.critique_max_response_length=2560",
         "algorithm.branch_revision_grpo.branch_max_tokens=128",
         "algorithm.branch_revision_grpo.new_continuation_max_tokens=256",
         "algorithm.branch_revision_grpo.min_continuation_tokens=128",
         f"algorithm.branch_revision_grpo.audit_output_dir={remote_evidence}/audit",
-        "data.train_batch_size=8",
-        "++data.gen_batch_size=8",
+        f"data.train_batch_size={n_prompts}",
+        f"++data.gen_batch_size={n_prompts}",
         "data.max_prompt_length=1024",
         "data.max_response_length=2048",
         "data.filter_overlong_prompts=true",
@@ -80,7 +86,7 @@ def _extra_args(remote_evidence: str) -> str:
         "actor_rollout_ref.actor.fsdp_config.param_offload=false",
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=false",
         "actor_rollout_ref.rollout.name=vllm",
-        "actor_rollout_ref.rollout.n=4",
+        f"actor_rollout_ref.rollout.n={n_samples}",
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.top_p=1.0",
         "actor_rollout_ref.rollout.top_k=-1",
@@ -128,7 +134,23 @@ def build_command(
     verl_root: Path,
     reward_file: Path,
     config_dir: Path,
+    n_prompts: int = 8,
+    n_samples: int = 4,
+    num_critiques: int = 4,
+    seed: int = 43,
 ) -> tuple[list[str], str]:
+    positive = {
+        "n_prompts": n_prompts,
+        "n_samples": n_samples,
+        "num_critiques": num_critiques,
+    }
+    for name, value in positive.items():
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if num_critiques < 2:
+        raise ValueError("num_critiques must be at least 2 for GRPO")
+    if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
+        raise ValueError("seed must be a nonnegative integer")
     remote_output = f"/output/smoke_tests/branch_revision_grpo/{run_tag}"
     remote_evidence = f"{remote_output}/evidence"
     command = [
@@ -167,9 +189,9 @@ def build_command(
         "--eval_data",
         VAL_DATA,
         "--n_prompts",
-        "8",
+        str(n_prompts),
         "--n_samples",
-        "4",
+        str(n_samples),
         "--n_val_samples",
         "1",
         "--val_batch_size",
@@ -207,7 +229,7 @@ def build_command(
         "--ae",
         "grpo",
         "--seed",
-        "43",
+        str(seed),
         "--add_interactive",
         "--no_sandbox",
         "--no_requeue",
@@ -215,7 +237,12 @@ def build_command(
         "--omit_noncore_algorithm_overrides",
         "--skip_runtime_package_install",
         "--extra_args",
-        _extra_args(remote_evidence),
+        _extra_args(
+            remote_evidence,
+            n_prompts=n_prompts,
+            n_samples=n_samples,
+            num_critiques=num_critiques,
+        ),
     ]
     if dry_run:
         command.append("--dry_run")
@@ -241,6 +268,10 @@ def main() -> None:
     parser.add_argument("--verl-root", type=Path, default=DEFAULT_VERL)
     parser.add_argument("--reward-file", type=Path, default=DEFAULT_REWARD)
     parser.add_argument("--config-dir", type=Path, default=DEFAULT_CONFIG_DIR)
+    parser.add_argument("--n-prompts", type=int, default=8)
+    parser.add_argument("--n-samples", type=int, default=4)
+    parser.add_argument("--num-critiques", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=43)
     args = parser.parse_args()
 
     local_run_dir = args.local_run_dir.expanduser().resolve()
@@ -290,6 +321,10 @@ def main() -> None:
         verl_root=repo_root,
         reward_file=args.reward_file,
         config_dir=execution_config_dir,
+        n_prompts=args.n_prompts,
+        n_samples=args.n_samples,
+        num_critiques=args.num_critiques,
+        seed=args.seed,
     )
     git = _git_provenance(repo_root)
     provenance = {
@@ -312,6 +347,10 @@ def main() -> None:
             verl_root=repo_root,
             reward_file=args.reward_file,
             config_dir=execution_config_dir,
+            n_prompts=args.n_prompts,
+            n_samples=args.n_samples,
+            num_critiques=args.num_critiques,
+            seed=args.seed,
         )
         result = _run(dry_command, local_run_dir / "dry_run.log")
         if result.returncode:

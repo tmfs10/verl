@@ -50,6 +50,54 @@ def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(t
     assert "--add_interactive" in command
 
 
+def test_rendered_smoke_scales_dataset_batch_rollouts_and_critiques_together(tmp_path: Path) -> None:
+    command, _ = build_command(
+        run_tag="scaled",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        n_prompts=32,
+        n_samples=4,
+        num_critiques=6,
+        seed=47,
+    )
+    rendered = " ".join(command)
+    assert "--n_prompts 32" in rendered
+    assert "--n_samples 4" in rendered
+    assert "--seed 47" in rendered
+    assert "data.train_batch_size=32" in rendered
+    assert "++data.gen_batch_size=32" in rendered
+    assert "actor_rollout_ref.rollout.n=4" in rendered
+    assert "algorithm.branch_revision_grpo.num_critiques=6" in rendered
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"n_prompts": 0}, "n_prompts"),
+        ({"n_samples": 0}, "n_samples"),
+        ({"num_critiques": 1}, "at least 2"),
+        ({"seed": -1}, "nonnegative"),
+    ],
+)
+def test_rendered_smoke_rejects_invalid_scale(overrides: dict[str, int], match: str, tmp_path: Path) -> None:
+    kwargs = {
+        "run_tag": "invalid",
+        "dry_run": False,
+        "python": Path("/python"),
+        "launcher": Path("/launcher"),
+        "verl_root": Path("/verl"),
+        "reward_file": Path("/reward.py"),
+        "config_dir": tmp_path,
+        **overrides,
+    }
+    with pytest.raises(ValueError, match=match):
+        build_command(**kwargs)
+
+
 def _write_json(path: Path, value) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value) + "\n", encoding="utf-8")
