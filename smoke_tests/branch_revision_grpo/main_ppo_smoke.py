@@ -40,7 +40,7 @@ EXPECTED = {
     "actor_rollout_ref.actor.ppo_epochs": 1,
     "actor_rollout_ref.rollout.max_model_len": 5120,
     "algorithm.branch_revision_grpo.num_critiques": 2,
-    "algorithm.branch_revision_grpo.critique_max_response_length": 1536,
+    "algorithm.branch_revision_grpo.critique_max_response_length": 2560,
     "trainer.nnodes": 1,
     "trainer.n_gpus_per_node": 8,
     "trainer.total_training_steps": 1,

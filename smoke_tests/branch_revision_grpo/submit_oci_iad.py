@@ -54,7 +54,7 @@ def _extra_args(remote_evidence: str) -> str:
         "algorithm.intermediate_mc_value.enable=false",
         "algorithm.branch_revision_grpo.enable=true",
         "algorithm.branch_revision_grpo.num_critiques=2",
-        "algorithm.branch_revision_grpo.critique_max_response_length=1536",
+        "algorithm.branch_revision_grpo.critique_max_response_length=2560",
         "algorithm.branch_revision_grpo.branch_max_tokens=128",
         "algorithm.branch_revision_grpo.new_continuation_max_tokens=256",
         f"algorithm.branch_revision_grpo.audit_output_dir={remote_evidence}/audit",

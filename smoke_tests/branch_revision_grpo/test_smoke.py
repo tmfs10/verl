@@ -59,15 +59,26 @@ def _write_jsonl(path: Path, rows) -> None:
 def _fixture(root: Path, *, include_continuation: bool = True) -> None:
     _write_json(root / "completed.json", {"status": "completed", "wall_seconds": 2.0})
     events = []
+    original_rewards = [0.0, 1.0, 0.0, 1.0] + [1.0] * 12
+    actor_rows = [
+        {
+            "kind": "original",
+            "group_id": f"solution:prompt-{index // 2}",
+            "reward": original_rewards[index],
+        }
+        for index in range(16)
+    ]
     continuation_count = 0
     for original_index in range(2):
         rollout = f"p:{original_index}"
+        prompt_group_id = f"prompt-{original_index}"
         for critique_index in range(2):
             valid = include_continuation and original_index == 0 and critique_index == 0
             events.append(
                 {
                     "event": "critique",
                     "rollout_id": rollout,
+                    "prompt_group_id": prompt_group_id,
                     "critique_index": critique_index,
                     "reward": 0.5 if valid else -0.5,
                     "continuation_outcome": 1.0 if valid else 0.0,
@@ -75,6 +86,13 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                     "parse_reason": "valid" if valid else "tag_count",
                     "branch": "bad" if valid else "",
                     "new_continuation": "good" if valid else "",
+                }
+            )
+            actor_rows.append(
+                {
+                    "kind": "critique",
+                    "group_id": f"critique:{rollout}",
+                    "reward": 0.5 if valid else -0.5,
                 }
             )
             if valid:
@@ -90,6 +108,13 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                         "continuation_log_probs": [-0.2],
                     }
                 )
+                actor_rows.append(
+                    {
+                        "kind": "continuation",
+                        "group_id": f"solution:{prompt_group_id}",
+                        "reward": 1.0,
+                    }
+                )
     rows = 16 + 4 + continuation_count
     padding = (-rows) % 8
     events.extend(
@@ -102,12 +127,18 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                 "continuations": continuation_count,
                 "padding": padding,
                 "policy_loss_mode": "dppo_tv",
+                "actor_rows": actor_rows,
             },
             {
                 "event": "iteration",
                 "originals": 16,
                 "incorrect": 2,
-                "original_rewards": [0.0, 0.0] + [1.0] * 14,
+                "original_rewards": original_rewards,
+                "prompt_pass_at_1": {
+                    "prompt-0": 0.5,
+                    "prompt-1": 0.5,
+                    **{f"prompt-{index}": 1.0 for index in range(2, 8)},
+                },
             },
         ]
     )
@@ -144,8 +175,32 @@ def test_verifier_rejects_smoke_without_a_valid_revision(tmp_path: Path) -> None
         verify(tmp_path)
 
 
+def test_verifier_rejects_centered_critique_reward_on_revised_solution_row(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    path = tmp_path / "audit" / "step_00000001.jsonl"
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    actor_batch = next(event for event in events if event["event"] == "actor_batch")
+    continuation = next(row for row in actor_batch["actor_rows"] if row["kind"] == "continuation")
+    continuation["reward"] = 0.5
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="continuation actor reward"):
+        verify(tmp_path)
+
+
+def test_verifier_rejects_critique_baseline_from_wrong_prompt_group(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    path = tmp_path / "audit" / "step_00000001.jsonl"
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    critique = next(event for event in events if event["event"] == "critique")
+    critique["prompt_group_id"] = "prompt-7"
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="wrong original prompt group"):
+        verify(tmp_path)
+
+
 def test_extra_args_contains_no_async_or_critic_training() -> None:
     rendered = _extra_args("/output/evidence")
     assert "critic.enable=false" in rendered
     assert "launch_reward_fn_async=false" in rendered
     assert "actor_rollout_ref.rollout.temperature=1.0" in rendered
+    assert "critique_max_response_length=2560" in rendered

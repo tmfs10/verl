@@ -79,6 +79,11 @@ def verify(root: Path) -> dict[str, Any]:
     incorrect = int(iteration["incorrect"])
     if incorrect != original_rewards.count(0.0) or incorrect <= 0:
         raise ValueError("smoke must contain and exactly count at least one incorrect original rollout")
+    audited_prompt_pass_at_1 = {str(key): float(value) for key, value in iteration.get("prompt_pass_at_1", {}).items()}
+    if len(audited_prompt_pass_at_1) != 8 or any(
+        not 0.0 <= value <= 1.0 for value in audited_prompt_pass_at_1.values()
+    ):
+        raise ValueError("iteration audit must retain one valid original-rollout pass@1 per prompt")
 
     critiques = [event for event in events if event.get("event") == "critique"]
     continuations = [event for event in events if event.get("event") == "continuation"]
@@ -98,9 +103,14 @@ def verify(root: Path) -> dict[str, Any]:
         critique_keys.add(key)
         per_rollout[key[0]].add(key[1])
         outcome = _require_binary(critique["continuation_outcome"], "critique continuation outcome")
+        prompt_group_id = str(critique.get("prompt_group_id"))
         baseline = float(critique["prompt_pass_at_1"])
         reward = float(critique["reward"])
-        if not 0.0 <= baseline <= 1.0 or not math.isclose(reward, outcome - baseline, abs_tol=1e-9):
+        if prompt_group_id not in audited_prompt_pass_at_1 or not math.isclose(
+            baseline, audited_prompt_pass_at_1[prompt_group_id], abs_tol=1e-9
+        ):
+            raise ValueError(f"critique {key!r} uses a pass@1 from the wrong original prompt group")
+        if not math.isclose(reward, outcome - baseline, abs_tol=1e-9):
             raise ValueError(
                 f"critique {key!r} reward must equal continuation_outcome - prompt_pass_at_1; "
                 f"got {reward!r}, {outcome!r}, {baseline!r}"
@@ -137,6 +147,49 @@ def verify(root: Path) -> dict[str, Any]:
     for key, expected in expected_batch.items():
         if actor_batch.get(key) != expected:
             raise ValueError(f"actor batch {key} mismatch: {actor_batch.get(key)!r} != {expected!r}")
+    actor_rows = actor_batch.get("actor_rows")
+    if not isinstance(actor_rows, list) or len(actor_rows) != expected_actor_rows:
+        raise ValueError("actor-batch audit must retain every non-padding row's kind, group, and reward")
+    actor_kind_counts = Counter(str(row.get("kind")) for row in actor_rows)
+    if actor_kind_counts != Counter(original=16, critique=expected_critiques, continuation=len(continuations)):
+        raise ValueError(f"actor-row kind counts mismatch: {actor_kind_counts!r}")
+    original_actor_rows = [row for row in actor_rows if row["kind"] == "original"]
+    critique_actor_rows = [row for row in actor_rows if row["kind"] == "critique"]
+    continuation_actor_rows = [row for row in actor_rows if row["kind"] == "continuation"]
+    if [float(row["reward"]) for row in original_actor_rows] != original_rewards:
+        raise ValueError("original actor rows do not retain their binary environment outcomes")
+    continuation_actor_rewards = sorted(
+        _require_binary(row["reward"], "continuation actor reward") for row in continuation_actor_rows
+    )
+    continuation_audit_rewards = sorted(float(event["reward"]) for event in continuations)
+    if continuation_actor_rewards != continuation_audit_rewards:
+        raise ValueError("revised solution actor rows must use their binary continuation outcomes")
+    critique_actor_rewards = sorted(float(row["reward"]) for row in critique_actor_rows)
+    critique_audit_rewards = sorted(float(event["reward"]) for event in critiques)
+    if len(critique_actor_rewards) != len(critique_audit_rewards) or any(
+        not math.isclose(actual, expected, abs_tol=1e-9)
+        for actual, expected in zip(critique_actor_rewards, critique_audit_rewards, strict=True)
+    ):
+        raise ValueError("critique actor rows do not use continuation_outcome - prompt_pass_at_1")
+    original_solution_groups = Counter(str(row["group_id"]) for row in original_actor_rows)
+    if len(original_solution_groups) != 8 or any(count != 2 for count in original_solution_groups.values()):
+        raise ValueError(
+            f"original solution GRPO groups must contain two rollouts per prompt: {original_solution_groups!r}"
+        )
+    recomputed_prompt_pass_at_1: dict[str, float] = {}
+    for group_id in original_solution_groups:
+        prompt_group_id = group_id.removeprefix("solution:")
+        group_rewards = [float(row["reward"]) for row in original_actor_rows if str(row["group_id"]) == group_id]
+        recomputed_prompt_pass_at_1[prompt_group_id] = sum(group_rewards) / len(group_rewards)
+    if recomputed_prompt_pass_at_1 != audited_prompt_pass_at_1:
+        raise ValueError("audited prompt pass@1 values do not match original solution outcomes")
+    if any(str(row["group_id"]) not in original_solution_groups for row in continuation_actor_rows):
+        raise ValueError("revised solutions must join their original prompt's solution GRPO group")
+    critique_groups = Counter(str(row["group_id"]) for row in critique_actor_rows)
+    if len(critique_groups) != incorrect or any(count != 2 for count in critique_groups.values()):
+        raise ValueError(
+            f"critique GRPO groups must contain two IID critiques per incorrect rollout: {critique_groups!r}"
+        )
     padding = int(actor_batch["padding"])
     if not 0 <= padding < 8 or (expected_actor_rows + padding) % 8:
         raise ValueError(f"invalid data-parallel padding count: {padding}")

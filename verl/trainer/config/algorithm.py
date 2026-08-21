@@ -36,20 +36,25 @@ __all__ = [
 ]
 
 
-BRANCH_REVISION_CRITIQUE_PROMPT = """Analyze the attempted solution with the goal of improving its chance of solving
-the problem within the remaining token budget.
+BRANCH_REVISION_CRITIQUE_PROMPT = """--- BEGIN CRITIQUE TASK ---
+The text above is a completed, incorrect attempted solution. Critique that
+attempt; do not continue it or re-solve the problem from scratch. Be concise
+enough to complete every requirement below.
 
+In at most three short numbered paragraphs:
 1. Identify which parts meaningfully pruned the search space and which did not.
-2. Explain when the solution should have switched direction and what direction
-   it should have taken.
-3. Select a unique section of the attempted solution that should be changed to
-   move away from a dead end.
-4. State what that section should be changed to.
+2. State when the solution should have switched direction and what direction it
+   should have taken.
+3. Identify the earliest useful edit that would move the remaining reasoning
+   away from a dead end and improve its chance of success in the remaining
+   token budget.
 
-End with exactly:
-
-<branch>the exact quoted section to replace</branch>
-<new continuation>the replacement text</new continuation>"""
+As the final content, emit exactly one <branch> tag pair containing a verbatim
+section of the attempted solution that occurs exactly once, immediately followed
+by exactly one <new continuation> tag pair containing its replacement. Do not
+copy placeholder text, and do not write anything after the closing
+</new continuation> tag.
+--- END CRITIQUE TASK ---"""
 
 
 @dataclass
@@ -81,9 +86,7 @@ class BranchRevisionGRPOConfig(BaseConfig):
             or isinstance(self.critique_max_response_length, bool)
             or self.critique_max_response_length <= 0
         ):
-            raise ValueError(
-                "algorithm.branch_revision_grpo.critique_max_response_length must be positive or null"
-            )
+            raise ValueError("algorithm.branch_revision_grpo.critique_max_response_length must be positive or null")
         if not math.isfinite(self.reward_tolerance) or self.reward_tolerance <= 0.0:
             raise ValueError("algorithm.branch_revision_grpo.reward_tolerance must be finite and positive")
         if self.critique_prompt != BRANCH_REVISION_CRITIQUE_PROMPT:

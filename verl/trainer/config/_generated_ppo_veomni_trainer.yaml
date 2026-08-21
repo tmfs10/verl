@@ -663,14 +663,20 @@ algorithm:
     branch_max_tokens: 128
     new_continuation_max_tokens: 256
     reward_tolerance: 1.0e-06
-    critique_prompt: "Analyze the attempted solution with the goal of improving its\
-      \ chance of solving\nthe problem within the remaining token budget.\n\n1. Identify\
-      \ which parts meaningfully pruned the search space and which did not.\n2. Explain\
-      \ when the solution should have switched direction and what direction\n   it\
-      \ should have taken.\n3. Select a unique section of the attempted solution that\
-      \ should be changed to\n   move away from a dead end.\n4. State what that section\
-      \ should be changed to.\n\nEnd with exactly:\n\n<branch>the exact quoted section\
-      \ to replace</branch>\n<new continuation>the replacement text</new continuation>"
+    critique_prompt: "--- BEGIN CRITIQUE TASK ---\nThe text above is a completed,\
+      \ incorrect attempted solution. Critique that\nattempt; do not continue it or\
+      \ re-solve the problem from scratch. Be concise\nenough to complete every requirement\
+      \ below.\n\nIn at most three short numbered paragraphs:\n1. Identify which parts\
+      \ meaningfully pruned the search space and which did not.\n2. State when the\
+      \ solution should have switched direction and what direction it\n   should have\
+      \ taken.\n3. Identify the earliest useful edit that would move the remaining\
+      \ reasoning\n   away from a dead end and improve its chance of success in the\
+      \ remaining\n   token budget.\n\nAs the final content, emit exactly one <branch>\
+      \ tag pair containing a verbatim\nsection of the attempted solution that occurs\
+      \ exactly once, immediately followed\nby exactly one <new continuation> tag\
+      \ pair containing its replacement. Do not\ncopy placeholder text, and do not\
+      \ write anything after the closing\n</new continuation> tag.\n--- END CRITIQUE\
+      \ TASK ---"
     audit_output_dir: null
 trainer:
   balance_batch: true

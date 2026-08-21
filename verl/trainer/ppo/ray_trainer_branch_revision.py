@@ -546,11 +546,16 @@ class BranchRevisionGRPOController:
                 finish_reason=critique.continuation_finish_reason,
             )
 
-    def _actor_rows(self, bundles: list[_Bundle]) -> list[_ActorRow]:
-        rows: list[_ActorRow] = []
+    @staticmethod
+    def _prompt_rewards(bundles: list[_Bundle]) -> dict[str, list[float]]:
         prompt_rewards: defaultdict[str, list[float]] = defaultdict(list)
         for bundle in bundles:
             prompt_rewards[bundle.prompt_group_id].append(bundle.original_reward)
+        return dict(prompt_rewards)
+
+    def _actor_rows(self, bundles: list[_Bundle]) -> list[_ActorRow]:
+        rows: list[_ActorRow] = []
+        prompt_rewards = self._prompt_rewards(bundles)
         prompt_pass_at_1 = {
             prompt_group_id: sum(rewards) / len(rewards) for prompt_group_id, rewards in prompt_rewards.items()
         }
@@ -591,7 +596,7 @@ class BranchRevisionGRPOController:
                         full_ids=[*bundle.prompt_ids, *critique.revised_prefix_ids, *critique.continuation_ids],
                         train_start=len(bundle.prompt_ids) + len(critique.revised_prefix_ids),
                         behavior_log_probs=list(critique.continuation_log_probs),
-                        reward=critique_reward,
+                        reward=continuation_outcome,
                         group_id=solution_group,
                         kind="continuation",
                     )
@@ -599,6 +604,7 @@ class BranchRevisionGRPOController:
                 self._audit(
                     "critique",
                     rollout_id=bundle.rollout_id,
+                    prompt_group_id=bundle.prompt_group_id,
                     critique_index=critique_index,
                     reward=critique_reward,
                     continuation_outcome=continuation_outcome,
@@ -616,6 +622,7 @@ class BranchRevisionGRPOController:
                 self._audit(
                     "critique",
                     rollout_id=bundle.rollout_id,
+                    prompt_group_id=bundle.prompt_group_id,
                     critique_index=critique_index,
                     reward=-prompt_pass_at_1[bundle.prompt_group_id],
                     continuation_outcome=0.0,
@@ -726,8 +733,38 @@ class BranchRevisionGRPOController:
             clip_ratio_low=self.config.actor_rollout_ref.actor.clip_ratio_low,
             clip_ratio_high=self.config.actor_rollout_ref.actor.clip_ratio_high,
             clip_ratio_c=float(self.config.actor_rollout_ref.actor.clip_ratio_c),
+            actor_rows=[{"kind": row.kind, "group_id": row.group_id, "reward": row.reward} for row in rows],
         )
         return actor_batch, padding_rows
+
+    @staticmethod
+    def _set_source_metric_advantages(
+        source: DataProto,
+        bundles: list[_Bundle],
+        actor_batch: DataProto,
+    ) -> None:
+        """Expose the actual original-row GRPO values to native post-step metrics."""
+
+        kinds = actor_batch.non_tensor_batch["branch_revision_actor_kind"]
+        original_rows = [index for index, kind in enumerate(kinds) if kind == "original"]
+        if len(original_rows) != len(bundles):
+            raise RuntimeError("branch-revision actor batch lost or duplicated original rows")
+        source_advantages = torch.zeros_like(source.batch["response_mask"], dtype=torch.float32)
+        source_returns = torch.zeros_like(source_advantages)
+        for bundle, actor_row in zip(bundles, original_rows, strict=True):
+            actor_mask = actor_batch.batch["response_mask"][actor_row].bool()
+            row_advantages = actor_batch.batch["advantages"][actor_row][actor_mask]
+            row_returns = actor_batch.batch["returns"][actor_row][actor_mask]
+            token_count = len(bundle.solution_ids)
+            if row_advantages.numel() != token_count or row_returns.numel() != token_count:
+                raise RuntimeError("branch-revision original metric span does not match its solution")
+            source_mask = source.batch["response_mask"][bundle.source_row].bool()
+            if int(source_mask.sum().item()) != token_count:
+                raise RuntimeError("branch-revision source response mask changed after bundle construction")
+            source_advantages[bundle.source_row, source_mask] = row_advantages.to(source_advantages.device)
+            source_returns[bundle.source_row, source_mask] = row_returns.to(source_returns.device)
+        source.batch["advantages"] = source_advantages
+        source.batch["returns"] = source_returns
 
     def _metrics(self, bundles: list[_Bundle], actor_batch: DataProto, padding_rows: int) -> dict[str, float]:
         originals = [bundle.original_reward for bundle in bundles]
@@ -811,6 +848,7 @@ class BranchRevisionGRPOController:
         with marked_timer("branch_revision_rewards", timing_raw, color="yellow"):
             self._evaluate_continuations(source, bundles)
         actor_batch, padding_rows = self._make_actor_batch(bundles)
+        self._set_source_metric_advantages(source, bundles, actor_batch)
         if self.config.trainer.balance_batch:
             self.trainer._balance_batch(
                 actor_batch,
@@ -828,5 +866,9 @@ class BranchRevisionGRPOController:
             originals=len(bundles),
             incorrect=sum(bundle.original_reward == 0.0 for bundle in bundles),
             original_rewards=rewards,
+            prompt_pass_at_1={
+                prompt_group_id: sum(group_rewards) / len(group_rewards)
+                for prompt_group_id, group_rewards in self._prompt_rewards(bundles).items()
+            },
         )
         return True

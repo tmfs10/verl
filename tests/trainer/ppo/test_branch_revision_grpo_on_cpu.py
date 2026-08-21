@@ -87,6 +87,14 @@ def _structured(branch: str, replacement: str, prefix: str = "analysis\n") -> st
     return f"{prefix}<branch>{branch}</branch>\n<new continuation>{replacement}</new continuation>"
 
 
+def test_critique_prompt_is_bounded_and_has_no_copyable_placeholder_values() -> None:
+    assert "do not continue it or re-solve the problem from scratch" in BRANCH_REVISION_CRITIQUE_PROMPT
+    assert "at most three short numbered paragraphs" in BRANCH_REVISION_CRITIQUE_PROMPT
+    assert "the exact quoted section to replace" not in BRANCH_REVISION_CRITIQUE_PROMPT
+    assert "the replacement text" not in BRANCH_REVISION_CRITIQUE_PROMPT
+    assert "do not write anything after" in BRANCH_REVISION_CRITIQUE_PROMPT
+
+
 def test_exact_parser_preserves_whitespace_unicode_and_truncates_at_unique_branch() -> None:
     solution = "use α\n  dead end\nthen waste"
     critique = _structured("  dead end\n", "  try β instead\n")
@@ -437,6 +445,7 @@ def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revis
     critique_rows = [index for index, kind in enumerate(kinds) if kind == "critique"]
     critique_rewards = actor_batch.non_tensor_batch["branch_revision_reward"][critique_rows].tolist()
     assert critique_rewards == pytest.approx([0.5, -0.5])
+    assert actor_batch.non_tensor_batch["branch_revision_reward"][continuation_row] == pytest.approx(1.0)
     assert actor_batch.batch["advantages"][critique_rows[0]].max().item() > 0
     assert actor_batch.batch["advantages"][critique_rows[1]].min().item() < 0
     original_rows = [index for index, kind in enumerate(kinds) if kind == "original"]
@@ -606,3 +615,7 @@ def test_full_controller_update_critiques_only_incorrect_and_trains_one_combined
     actor_batch = captured["batch"]
     assert actor_batch.non_tensor_batch["branch_revision_actor_kind"].tolist().count("critique") == 2
     assert actor_batch.non_tensor_batch["branch_revision_actor_kind"].tolist().count("continuation") == 1
+    assert "advantages" in source.batch and "returns" in source.batch
+    response_mask = source.batch["response_mask"].bool()
+    assert source.batch["advantages"][0][response_mask[0]].max().item() < 0.0
+    assert source.batch["advantages"][1][response_mask[1]].min().item() > 0.0
