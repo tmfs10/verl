@@ -121,6 +121,9 @@ def _extra_args(
         "trainer.resume_mode=disable",
         "trainer.balance_batch=true",
         f"+branch_revision_smoke.output_dir={remote_evidence}",
+        f"+branch_revision_smoke.n_prompts={n_prompts}",
+        f"+branch_revision_smoke.n_samples={n_samples}",
+        f"+branch_revision_smoke.num_critiques={num_critiques}",
     ]
     return " ".join(overrides)
 
@@ -147,6 +150,8 @@ def build_command(
     for name, value in positive.items():
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
+    if n_samples < 2:
+        raise ValueError("n_samples must be at least 2 for a GRPO acceptance group")
     if num_critiques < 2:
         raise ValueError("num_critiques must be at least 2 for GRPO")
     if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:

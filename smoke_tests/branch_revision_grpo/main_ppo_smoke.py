@@ -32,14 +32,11 @@ from verl.trainer.main_ppo import _apply_reward_focus_mask_alignment, run_ppo
 from verl.utils.device import auto_set_device
 
 EXPECTED = {
-    "data.train_batch_size": 8,
     "data.max_prompt_length": 1024,
     "data.max_response_length": 2048,
-    "actor_rollout_ref.rollout.n": 4,
     "actor_rollout_ref.actor.ppo_mini_batch_size": 8,
     "actor_rollout_ref.actor.ppo_epochs": 1,
     "actor_rollout_ref.rollout.max_model_len": 6144,
-    "algorithm.branch_revision_grpo.num_critiques": 4,
     "algorithm.branch_revision_grpo.critique_max_response_length": 2560,
     "algorithm.branch_revision_grpo.min_continuation_tokens": 128,
     "trainer.nnodes": 1,
@@ -68,7 +65,30 @@ def _configure_file_logger(config, path: Path) -> None:
     )
 
 
-def _validate_contract(config, output_dir: Path) -> None:
+def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any]) -> None:
+    required_contract = {"n_prompts", "n_samples", "num_critiques"}
+    if set(smoke_contract) != required_contract:
+        raise ValueError(
+            f"branch-revision smoke contract must contain exactly {sorted(required_contract)!r}, "
+            f"got {sorted(smoke_contract)!r}"
+        )
+    dynamic_expected = {
+        "data.train_batch_size": smoke_contract["n_prompts"],
+        "data.gen_batch_size": smoke_contract["n_prompts"],
+        "actor_rollout_ref.rollout.n": smoke_contract["n_samples"],
+        "algorithm.branch_revision_grpo.num_critiques": smoke_contract["num_critiques"],
+    }
+    for name, value in smoke_contract.items():
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"branch-revision smoke {name} must be a positive integer")
+    if smoke_contract["n_samples"] < 2:
+        raise ValueError("branch-revision smoke n_samples must be at least 2 for a GRPO acceptance group")
+    if smoke_contract["num_critiques"] < 2:
+        raise ValueError("branch-revision smoke num_critiques must be at least 2 for GRPO")
+    for key, expected in dynamic_expected.items():
+        actual = OmegaConf.select(config, key)
+        if actual != expected:
+            raise ValueError(f"branch-revision smoke requires {key}={expected!r}, got {actual!r}")
     for key, expected in EXPECTED.items():
         actual = OmegaConf.select(config, key)
         if actual != expected:
@@ -122,6 +142,10 @@ def main(config) -> None:
     if smoke_config is None:
         raise ValueError("missing +branch_revision_smoke.output_dir")
     output_dir = Path(str(smoke_config.output_dir))
+    smoke_contract = OmegaConf.to_container(smoke_config, resolve=True)
+    if not isinstance(smoke_contract, dict):
+        raise ValueError("branch_revision_smoke must be a mapping")
+    smoke_contract.pop("output_dir", None)
     if not output_dir.is_absolute() or str(output_dir).startswith("/opt/verl"):
         raise ValueError("branch-revision smoke output must be an absolute mounted data/output path")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -132,7 +156,7 @@ def main(config) -> None:
     config = _apply_reward_focus_mask_alignment(config)
     _configure_file_logger(config, output_dir / "metrics.jsonl")
     OmegaConf.resolve(config)
-    _validate_contract(config, output_dir)
+    _validate_contract(config, output_dir, smoke_contract)
     _write_json(output_dir / "resolved_config.json", OmegaConf.to_container(config, resolve=True))
     _write_json(
         output_dir / "environment.json",

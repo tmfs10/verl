@@ -18,7 +18,9 @@ import json
 from pathlib import Path
 
 import pytest
+from omegaconf import OmegaConf
 
+from smoke_tests.branch_revision_grpo.main_ppo_smoke import _validate_contract
 from smoke_tests.branch_revision_grpo.submit_oci_iad import _extra_args, build_command
 from smoke_tests.branch_revision_grpo.verify_smoke import verify
 
@@ -72,6 +74,9 @@ def test_rendered_smoke_scales_dataset_batch_rollouts_and_critiques_together(tmp
     assert "++data.gen_batch_size=32" in rendered
     assert "actor_rollout_ref.rollout.n=4" in rendered
     assert "algorithm.branch_revision_grpo.num_critiques=6" in rendered
+    assert "+branch_revision_smoke.n_prompts=32" in rendered
+    assert "+branch_revision_smoke.n_samples=4" in rendered
+    assert "+branch_revision_smoke.num_critiques=6" in rendered
 
 
 @pytest.mark.parametrize(
@@ -79,6 +84,7 @@ def test_rendered_smoke_scales_dataset_batch_rollouts_and_critiques_together(tmp
     [
         ({"n_prompts": 0}, "n_prompts"),
         ({"n_samples": 0}, "n_samples"),
+        ({"n_samples": 1}, "at least 2"),
         ({"num_critiques": 1}, "at least 2"),
         ({"seed": -1}, "nonnegative"),
     ],
@@ -96,6 +102,73 @@ def test_rendered_smoke_rejects_invalid_scale(overrides: dict[str, int], match: 
     }
     with pytest.raises(ValueError, match=match):
         build_command(**kwargs)
+
+
+def _scaled_runtime_config(tmp_path: Path):
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text("{}\n", encoding="utf-8")
+    train = tmp_path / "opsd.jsonl"
+    train.write_text("{}\n", encoding="utf-8")
+    return OmegaConf.create(
+        {
+            "data": {
+                "train_batch_size": 32,
+                "gen_batch_size": 32,
+                "max_prompt_length": 1024,
+                "max_response_length": 2048,
+                "train_files": [str(train)],
+            },
+            "actor_rollout_ref": {
+                "model": {"path": str(model)},
+                "rollout": {
+                    "n": 4,
+                    "max_model_len": 6144,
+                    "temperature": 1.0,
+                    "val_kwargs": {"temperature": 1.0},
+                },
+                "actor": {
+                    "ppo_mini_batch_size": 8,
+                    "ppo_epochs": 1,
+                    "policy_loss": {"loss_mode": "dppo_tv"},
+                },
+            },
+            "algorithm": {
+                "adv_estimator": "grpo",
+                "intermediate_mc_value": {"enable": False},
+                "branch_revision_grpo": {
+                    "enable": True,
+                    "num_critiques": 6,
+                    "critique_max_response_length": 2560,
+                    "min_continuation_tokens": 128,
+                    "audit_output_dir": str(tmp_path / "audit"),
+                },
+            },
+            "critic": {"enable": False},
+            "trainer": {
+                "nnodes": 1,
+                "n_gpus_per_node": 8,
+                "total_training_steps": 1,
+                "val_before_train": False,
+                "save_freq": -1,
+                "test_freq": -1,
+                "resume_mode": "disable",
+                "logger": ["file"],
+                "rollout_data_dir": None,
+            },
+        }
+    )
+
+
+def test_scaled_runtime_contract_accepts_matching_resolved_dimensions(tmp_path: Path) -> None:
+    config = _scaled_runtime_config(tmp_path)
+    _validate_contract(config, tmp_path, {"n_prompts": 32, "n_samples": 4, "num_critiques": 6})
+
+
+def test_scaled_runtime_contract_rejects_stale_fixed_dimension(tmp_path: Path) -> None:
+    config = _scaled_runtime_config(tmp_path)
+    with pytest.raises(ValueError, match="data.train_batch_size=8"):
+        _validate_contract(config, tmp_path, {"n_prompts": 8, "n_samples": 4, "num_critiques": 6})
 
 
 def _write_json(path: Path, value) -> None:
