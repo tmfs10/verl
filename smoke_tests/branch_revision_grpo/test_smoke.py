@@ -431,7 +431,7 @@ def test_verifier_accepts_native_clipped_ppo_evidence(tmp_path: Path) -> None:
 
 def test_verifier_rejects_smoke_without_a_valid_revision(tmp_path: Path) -> None:
     _fixture(tmp_path, include_continuation=False)
-    with pytest.raises(ValueError, match="no strictly parsed"):
+    with pytest.raises(ValueError, match="no learnability-accepted"):
         verify(tmp_path)
 
 

@@ -109,7 +109,7 @@ def verify(root: Path) -> dict[str, Any]:
     if len(critiques) != expected_critiques:
         raise ValueError(f"expected {expected_critiques} IID critiques, got {len(critiques)}")
     if not continuations:
-        raise ValueError("smoke produced no strictly parsed branch revision or continuation")
+        raise ValueError("smoke produced no learnability-accepted revision and therefore no rewarded continuation")
 
     critique_keys: set[tuple[str, int]] = set()
     critique_by_key: dict[tuple[str, int], dict[str, Any]] = {}
