@@ -662,6 +662,7 @@ algorithm:
     enable_positive_compression: false
     num_positive_critiques: 4
     positive_compression_target: 0.25
+    learnability_logprob_statistic: mean
     min_seed_window_percentile: 0.2
     full_credit_seed_window_percentile: 0.5
     learnability_windows_per_rollout: 8

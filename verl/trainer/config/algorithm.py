@@ -144,6 +144,7 @@ class BranchRevisionGRPOConfig(BaseConfig):
     enable_positive_compression: bool = False
     num_positive_critiques: int = 4
     positive_compression_target: float = 0.25
+    learnability_logprob_statistic: str = "mean"
     min_seed_window_percentile: float = 0.20
     full_credit_seed_window_percentile: float = 0.50
     learnability_windows_per_rollout: int = 8
@@ -184,6 +185,8 @@ class BranchRevisionGRPOConfig(BaseConfig):
             raise ValueError("algorithm.branch_revision_grpo.reward_tolerance must be finite and positive")
         if not math.isfinite(self.positive_compression_target) or not 0.0 < self.positive_compression_target <= 1.0:
             raise ValueError("algorithm.branch_revision_grpo.positive_compression_target must be in (0, 1]")
+        if self.learnability_logprob_statistic not in {"mean", "min"}:
+            raise ValueError("algorithm.branch_revision_grpo.learnability_logprob_statistic must be mean or min")
         if not (
             math.isfinite(self.min_seed_window_percentile)
             and math.isfinite(self.full_credit_seed_window_percentile)

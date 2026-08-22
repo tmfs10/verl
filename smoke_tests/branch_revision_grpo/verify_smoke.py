@@ -17,11 +17,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
+
+import numpy as np
+
+_AUDIT_SCHEMA_VERSION = 2
 
 
 def _read_json(path: Path) -> Any:
@@ -56,13 +61,42 @@ def _require_binary(value: object, label: str) -> float:
     return number
 
 
-def verify(root: Path) -> dict[str, Any]:
+def _canonical_sha256(values: Any, *, dtype: str) -> str:
+    array = np.asarray(values, dtype=np.dtype(dtype))
+    return hashlib.sha256(array.tobytes(order="C")).hexdigest()
+
+
+def _float32_values(values: Any) -> list[float]:
+    result = np.asarray(list(values), dtype=np.float32)
+    if result.ndim != 1 or not np.isfinite(result).all():
+        raise ValueError("audited log probabilities must be a finite one-dimensional sequence")
+    return [float(value) for value in result.tolist()]
+
+
+def _aggregate(values: Any, statistic: str) -> float:
+    normalized = _float32_values(values)
+    if not normalized:
+        raise ValueError("cannot aggregate empty audited log probabilities")
+    if statistic == "mean":
+        return math.fsum(normalized) / len(normalized)
+    if statistic == "min":
+        return min(normalized)
+    raise ValueError(f"unsupported learnability log-probability statistic: {statistic!r}")
+
+
+def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, Any]:
     root = root.expanduser().resolve()
+    status = _read_json(root / "status.json")
+    if status.get("status") != "completed":
+        raise ValueError(f"current smoke invocation did not complete: {status!r}")
     completed = _read_json(root / "completed.json")
     if completed.get("status") != "completed":
         raise ValueError(f"training did not complete: {completed!r}")
-    if (root / "failed.json").exists():
-        raise ValueError("failed.json exists beside completed.json")
+    if completed.get("invocation_id") != status.get("invocation_id"):
+        raise ValueError("completed and status evidence refer to different smoke invocations")
+    failed_path = root / "failed.json"
+    if failed_path.exists() and _read_json(failed_path).get("invocation_id") == status.get("invocation_id"):
+        raise ValueError("the current completed smoke invocation also has failure evidence")
     resolved_config = _read_json(root / "resolved_config.json")
     branch_config = resolved_config["algorithm"]["branch_revision_grpo"]
     num_critiques = int(branch_config["num_critiques"])
@@ -70,6 +104,9 @@ def verify(root: Path) -> dict[str, Any]:
         raise ValueError("live smoke did not enable positive-rollout compression")
     num_positive_critiques = int(branch_config["num_positive_critiques"])
     min_continuation_tokens = int(branch_config["min_continuation_tokens"])
+    statistic = str(branch_config["learnability_logprob_statistic"])
+    if statistic not in {"mean", "min"}:
+        raise ValueError(f"unsupported learnability statistic in smoke evidence: {statistic!r}")
     expected_originals = int(resolved_config["data"]["train_batch_size"]) * int(
         resolved_config["actor_rollout_ref"]["rollout"]["n"]
     )
@@ -77,10 +114,30 @@ def verify(root: Path) -> dict[str, Any]:
     if loss_mode not in {"dppo_tv", "vanilla"}:
         raise ValueError(f"unsupported actor policy loss in smoke evidence: {loss_mode!r}")
 
-    audit_files = sorted((root / "audit").glob("step_*.jsonl"))
+    attempt_id = str(completed.get("audit_attempt_id", ""))
+    if not attempt_id:
+        raise ValueError("completed smoke evidence omitted its audit attempt ID")
+    attempt_dir = root / "audit" / f"attempt_{attempt_id}"
+    attempt = _read_json(attempt_dir / "attempt.json")
+    if int(attempt.get("schema_version", -1)) != _AUDIT_SCHEMA_VERSION or attempt.get("attempt_id") != attempt_id:
+        raise ValueError("audit attempt metadata has the wrong schema or attempt ID")
+    resolved_config_json = json.dumps(resolved_config, sort_keys=True, default=str, ensure_ascii=False)
+    if attempt.get("resolved_config_sha256") != hashlib.sha256(resolved_config_json.encode("utf-8")).hexdigest():
+        raise ValueError("audit attempt metadata does not match the resolved configuration")
+    audit_files = sorted(attempt_dir.glob("step_*.jsonl"))
     if len(audit_files) != 1:
         raise ValueError(f"expected exactly one step-scoped audit file, got {audit_files!r}")
     events = _read_jsonl(audit_files[0])
+    if any(
+        int(event.get("schema_version", -1)) != _AUDIT_SCHEMA_VERSION or event.get("attempt_id") != attempt_id
+        for event in events
+    ):
+        raise ValueError("step audit mixes schema versions or attempt IDs")
+    if (
+        events[-1].get("event") != "step_complete"
+        or sum(event.get("event") == "step_complete" for event in events) != 1
+    ):
+        raise ValueError("selected audit step is incomplete")
     event_counts = Counter(str(event.get("event")) for event in events)
     iteration = _only(events, "iteration")
     actor_batch = _only(events, "actor_batch")
@@ -89,6 +146,8 @@ def verify(root: Path) -> dict[str, Any]:
     original_rewards = [_require_binary(value, "original reward") for value in iteration["original_rewards"]]
     if len(original_rewards) != expected_originals:
         raise ValueError(f"iteration audit must retain all {expected_originals} original binary rewards")
+    if iteration.get("learnability_logprob_statistic") != statistic:
+        raise ValueError("iteration audit used a different learnability statistic than the resolved config")
     incorrect = int(iteration["incorrect"])
     if incorrect != original_rewards.count(0.0) or incorrect <= 0:
         raise ValueError("smoke must contain and exactly count at least one incorrect original rollout")
@@ -102,13 +161,31 @@ def verify(root: Path) -> dict[str, Any]:
     ):
         raise ValueError("iteration audit must retain one valid original-rollout pass@1 per prompt")
 
+    originals = [event for event in events if event.get("event") == "original"]
+    if len(originals) != expected_originals:
+        raise ValueError("audit must contain one source event per original rollout")
+    original_by_rollout = {str(event["rollout_id"]): event for event in originals}
+    if len(original_by_rollout) != len(originals):
+        raise ValueError("duplicate original-rollout audit evidence")
+    for original in originals:
+        prompt_ids = [int(token) for token in original.get("prompt_ids", ())]
+        solution_ids = [int(token) for token in original.get("solution_ids", ())]
+        solution_log_probs = _float32_values(original.get("solution_log_probs", ()))
+        editable_length = int(original.get("editable_solution_length", -1))
+        if not prompt_ids or not solution_ids or len(solution_ids) != len(solution_log_probs):
+            raise ValueError("original audit token/log-probability evidence is incomplete")
+        if not 0 < editable_length <= len(solution_ids):
+            raise ValueError("original audit has an invalid editable solution length")
+        _require_binary(original.get("reward"), "audited original reward")
+
     critiques = [event for event in events if event.get("event") == "critique"]
     continuations = [event for event in events if event.get("event") == "continuation"]
+    reference_events = [event for event in events if event.get("event") == "learnability_reference"]
     learnability_events = [event for event in events if event.get("event") == "learnability"]
     expected_critiques = incorrect * num_critiques + correct * num_positive_critiques
     if len(critiques) != expected_critiques:
         raise ValueError(f"expected {expected_critiques} IID critiques, got {len(critiques)}")
-    if not continuations:
+    if require_algorithm_signal and not continuations:
         raise ValueError("smoke produced no learnability-accepted revision and therefore no rewarded continuation")
 
     critique_keys: set[tuple[str, int]] = set()
@@ -125,6 +202,9 @@ def verify(root: Path) -> dict[str, Any]:
         critique_keys.add(key)
         critique_by_key[key] = critique
         per_rollout[key[0]].add(key[1])
+        original = original_by_rollout.get(key[0])
+        if original is None:
+            raise ValueError(f"critique {key!r} has no original-rollout evidence")
         objective = str(critique.get("objective"))
         if objective not in {"recovery", "compression"}:
             raise ValueError(f"critique {key!r} has invalid objective {objective!r}")
@@ -139,6 +219,17 @@ def verify(root: Path) -> dict[str, Any]:
         if not critique_ids or len(critique_ids) != len(critique_log_probs):
             raise ValueError(f"critique {key!r} token/log-prob lengths differ")
         critique_prompts[key[0]].add(critique_prompt_ids)
+        original_prefix = tuple(
+            [
+                *[int(token) for token in original["prompt_ids"]],
+                *[int(token) for token in original["solution_ids"][: int(original["editable_solution_length"])]],
+            ]
+        )
+        if (
+            len(critique_prompt_ids) <= len(original_prefix)
+            or critique_prompt_ids[: len(original_prefix)] != original_prefix
+        ):
+            raise ValueError(f"critique {key!r} prompt does not preserve the exact original prompt/solution")
         outcome = _require_binary(critique["continuation_outcome"], "critique continuation outcome")
         prompt_group_id = str(critique.get("prompt_group_id"))
         baseline = float(critique["prompt_pass_at_1"])
@@ -176,6 +267,28 @@ def verify(root: Path) -> dict[str, Any]:
                 raise ValueError(f"valid critique {key!r} omitted an edit boundary")
             if accepted:
                 accepted_keys.add(key)
+            branch_prefix_ids = [int(token) for token in critique.get("branch_prefix_ids", ())]
+            replacement_ids = [int(token) for token in critique.get("new_continuation_ids", ())]
+            replacement_log_probs = _float32_values(critique.get("new_continuation_log_probs", ()))
+            revised_prefix_ids = [int(token) for token in critique.get("revised_prefix_ids", ())]
+            generated_ids = [int(token) for token in critique.get("generated_continuation_ids", ())]
+            generated_log_probs = _float32_values(critique.get("generated_continuation_log_probs", ()))
+            if (
+                not branch_prefix_ids
+                or not replacement_ids
+                or revised_prefix_ids
+                != [
+                    *branch_prefix_ids,
+                    *replacement_ids,
+                ]
+            ):
+                raise ValueError(f"valid critique {key!r} has inconsistent replacement boundaries")
+            if len(replacement_ids) != len(replacement_log_probs):
+                raise ValueError(f"valid critique {key!r} replacement token/log-probability lengths differ")
+            if not generated_ids or len(generated_ids) != len(generated_log_probs):
+                raise ValueError(f"valid critique {key!r} generated continuation evidence is incomplete")
+            if bool(critique.get("continuation_reward_evaluated")) != accepted:
+                raise ValueError(f"critique {key!r} reward-evaluation flag differs from learnability acceptance")
         elif accepted or learnability_weight != 0.0:
             raise ValueError(f"structurally invalid critique {key!r} received learnability credit")
     for rollout_id, indices in per_rollout.items():
@@ -190,6 +303,44 @@ def verify(root: Path) -> dict[str, Any]:
     if any(len(prompts) != 1 for prompts in critique_prompts.values()):
         raise ValueError("IID critiques for one original rollout used different behavior-policy prompt IDs")
 
+    references = {str(event.get("reference_key")): event for event in reference_events}
+    if len(references) != len(reference_events):
+        raise ValueError("duplicate learnability-reference evidence")
+    for reference_key, reference in references.items():
+        if reference.get("logprob_statistic") != statistic:
+            raise ValueError(f"learnability reference {reference_key!r} used the wrong statistic")
+        seed_tokens = int(reference.get("seed_tokens", 0))
+        windows = reference.get("windows")
+        if reference_key != f"{statistic}:{seed_tokens}" or seed_tokens <= 0 or not isinstance(windows, list):
+            raise ValueError(f"learnability reference {reference_key!r} has invalid identity or windows")
+        eligible_rollouts = int(reference.get("eligible_rollouts", 0))
+        sampled_windows = int(reference.get("sampled_windows", -1))
+        if sampled_windows != len(windows) or eligible_rollouts <= 0:
+            raise ValueError(f"learnability reference {reference_key!r} has inconsistent counts")
+        mass_by_rollout: defaultdict[str, float] = defaultdict(float)
+        for window in windows:
+            rollout_id = str(window.get("rollout_id"))
+            original = original_by_rollout.get(rollout_id)
+            if original is None:
+                raise ValueError(f"learnability reference {reference_key!r} names an unknown rollout")
+            start = int(window.get("start", -1))
+            editable_length = int(original["editable_solution_length"])
+            if start < 0 or start + seed_tokens > editable_length:
+                raise ValueError(f"learnability reference {reference_key!r} has an invalid window boundary")
+            source_values = original["solution_log_probs"][start : start + seed_tokens]
+            expected_score = _aggregate(source_values, statistic)
+            if not math.isclose(float(window.get("score")), expected_score, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(f"learnability reference {reference_key!r} has a corrupted window score")
+            weight = float(window.get("weight"))
+            if not math.isfinite(weight) or weight <= 0.0:
+                raise ValueError(f"learnability reference {reference_key!r} has an invalid window weight")
+            mass_by_rollout[rollout_id] += weight
+        if len(mass_by_rollout) != eligible_rollouts or any(
+            not math.isclose(mass, 1.0 / eligible_rollouts, rel_tol=0.0, abs_tol=1e-12)
+            for mass in mass_by_rollout.values()
+        ):
+            raise ValueError(f"learnability reference {reference_key!r} does not give equal mass per rollout")
+
     learnability_by_key = {
         (str(event["rollout_id"]), int(event["critique_index"])): event for event in learnability_events
     }
@@ -200,13 +351,58 @@ def verify(root: Path) -> dict[str, Any]:
     for key, event in learnability_by_key.items():
         if event.get("score_source") != "vllm_prompt_logprobs":
             raise ValueError(f"learnability event {key!r} did not use vLLM prompt log probabilities")
+        if event.get("logprob_statistic") != statistic:
+            raise ValueError(f"learnability event {key!r} used the wrong log-probability statistic")
         if not 0.0 <= float(event["percentile"]) <= 1.0 or not 0.0 <= float(event["reward_weight"]) <= 1.0:
             raise ValueError(f"learnability event {key!r} has an invalid percentile or weight")
-        if int(event["seed_tokens"]) <= 0:
+        seed_tokens = int(event["seed_tokens"])
+        if seed_tokens <= 0:
             raise ValueError(f"learnability event {key!r} has no replacement seed")
-        if bool(event["accepted"]) and int(event["sampled_windows"]) <= 0:
-            raise ValueError(f"accepted learnability event {key!r} lacks a length-matched reference")
         critique = critique_by_key[key]
+        reference = references.get(str(event.get("reference_key")))
+        if reference is None or int(reference["seed_tokens"]) != seed_tokens:
+            raise ValueError(f"learnability event {key!r} lacks its exact length-matched reference")
+        if int(event["eligible_rollouts"]) != int(reference["eligible_rollouts"]) or int(
+            event["sampled_windows"]
+        ) != int(reference["sampled_windows"]):
+            raise ValueError(f"learnability event {key!r} reference counts disagree")
+        scored_ids = [int(token) for token in event.get("scored_token_ids", ())]
+        scored_log_probs = _float32_values(event.get("scored_token_log_probs", ()))
+        scoring_prompt_ids = [int(token) for token in event.get("scoring_prompt_ids", ())]
+        prompt_logprob_start = int(event.get("prompt_logprob_start", -1))
+        original = original_by_rollout[key[0]]
+        expected_prompt = [
+            *[int(token) for token in original["prompt_ids"]],
+            *[int(token) for token in critique["branch_prefix_ids"]],
+            *[int(token) for token in critique["new_continuation_ids"]],
+        ]
+        expected_start = len(original["prompt_ids"]) + len(critique["branch_prefix_ids"])
+        if (
+            scoring_prompt_ids != expected_prompt
+            or prompt_logprob_start != expected_start
+            or scored_ids != [int(token) for token in critique["new_continuation_ids"]]
+            or scored_log_probs != _float32_values(critique["new_continuation_log_probs"])
+            or scoring_prompt_ids[prompt_logprob_start:] != scored_ids
+            or len(scored_ids) != len(scored_log_probs)
+        ):
+            raise ValueError(f"learnability event {key!r} has a corrupted prompt-scoring slice")
+        expected_seed_score = _aggregate(scored_log_probs, statistic)
+        if not math.isclose(float(event["seed_score"]), expected_seed_score, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"learnability event {key!r} has a corrupted replacement score")
+        expected_percentile = sum(
+            float(window["weight"]) for window in reference["windows"] if float(window["score"]) <= expected_seed_score
+        )
+        expected_percentile = min(max(expected_percentile, 0.0), 1.0)
+        minimum = float(branch_config["min_seed_window_percentile"])
+        full_credit = float(branch_config["full_credit_seed_window_percentile"])
+        expected_accepted = expected_percentile >= minimum
+        expected_weight = min(max((expected_percentile - minimum) / (full_credit - minimum), 0.0), 1.0)
+        if (
+            not math.isclose(float(event["percentile"]), expected_percentile, rel_tol=0.0, abs_tol=1e-12)
+            or bool(event["accepted"]) != expected_accepted
+            or not math.isclose(float(event["reward_weight"]), expected_weight, rel_tol=0.0, abs_tol=1e-12)
+        ):
+            raise ValueError(f"learnability event {key!r} does not match its audited reference distribution")
         if bool(event["accepted"]) != bool(critique["learnability_accepted"]) or not math.isclose(
             float(event["reward_weight"]), float(critique["learnability_weight"]), abs_tol=1e-9
         ):
@@ -249,20 +445,116 @@ def verify(root: Path) -> dict[str, Any]:
         if actor_batch.get(key) != expected:
             raise ValueError(f"actor batch {key} mismatch: {actor_batch.get(key)!r} != {expected!r}")
     actor_rows = actor_batch.get("actor_rows")
-    if not isinstance(actor_rows, list) or len(actor_rows) != expected_actor_rows:
-        raise ValueError("actor-batch audit must retain every non-padding row's kind, group, and reward")
+    padding = int(actor_batch["padding"])
+    if not 0 <= padding < 8 or (expected_actor_rows + padding) % 8:
+        raise ValueError(f"invalid data-parallel padding count: {padding}")
+    if not isinstance(actor_rows, list) or len(actor_rows) != expected_actor_rows + padding:
+        raise ValueError("actor-batch audit must retain every balanced row")
     actor_kind_counts = Counter(str(row.get("kind")) for row in actor_rows)
     if actor_kind_counts != Counter(
         original=expected_originals,
         critique=expected_critiques,
         continuation=len(continuations),
+        padding=padding,
     ):
         raise ValueError(f"actor-row kind counts mismatch: {actor_kind_counts!r}")
+
+    expected_sources: dict[str, dict[str, Any]] = {}
+    for rollout_id, original in original_by_rollout.items():
+        expected_sources[f"original:{rollout_id}"] = {
+            "kind": "original",
+            "group_id": f"solution:{original['prompt_group_id']}",
+            "reward": float(original["reward"]),
+            "full_ids": [*original["prompt_ids"], *original["solution_ids"]],
+            "train_start": len(original["prompt_ids"]),
+            "behavior_log_probs": _float32_values(original["solution_log_probs"]),
+        }
+    for key, critique in critique_by_key.items():
+        row_id = str(critique["actor_row_id"])
+        expected_sources[row_id] = {
+            "kind": "critique",
+            "group_id": f"critique:{key[0]}",
+            "reward": float(critique["reward"]),
+            "full_ids": [*critique["critique_prompt_ids"], *critique["critique_ids"]],
+            "train_start": len(critique["critique_prompt_ids"]),
+            "behavior_log_probs": _float32_values(critique["critique_log_probs"]),
+        }
+    for continuation in continuations:
+        rollout_id = str(continuation["rollout_id"])
+        original = original_by_rollout[rollout_id]
+        row_id = str(continuation["actor_row_id"])
+        expected_sources[row_id] = {
+            "kind": "continuation",
+            "group_id": f"solution:{original['prompt_group_id']}",
+            "reward": float(continuation["reward"]),
+            "full_ids": [
+                *original["prompt_ids"],
+                *continuation["revised_prefix_ids"],
+                *continuation["continuation_ids"],
+            ],
+            "train_start": len(original["prompt_ids"]) + len(continuation["revised_prefix_ids"]),
+            "behavior_log_probs": _float32_values(continuation["continuation_log_probs"]),
+        }
+    if len(expected_sources) != expected_actor_rows:
+        raise ValueError("source audit evidence does not map one-to-one onto non-padding actor rows")
+
+    seen_source_ids: set[str] = set()
+    balanced_indices: set[int] = set()
+    response_widths = {int(row["response_width"]) for row in actor_rows}
+    if len(response_widths) != 1:
+        raise ValueError("balanced actor rows disagree on response width")
+    response_width = response_widths.pop()
+    pad_token_id = int(actor_batch["pad_token_id"])
+    for row in actor_rows:
+        row_id = str(row.get("actor_row_id"))
+        balanced_indices.add(int(row.get("balanced_row_index", -1)))
+        if row_id.startswith("padding:"):
+            expected = {
+                "kind": "padding",
+                "group_id": row_id,
+                "reward": 0.0,
+                "full_ids": [pad_token_id],
+                "train_start": None,
+                "behavior_log_probs": [],
+            }
+        else:
+            expected = expected_sources.get(row_id)
+            if expected is None:
+                raise ValueError(f"balanced actor row {row_id!r} has no source evidence")
+            if row_id in seen_source_ids:
+                raise ValueError(f"balanced actor row {row_id!r} is duplicated")
+            seen_source_ids.add(row_id)
+        full_ids = [int(token) for token in expected["full_ids"]]
+        behavior = _float32_values(expected["behavior_log_probs"])
+        train_start = expected["train_start"]
+        if train_start is None:
+            train_stop = None
+            response_mask = [0] * response_width
+        else:
+            train_stop = int(train_start) + len(behavior)
+            if not 0 < int(train_start) < train_stop == len(full_ids) or len(full_ids) - 1 > response_width:
+                raise ValueError(f"source actor row {row_id!r} has an invalid train span")
+            response_mask = [0] * response_width
+            response_mask[int(train_start) - 1 : train_stop - 1] = [1] * len(behavior)
+        if (
+            str(row.get("kind")) != expected["kind"]
+            or str(row.get("group_id")) != expected["group_id"]
+            or not math.isclose(float(row.get("reward")), float(expected["reward"]), abs_tol=1e-6)
+            or int(row.get("sequence_length")) != len(full_ids)
+            or row.get("train_start") != train_start
+            or row.get("train_stop") != train_stop
+            or row.get("input_ids_sha256") != _canonical_sha256(full_ids, dtype="<i8")
+            or row.get("response_mask_sha256") != _canonical_sha256(response_mask, dtype="u1")
+            or row.get("old_log_probs_sha256") != _canonical_sha256(behavior, dtype="<f4")
+            or row.get("rollout_log_probs_sha256") != _canonical_sha256(behavior, dtype="<f4")
+        ):
+            raise ValueError(f"balanced actor row {row_id!r} does not match its source tensors")
+    if seen_source_ids != set(expected_sources) or balanced_indices != set(range(len(actor_rows))):
+        raise ValueError("balanced actor audit lost, duplicated, or misindexed source rows")
+
     original_actor_rows = [row for row in actor_rows if row["kind"] == "original"]
     critique_actor_rows = [row for row in actor_rows if row["kind"] == "critique"]
     continuation_actor_rows = [row for row in actor_rows if row["kind"] == "continuation"]
-    if [float(row["reward"]) for row in original_actor_rows] != original_rewards:
-        raise ValueError("original actor rows do not retain their binary environment outcomes")
     continuation_actor_rewards = sorted(
         _require_binary(row["reward"], "continuation actor reward") for row in continuation_actor_rows
     )
@@ -285,7 +577,7 @@ def verify(root: Path) -> dict[str, Any]:
         raise ValueError(
             f"original solution GRPO groups must contain {rollout_n} rollouts per prompt: {original_solution_groups!r}"
         )
-    if not any(
+    if require_algorithm_signal and not any(
         len({float(row["reward"]) for row in original_actor_rows if str(row["group_id"]) == group_id}) > 1
         for group_id in original_solution_groups
     ):
@@ -313,14 +605,11 @@ def verify(root: Path) -> dict[str, Any]:
             for group_id in critique_groups
             if rollout_objectives[group_id.removeprefix("critique:")] == objective
         ]
-        if not any(
+        if require_algorithm_signal and not any(
             len({float(row["reward"]) for row in critique_actor_rows if str(row["group_id"]) == group_id}) > 1
             for group_id in objective_groups
         ):
             raise ValueError(f"smoke has no nonuniform {objective} critique GRPO reward group")
-    padding = int(actor_batch["padding"])
-    if not 0 <= padding < 8 or (expected_actor_rows + padding) % 8:
-        raise ValueError(f"invalid data-parallel padding count: {padding}")
 
     metrics = _read_jsonl(root / "metrics.jsonl")
     step_rows = [row for row in metrics if int(row.get("step", -1)) == 1]
@@ -345,33 +634,52 @@ def verify(root: Path) -> dict[str, Any]:
         actual = float(merged_metrics.get(key, float("nan")))
         if actual != expected:
             raise ValueError(f"metric {key} mismatch: {actual!r} != {expected!r}")
+    successful_recovery_count = sum(
+        float(event["reward"]) for event in continuations if event.get("objective") == "recovery"
+    )
+    accepted_recovery_count = sum(rollout_objectives[key[0]] == "recovery" for key in accepted_keys)
+    valid_recovery_count = sum(rollout_objectives[key[0]] == "recovery" for key in structurally_valid_keys)
+    expected_rates = {
+        "branch_revision/flip/success_per_valid_continuation": (
+            successful_recovery_count / accepted_recovery_count if accepted_recovery_count else 0.0
+        ),
+        "branch_revision/flip/success_per_continuation": (
+            successful_recovery_count / valid_recovery_count if valid_recovery_count else 0.0
+        ),
+    }
+    for key, expected in expected_rates.items():
+        actual = float(merged_metrics.get(key, float("nan")))
+        if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(f"metric {key} mismatch: {actual!r} != {expected!r}")
     grad_keys = [key for key in merged_metrics if key.endswith("actor/grad_norm") or key == "actor/grad_norm"]
     if not grad_keys:
         raise ValueError("optimizer-step grad_norm metric is missing")
     finite_grad_norms = [float(merged_metrics[key]) for key in grad_keys if math.isfinite(float(merged_metrics[key]))]
-    if not finite_grad_norms or not any(value > 0.0 for value in finite_grad_norms):
+    if not finite_grad_norms:
+        raise ValueError("optimizer-step grad_norm metrics contain no finite values")
+    if require_algorithm_signal and not any(value > 0.0 for value in finite_grad_norms):
         raise ValueError("optimizer-step grad_norm metrics contain no finite positive learning signal")
     pg_loss = float(merged_metrics.get("actor/pg_loss", float("nan")))
     if not math.isfinite(pg_loss):
         raise ValueError("optimizer-step actor/pg_loss metric is missing or non-finite")
     successful_revisions = sum(float(event["reward"]) for event in continuations)
-    if successful_revisions <= 0.0:
+    if require_algorithm_signal and successful_revisions <= 0.0:
         raise ValueError("smoke has no successful revised continuation")
-    successful_recoveries = sum(
-        float(event["reward"]) for event in continuations if event.get("objective") == "recovery"
-    )
+    successful_recoveries = successful_recovery_count
     successful_compressions = sum(
         float(event.get("compression_credit") or 0.0)
         for event in continuations
         if event.get("objective") == "compression"
     )
-    if successful_recoveries <= 0.0:
+    if require_algorithm_signal and successful_recoveries <= 0.0:
         raise ValueError("smoke has no successful recovery continuation")
-    if successful_compressions <= 0.0:
+    if require_algorithm_signal and successful_compressions <= 0.0:
         raise ValueError("smoke has no successful positive-rollout compression")
 
     return {
-        "status": "verified",
+        "status": "verified" if require_algorithm_signal else "integrity-verified",
+        "algorithm_signal_required": require_algorithm_signal,
+        "audit_attempt_id": attempt_id,
         "audit_file": str(audit_files[0]),
         "event_counts": dict(sorted(event_counts.items())),
         "incorrect_originals": incorrect,
@@ -381,6 +689,7 @@ def verify(root: Path) -> dict[str, Any]:
         "successful_revisions": successful_revisions,
         "successful_compression_credit": successful_compressions,
         "policy_loss_mode": loss_mode,
+        "learnability_logprob_statistic": statistic,
         "actor_rows": expected_actor_rows,
         "padding_rows": padding,
         "wall_seconds": float(completed["wall_seconds"]),
@@ -391,8 +700,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--output-json", type=Path)
+    parser.add_argument(
+        "--integrity-only",
+        action="store_true",
+        help="verify complete schema-v2 evidence without requiring nonzero revision learning signal",
+    )
     args = parser.parse_args()
-    result = verify(args.root)
+    result = verify(args.root, require_algorithm_signal=not args.integrity_only)
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)

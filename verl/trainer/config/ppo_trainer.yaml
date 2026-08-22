@@ -210,6 +210,9 @@ algorithm:
     # Relative length reduction that earns full positive-compression credit.
     positive_compression_target: 0.25
 
+    # Aggregate replacement and matched-window token log-probabilities by mean or minimum.
+    learnability_logprob_statistic: mean
+
     # Reject replacement seeds below this length-matched original-window percentile.
     min_seed_window_percentile: 0.20
 

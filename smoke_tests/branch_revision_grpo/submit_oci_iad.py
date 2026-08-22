@@ -55,9 +55,12 @@ def _extra_args(
     num_critiques: int = 4,
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
+    learnability_logprob_statistic: str = "mean",
 ) -> str:
     if loss_mode not in {"dppo_tv", "vanilla"}:
         raise ValueError("loss_mode must be dppo_tv or vanilla")
+    if learnability_logprob_statistic not in {"mean", "min"}:
+        raise ValueError("learnability_logprob_statistic must be mean or min")
     overrides = [
         "~critic.append_solution_to_prompt",
         "algorithm.adv_estimator=grpo",
@@ -68,6 +71,7 @@ def _extra_args(
         "algorithm.branch_revision_grpo.enable_positive_compression=true",
         f"algorithm.branch_revision_grpo.num_positive_critiques={num_critiques}",
         "algorithm.branch_revision_grpo.positive_compression_target=0.25",
+        f"algorithm.branch_revision_grpo.learnability_logprob_statistic={learnability_logprob_statistic}",
         "algorithm.branch_revision_grpo.min_seed_window_percentile=0.20",
         "algorithm.branch_revision_grpo.full_credit_seed_window_percentile=0.50",
         "algorithm.branch_revision_grpo.learnability_windows_per_rollout=8",
@@ -122,7 +126,7 @@ def _extra_args(
         "trainer.critic_warmup=0",
         "trainer.logger=[file]",
         "trainer.project_name=branch_revision_grpo_smoke",
-        f"trainer.experiment_name=branch_revision_{loss_mode}",
+        f"trainer.experiment_name=branch_revision_{loss_mode}_{learnability_logprob_statistic}",
         f"trainer.default_local_dir={remote_evidence}/checkpoints",
         "trainer.total_training_steps=1",
         "trainer.total_epochs=1",
@@ -140,6 +144,7 @@ def _extra_args(
         f"+branch_revision_smoke.num_critiques={num_critiques}",
         f"+branch_revision_smoke.model_path={model_path}",
         f"+branch_revision_smoke.loss_mode={loss_mode}",
+        f"+branch_revision_smoke.learnability_logprob_statistic={learnability_logprob_statistic}",
     ]
     return " ".join(overrides)
 
@@ -159,6 +164,7 @@ def build_command(
     seed: int = 43,
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
+    learnability_logprob_statistic: str = "mean",
 ) -> tuple[list[str], str]:
     positive = {
         "n_prompts": n_prompts,
@@ -178,6 +184,8 @@ def build_command(
         raise ValueError(f"model_path must be one of {sorted(SUPPORTED_MODEL_PATHS)!r}")
     if loss_mode not in {"dppo_tv", "vanilla"}:
         raise ValueError("loss_mode must be dppo_tv or vanilla")
+    if learnability_logprob_statistic not in {"mean", "min"}:
+        raise ValueError("learnability_logprob_statistic must be mean or min")
     remote_output = f"/output/smoke_tests/branch_revision_grpo/{run_tag}"
     remote_evidence = f"{remote_output}/evidence"
     command = [
@@ -271,6 +279,7 @@ def build_command(
             num_critiques=num_critiques,
             model_path=model_path,
             loss_mode=loss_mode,
+            learnability_logprob_statistic=learnability_logprob_statistic,
         ),
     ]
     if dry_run:
@@ -289,7 +298,7 @@ def _job_record(path: Path) -> dict[str, str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("dry-run", "submit", "status", "collect", "verify"))
+    parser.add_argument("action", choices=("dry-run", "submit", "status", "collect", "verify", "verify-integrity"))
     parser.add_argument("--run-tag", required=True)
     parser.add_argument("--local-run-dir", type=Path, required=True)
     parser.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
@@ -303,6 +312,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument("--model-path", choices=sorted(SUPPORTED_MODEL_PATHS), default=MODEL_PATH)
     parser.add_argument("--loss-mode", choices=("dppo_tv", "vanilla"), default="dppo_tv")
+    parser.add_argument("--learnability-logprob-statistic", choices=("mean", "min"), default="mean")
     args = parser.parse_args()
 
     local_run_dir = args.local_run_dir.expanduser().resolve()
@@ -334,12 +344,14 @@ def main() -> None:
         print(json.dumps({"status": "collected", "source": str(source), "destination": str(destination)}))
         return
 
-    if args.action == "verify":
+    if args.action in {"verify", "verify-integrity"}:
         from smoke_tests.branch_revision_grpo.verify_smoke import verify
 
-        result = verify(local_run_dir / "collected")
+        integrity_only = args.action == "verify-integrity"
+        result = verify(local_run_dir / "collected", require_algorithm_signal=not integrity_only)
         rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
-        (local_run_dir / "verified.json").write_text(rendered, encoding="utf-8")
+        output_name = "integrity_verified.json" if integrity_only else "verified.json"
+        (local_run_dir / output_name).write_text(rendered, encoding="utf-8")
         print(rendered, end="")
         return
 
@@ -358,6 +370,7 @@ def main() -> None:
         seed=args.seed,
         model_path=args.model_path,
         loss_mode=args.loss_mode,
+        learnability_logprob_statistic=args.learnability_logprob_statistic,
     )
     git = _git_provenance(repo_root)
     provenance = {
@@ -386,6 +399,7 @@ def main() -> None:
             seed=args.seed,
             model_path=args.model_path,
             loss_mode=args.loss_mode,
+            learnability_logprob_statistic=args.learnability_logprob_statistic,
         )
         result = _run(dry_command, local_run_dir / "dry_run.log")
         if result.returncode:

@@ -21,6 +21,7 @@ import os
 import socket
 import time
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,7 @@ from omegaconf import OmegaConf, open_dict
 
 from verl.experimental.reward_loop import migrate_legacy_reward_impl
 from verl.trainer.main_ppo import _apply_reward_focus_mask_alignment, run_ppo
+from verl.trainer.ppo.ray_trainer_branch_revision import validate_branch_revision_runtime_config
 from verl.utils.device import auto_set_device
 
 EXPECTED = {
@@ -51,7 +53,9 @@ EXPECTED = {
 
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
 
 
 def _configure_file_logger(config, path: Path) -> None:
@@ -66,7 +70,14 @@ def _configure_file_logger(config, path: Path) -> None:
 
 
 def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any]) -> None:
-    required_contract = {"model_path", "n_prompts", "n_samples", "num_critiques", "loss_mode"}
+    required_contract = {
+        "model_path",
+        "n_prompts",
+        "n_samples",
+        "num_critiques",
+        "loss_mode",
+        "learnability_logprob_statistic",
+    }
     if set(smoke_contract) != required_contract:
         raise ValueError(
             f"branch-revision smoke contract must contain exactly {sorted(required_contract)!r}, "
@@ -81,6 +92,9 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "actor_rollout_ref.model.path": smoke_contract["model_path"],
         "critic.model.path": smoke_contract["model_path"],
         "actor_rollout_ref.actor.policy_loss.loss_mode": smoke_contract["loss_mode"],
+        "algorithm.branch_revision_grpo.learnability_logprob_statistic": smoke_contract[
+            "learnability_logprob_statistic"
+        ],
     }
     for name in ("n_prompts", "n_samples", "num_critiques"):
         value = smoke_contract[name]
@@ -90,6 +104,8 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("branch-revision smoke model_path must be an absolute string path")
     if smoke_contract["loss_mode"] not in {"dppo_tv", "vanilla"}:
         raise ValueError("branch-revision smoke loss_mode must be dppo_tv or vanilla")
+    if smoke_contract["learnability_logprob_statistic"] not in {"mean", "min"}:
+        raise ValueError("branch-revision smoke learnability_logprob_statistic must be mean or min")
     if smoke_contract["n_samples"] < 2:
         raise ValueError("branch-revision smoke n_samples must be at least 2 for a GRPO acceptance group")
     if smoke_contract["num_critiques"] < 2:
@@ -169,6 +185,7 @@ def main(config) -> None:
         del config.branch_revision_smoke
     config = migrate_legacy_reward_impl(config)
     config = _apply_reward_focus_mask_alignment(config)
+    validate_branch_revision_runtime_config(config)
     _configure_file_logger(config, output_dir / "metrics.jsonl")
     OmegaConf.resolve(config)
     _validate_contract(config, output_dir, smoke_contract)
@@ -185,23 +202,52 @@ def main(config) -> None:
     )
 
     started = time.time()
+    invocation_id = uuid.uuid4().hex
+    audit_root = output_dir / "audit"
+    prior_attempts = {path.name for path in audit_root.glob("attempt_*") if path.is_dir()}
+    _write_json(
+        output_dir / "status.json",
+        {"status": "running", "invocation_id": invocation_id, "started_at": started},
+    )
     try:
         auto_set_device(config)
         run_ppo(config)
+        new_attempts = sorted(
+            path.name for path in audit_root.glob("attempt_*") if path.is_dir() and path.name not in prior_attempts
+        )
+        if len(new_attempts) != 1:
+            raise RuntimeError(f"smoke invocation must create exactly one audit attempt, got {new_attempts!r}")
+        attempt_id = new_attempts[0].removeprefix("attempt_")
+        completion = {
+            "status": "completed",
+            "invocation_id": invocation_id,
+            "audit_attempt_id": attempt_id,
+            "wall_seconds": time.time() - started,
+        }
         _write_json(
             output_dir / "completed.json",
-            {"status": "completed", "wall_seconds": time.time() - started},
+            completion,
         )
+        _write_json(output_dir / "status.json", completion)
     except BaseException as error:
+        new_attempts = sorted(
+            path.name.removeprefix("attempt_")
+            for path in audit_root.glob("attempt_*")
+            if path.is_dir() and path.name not in prior_attempts
+        )
+        failure = {
+            "status": "failed",
+            "invocation_id": invocation_id,
+            "audit_attempt_ids": new_attempts,
+            "wall_seconds": time.time() - started,
+            "error": repr(error),
+            "traceback": traceback.format_exc(),
+        }
         _write_json(
             output_dir / "failed.json",
-            {
-                "status": "failed",
-                "wall_seconds": time.time() - started,
-                "error": repr(error),
-                "traceback": traceback.format_exc(),
-            },
+            failure,
         )
+        _write_json(output_dir / "status.json", failure)
         raise
 
 

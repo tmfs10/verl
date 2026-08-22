@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 import subprocess
 import sys
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -29,6 +31,7 @@ from verl.experimental.agent_loop.branch_revision_agent_loop import (
     BranchRevisionAgentLoop,
     BranchRevisionCritiqueGeneration,
     BranchRevisionGenerationRecord,
+    _gather_and_drain,
 )
 from verl.trainer.config import (
     BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT,
@@ -39,6 +42,7 @@ from verl.trainer.config import (
 from verl.trainer.ppo import ray_trainer_branch_revision as branch_controller_module
 from verl.trainer.ppo.branch_revision_grpo import (
     LearnabilityScore,
+    aggregate_log_probs,
     build_learnability_reference,
     build_rollout_logprob_prefixes,
     decode_exact,
@@ -324,12 +328,49 @@ def test_length_matched_learnability_windows_are_deterministic_and_rollout_balan
     )
     first = build_learnability_reference(prefixes, window_size=2, windows_per_rollout=4, seed=9)
     second = build_learnability_reference(prefixes, window_size=2, windows_per_rollout=4, seed=9)
-    torch.testing.assert_close(first.window_means, second.window_means)
+    torch.testing.assert_close(first.window_scores, second.window_scores)
     torch.testing.assert_close(first.window_weights, second.window_weights)
     assert first.eligible_rollouts == 2
     assert first.sampled_windows == 6
-    assert first.window_weights[first.window_means == -1.0].sum().item() == pytest.approx(0.5)
-    assert first.window_weights[first.window_means == -3.0].sum().item() == pytest.approx(0.5)
+    assert first.window_weights[first.window_scores == -1.0].sum().item() == pytest.approx(0.5)
+    assert first.window_weights[first.window_scores == -3.0].sum().item() == pytest.approx(0.5)
+
+
+def test_mean_and_min_learnability_use_the_same_length_matched_windows() -> None:
+    prefixes = build_rollout_logprob_prefixes(
+        ["r"],
+        [[-1.0, -9.0, -4.0, -4.0]],
+    )
+    mean_reference = build_learnability_reference(
+        prefixes,
+        window_size=2,
+        windows_per_rollout=8,
+        seed=0,
+        logprob_statistic="mean",
+    )
+    min_reference = build_learnability_reference(
+        prefixes,
+        window_size=2,
+        windows_per_rollout=8,
+        seed=0,
+        logprob_statistic="min",
+    )
+    assert mean_reference.window_starts.tolist() == min_reference.window_starts.tolist() == [0, 1, 2]
+    assert mean_reference.window_scores.tolist() == pytest.approx([-5.0, -6.5, -4.0])
+    assert min_reference.window_scores.tolist() == pytest.approx([-9.0, -9.0, -4.0])
+    assert aggregate_log_probs([-1.0, -9.0], statistic="mean") == pytest.approx(-5.0)
+    assert aggregate_log_probs([-1.0, -9.0], statistic="min") == pytest.approx(-9.0)
+
+
+def test_mean_and_min_learnability_are_identical_for_one_token() -> None:
+    prefixes = build_rollout_logprob_prefixes(["r"], [[-4.0, -2.0]])
+    mean_reference = build_learnability_reference(
+        prefixes, window_size=1, windows_per_rollout=8, seed=0, logprob_statistic="mean"
+    )
+    min_reference = build_learnability_reference(
+        prefixes, window_size=1, windows_per_rollout=8, seed=0, logprob_statistic="min"
+    )
+    torch.testing.assert_close(mean_reference.window_scores, min_reference.window_scores)
 
 
 def test_learnability_percentile_gates_and_ramps_reward_credit() -> None:
@@ -359,6 +400,29 @@ def test_learnability_percentile_gates_and_ramps_reward_credit() -> None:
     assert full.accepted and full.reward_weight == 1.0
 
 
+@pytest.mark.parametrize("statistic", ["mean", "min"])
+def test_learnability_quantizes_both_sides_to_float32_before_comparison(statistic) -> None:
+    raw_reference = -1.00000004
+    raw_seed = -1.00000005
+    assert raw_seed < raw_reference
+    prefixes = build_rollout_logprob_prefixes(["r"], [[raw_reference]])
+    reference = build_learnability_reference(
+        prefixes,
+        window_size=1,
+        windows_per_rollout=1,
+        seed=0,
+        logprob_statistic=statistic,
+    )
+    score = score_seed_learnability(
+        aggregate_log_probs([raw_seed], statistic=statistic),
+        reference,
+        minimum_percentile=0.2,
+        full_credit_percentile=0.5,
+    )
+    assert score.seed_score == reference.window_scores.item() == -1.0
+    assert score.percentile == 1.0
+
+
 @pytest.mark.parametrize(("row", "expected"), [([0.0, 0.0], 0.0), ([0.0, 1.0, 0.0], 1.0)])
 def test_binary_reward_validation_accepts_only_one_terminal_unit(row, expected) -> None:
     assert validate_binary_reward_row(row, tolerance=1e-6) == expected
@@ -381,6 +445,7 @@ def _runtime_config(loss_mode="dppo_tv"):
                     "enable_positive_compression": True,
                     "num_positive_critiques": 4,
                     "positive_compression_target": 0.25,
+                    "learnability_logprob_statistic": "mean",
                     "min_seed_window_percentile": 0.20,
                     "full_credit_seed_window_percentile": 0.50,
                     "learnability_windows_per_rollout": 8,
@@ -460,6 +525,17 @@ def test_runtime_config_accepts_both_native_policy_losses_and_forces_behavior_lo
     assert config.actor_rollout_ref.actor.policy_loss.loss_mode == loss_mode
 
 
+@pytest.mark.parametrize("statistic", ["mean", "min"])
+def test_branch_revision_config_accepts_both_learnability_statistics(statistic) -> None:
+    feature = BranchRevisionGRPOConfig(learnability_logprob_statistic=statistic)
+    assert feature.learnability_logprob_statistic == statistic
+
+
+def test_branch_revision_config_rejects_unknown_learnability_statistic() -> None:
+    with pytest.raises(ValueError, match="must be mean or min"):
+        BranchRevisionGRPOConfig(learnability_logprob_statistic="median")
+
+
 @pytest.mark.parametrize(
     ("path", "value", "message"),
     [
@@ -479,6 +555,57 @@ def test_runtime_config_rejects_unsafe_interactions(path, value, message) -> Non
     OmegaConf.update(config, path, value)
     with pytest.raises(ValueError, match=message):
         validate_branch_revision_runtime_config(config)
+
+
+class _HeadroomTokenizer(_CharTokenizer):
+    def apply_chat_template(
+        self,
+        messages,
+        *,
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking=True,
+        headroom_marker="",
+    ):
+        rendered = super().apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+        )
+        rendered += headroom_marker
+        return self.encode(rendered) if tokenize else rendered
+
+
+@pytest.mark.parametrize("critique_cap", [16, None])
+def test_tokenizer_aware_context_headroom_accepts_exact_fit_and_rejects_one_token_short(critique_cap) -> None:
+    config = _runtime_config()
+    config.algorithm.branch_revision_grpo.critique_max_response_length = critique_cap
+    config.data.apply_chat_template_kwargs = {"headroom_marker": "base"}
+    config.data.train_apply_chat_template_kwargs = {"headroom_marker": "train-override"}
+    tokenizer = _HeadroomTokenizer()
+    followup_lengths = [
+        len(
+            encode_followup_user_turn(
+                instruction,
+                tokenizer,
+                chat_template_kwargs={"headroom_marker": "train-override"},
+            )
+        )
+        for instruction in (BRANCH_REVISION_CRITIQUE_PROMPT, BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT)
+    ]
+    effective_cap = int(critique_cap or config.data.max_response_length)
+    required = (
+        int(config.data.max_prompt_length)
+        + int(config.data.max_response_length)
+        + max(followup_lengths)
+        + effective_cap
+    )
+    config.actor_rollout_ref.rollout.max_model_len = required
+    validate_branch_revision_runtime_config(config, actor_tokenizer=tokenizer)
+    config.actor_rollout_ref.rollout.max_model_len = required - 1
+    with pytest.raises(ValueError, match=r"max_prompt=.*followup=.*critique_cap=.*required=.*limit="):
+        validate_branch_revision_runtime_config(config, actor_tokenizer=tokenizer)
 
 
 def _loop() -> BranchRevisionAgentLoop:
@@ -693,6 +820,60 @@ def test_agent_loop_drains_all_sibling_failures_before_raising() -> None:
     assert sorted(completed) == ["critique[0]", "critique[1]"]
 
 
+def test_agent_loop_validates_every_critique_before_launching_continuations() -> None:
+    loop = _loop()
+    calls: list[str] = []
+
+    async def fake_generate(_route, _prompt, _params, *, max_tokens, kind, prompt_logprob_start=None):
+        del max_tokens, prompt_logprob_start
+        calls.append(kind)
+        if kind == "critique[0]":
+            text = _structured("dead", "better")
+            return TokenOutput(token_ids=_ids(text), log_probs=[-0.2] * len(_ids(text)))
+        if kind == "critique[1]":
+            return TokenOutput(token_ids=_ids("broken"), log_probs=None)
+        raise AssertionError("a continuation launched before every critique passed validation")
+
+    loop._generate = fake_generate
+    solution_ids = _ids("start dead and waste")
+    with pytest.raises(RuntimeError, match="before continuation launch"):
+        asyncio.run(
+            loop.run(
+                {},
+                branch_revision_rollout_id="p:0",
+                branch_revision_parent_objective="recovery",
+                branch_revision_num_critiques=2,
+                branch_revision_parent_prompt_ids=_ids("q"),
+                branch_revision_parent_solution_ids=solution_ids,
+                branch_revision_parent_solution_log_probs=[-0.1] * len(solution_ids),
+                raw_prompt=[{"role": "user", "content": "q"}],
+            )
+        )
+    assert calls == ["critique[0]", "critique[1]"]
+
+
+def test_gather_and_drain_cancels_every_task_when_parent_is_cancelled() -> None:
+    finalized: list[int] = []
+
+    async def scenario() -> None:
+        async def child(index: int) -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                finalized.append(index)
+
+        children = [asyncio.create_task(child(index)) for index in range(2)]
+        parent = asyncio.create_task(_gather_and_drain(children, phase="critique", indices=[0, 1]))
+        await asyncio.sleep(0)
+        parent.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await parent
+        assert all(task.done() for task in children)
+
+    asyncio.run(scenario())
+    assert sorted(finalized) == [0, 1]
+
+
 def _controller() -> BranchRevisionGRPOController:
     controller = BranchRevisionGRPOController.__new__(BranchRevisionGRPOController)
     controller.feature = BranchRevisionGRPOConfig(enable=True, num_critiques=2)
@@ -715,7 +896,9 @@ def _controller() -> BranchRevisionGRPOController:
         }
     )
     controller.tokenizer = TOKENIZER
+    controller.audit_root = None
     controller.audit_dir = None
+    controller.audit_attempt_id = None
     controller._initialized_audit_steps = set()
     controller.trainer = SimpleNamespace(
         actor_rollout_wg=object(),
@@ -723,6 +906,59 @@ def _controller() -> BranchRevisionGRPOController:
         global_steps=1,
     )
     return controller
+
+
+def _enable_audit(controller: BranchRevisionGRPOController, root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    controller.audit_root = str(root)
+    controller.audit_dir = None
+    controller.audit_attempt_id = None
+    controller._initialized_audit_steps = set()
+
+
+def test_audit_resume_creates_a_new_attempt_without_overwriting_incomplete_evidence(tmp_path: Path) -> None:
+    audit_root = tmp_path / "audit"
+    first = _controller()
+    _enable_audit(first, audit_root)
+    first._audit("original", rollout_id="p:0")
+    first_attempt = first.audit_attempt_id
+
+    second = _controller()
+    _enable_audit(second, audit_root)
+    second._audit("original", rollout_id="p:0")
+    second._audit("step_complete")
+    second_attempt = second.audit_attempt_id
+
+    assert first_attempt and second_attempt and first_attempt != second_attempt
+    first_events = (audit_root / f"attempt_{first_attempt}" / "step_00000001.jsonl").read_text(encoding="utf-8")
+    second_events = (audit_root / f"attempt_{second_attempt}" / "step_00000001.jsonl").read_text(encoding="utf-8")
+    assert '"event": "step_complete"' not in first_events
+    assert '"event": "step_complete"' in second_events
+
+
+def test_actor_audit_uses_the_actual_post_reorder_batch(tmp_path: Path) -> None:
+    controller = _controller()
+    _enable_audit(controller, tmp_path / "audit")
+    bundles = [
+        _Bundle(
+            source_row=index,
+            rollout_id=f"p:{index}",
+            prompt_group_id="p",
+            prompt_ids=_ids("q"),
+            solution_ids=_ids("wrong" if index == 0 else "right"),
+            solution_log_probs=[-0.1] * len(_ids("wrong" if index == 0 else "right")),
+            original_reward=float(index),
+        )
+        for index in range(2)
+    ]
+    actor_batch, padding_rows = controller._make_actor_batch(bundles)
+    actor_batch.reorder(torch.tensor([1, 0]))
+    controller._audit_actor_batch(actor_batch, padding_rows=padding_rows)
+    attempt = controller.audit_attempt_id
+    path = tmp_path / "audit" / f"attempt_{attempt}" / "step_00000001.jsonl"
+    event = json.loads(path.read_text(encoding="utf-8").strip())
+    assert [row["actor_row_id"] for row in event["actor_rows"]] == ["original:p:1", "original:p:0"]
+    assert [row["balanced_row_index"] for row in event["actor_rows"]] == [0, 1]
 
 
 def _critique(text: str, *, valid: bool, continuation: str = "") -> BranchRevisionCritiqueGeneration:
@@ -760,7 +996,8 @@ def _critique(text: str, *, valid: bool, continuation: str = "") -> BranchRevisi
 
 def _learnability(*, percentile: float = 1.0, weight: float = 1.0, accepted: bool = True) -> LearnabilityScore:
     return LearnabilityScore(
-        seed_mean_log_prob=-0.1,
+        logprob_statistic="mean",
+        seed_score=-0.1,
         percentile=percentile,
         reward_weight=weight,
         accepted=accepted,
@@ -792,6 +1029,33 @@ def test_learnability_fails_closed_without_aligned_vllm_prompt_scores() -> None:
     )
     with pytest.raises(RuntimeError, match="one vLLM prompt log probability"):
         controller._score_seed_learnability([bundle])
+
+
+def test_controller_uses_configured_minimum_logprob_statistic() -> None:
+    controller = _controller()
+    controller.feature = replace(controller.feature, learnability_logprob_statistic="min")
+    valid = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    seed_values = [-0.01] * len(valid.new_continuation_ids)
+    seed_values[2] = -0.75
+    valid = replace(valid, new_continuation_log_probs=tuple(seed_values))
+    bundle = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord(
+            "p:0",
+            "recovery",
+            (valid, _critique("invalid", valid=False)),
+            tuple(_ids("prompt")),
+        ),
+    )
+    controller._score_seed_learnability([bundle])
+    assert bundle.learnability[0].logprob_statistic == "min"
+    assert bundle.learnability[0].seed_score == pytest.approx(-0.75)
 
 
 def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revision_seed() -> None:
@@ -1117,6 +1381,36 @@ def test_low_learnability_edit_is_not_rewarded_or_solution_trained(monkeypatch) 
     assert [row.reward for row in rows if row.kind == "critique"] == [-0.5, -0.5]
 
 
+def test_success_per_continuation_counts_learnability_rejections_in_its_denominator() -> None:
+    controller = _controller()
+    first = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    second = _critique(_structured("dead", "alternate"), valid=True, continuation=" failed")
+    bundle = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord(
+            "p:0",
+            "recovery",
+            (first, second),
+            tuple([*_ids("q"), *_ids("start dead and waste"), *_ids("<followup>")]),
+        ),
+        learnability={
+            0: _learnability(),
+            1: _learnability(percentile=0.1, weight=0.0, accepted=False),
+        },
+        continuation_rewards={0: 1.0},
+    )
+    actor_batch, padding_rows = controller._make_actor_batch([bundle])
+    metrics = controller._metrics([bundle], actor_batch, padding_rows)
+    assert metrics["branch_revision/flip/success_per_valid_continuation"] == 1.0
+    assert metrics["branch_revision/flip/success_per_continuation"] == 0.5
+
+
 def test_full_controller_update_critiques_only_incorrect_and_trains_one_combined_batch(monkeypatch) -> None:
     controller = _controller()
     controller.config.actor_rollout_ref.rollout.prompt_length = 8
@@ -1181,6 +1475,7 @@ def test_full_controller_update_critiques_only_incorrect_and_trains_one_combined
     assert metrics["branch_revision/continuations"] == 1.0
     assert metrics["branch_revision/flip/success_per_all_critiques"] == 0.5
     assert metrics["branch_revision/flip/success_per_valid_continuation"] == 1.0
+    assert metrics["branch_revision/flip/success_per_continuation"] == 1.0
     assert timing["child_internal"] == 0.25
     actor_batch = captured["batch"]
     assert actor_batch.non_tensor_batch["branch_revision_actor_kind"].tolist().count("critique") == 2

@@ -61,6 +61,7 @@ class ParsedBranchRevision:
 @dataclass(frozen=True)
 class RolloutLogProbPrefix:
     rollout_id: str
+    log_probs: torch.Tensor
     prefix_sums: torch.Tensor
 
     @property
@@ -71,18 +72,22 @@ class RolloutLogProbPrefix:
 @dataclass(frozen=True)
 class LearnabilityReference:
     window_size: int
-    window_means: torch.Tensor
+    logprob_statistic: str
+    window_scores: torch.Tensor
     window_weights: torch.Tensor
+    window_rollout_ids: tuple[str, ...]
+    window_starts: torch.Tensor
     eligible_rollouts: int
 
     @property
     def sampled_windows(self) -> int:
-        return int(self.window_means.numel())
+        return int(self.window_scores.numel())
 
 
 @dataclass(frozen=True)
 class LearnabilityScore:
-    seed_mean_log_prob: float
+    logprob_statistic: str
+    seed_score: float
     percentile: float
     reward_weight: float
     accepted: bool
@@ -180,18 +185,47 @@ def build_rollout_logprob_prefixes(
     *,
     device: torch.device | str | None = None,
 ) -> tuple[RolloutLogProbPrefix, ...]:
-    """Build each rollout's cumulative log-probabilities exactly once per iteration."""
+    """Normalize rollout log-probabilities and build cumulative sums once per iteration."""
 
     if len(rollout_ids) != len(rollout_log_probs):
         raise ValueError("rollout ids and log-probability rows must have equal lengths")
     result: list[RolloutLogProbPrefix] = []
     for rollout_id, values in zip(rollout_ids, rollout_log_probs, strict=True):
-        tensor = torch.as_tensor(list(values), dtype=torch.float64, device=device)
+        tensor = normalize_log_probs_float32(values, device=device)
         if not torch.isfinite(tensor).all():
             raise ValueError(f"rollout {rollout_id!r} contains non-finite log probabilities")
-        prefix = torch.cat([torch.zeros(1, dtype=torch.float64, device=tensor.device), tensor.cumsum(dim=0)])
-        result.append(RolloutLogProbPrefix(str(rollout_id), prefix))
+        prefix_values = tensor.to(dtype=torch.float64)
+        prefix = torch.cat([torch.zeros(1, dtype=torch.float64, device=tensor.device), prefix_values.cumsum(dim=0)])
+        result.append(RolloutLogProbPrefix(str(rollout_id), tensor, prefix))
     return tuple(result)
+
+
+def normalize_log_probs_float32(
+    values: Iterable[float],
+    *,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Use one explicit precision boundary for rollout and prompt log-probabilities."""
+
+    tensor = torch.as_tensor(list(values), dtype=torch.float32, device=device)
+    if tensor.ndim != 1:
+        raise ValueError("log probabilities must form a one-dimensional sequence")
+    if not torch.isfinite(tensor).all():
+        raise ValueError("log probabilities must all be finite")
+    return tensor
+
+
+def aggregate_log_probs(values: Iterable[float], *, statistic: str) -> float:
+    """Aggregate float32-normalized token log-probabilities for learnability."""
+
+    tensor = normalize_log_probs_float32(values)
+    if tensor.numel() == 0:
+        raise ValueError("cannot aggregate an empty log-probability sequence")
+    if statistic == "mean":
+        return float(tensor.to(dtype=torch.float64).mean().item())
+    if statistic == "min":
+        return float(tensor.amin().item())
+    raise ValueError("learnability log-probability statistic must be mean or min")
 
 
 def _stratified_window_starts(
@@ -223,12 +257,17 @@ def build_learnability_reference(
     window_size: int,
     windows_per_rollout: int,
     seed: int,
+    logprob_statistic: str = "mean",
 ) -> LearnabilityReference:
     """Sample length-matched windows, giving every eligible rollout equal mass."""
 
     if window_size <= 0 or windows_per_rollout <= 0:
         raise ValueError("learnability window sizes and counts must be positive")
+    if logprob_statistic not in {"mean", "min"}:
+        raise ValueError("learnability log-probability statistic must be mean or min")
     sampled: list[torch.Tensor] = []
+    sampled_rollout_ids: list[str] = []
+    sampled_starts: list[torch.Tensor] = []
     for rollout in prefixes:
         candidate_count = rollout.token_count - window_size + 1
         if candidate_count <= 0:
@@ -241,23 +280,41 @@ def build_learnability_reference(
             window_size=window_size,
         )
         indices = torch.tensor(starts, dtype=torch.long, device=rollout.prefix_sums.device)
-        means = (rollout.prefix_sums[indices + window_size] - rollout.prefix_sums[indices]) / float(window_size)
-        sampled.append(means)
+        if logprob_statistic == "mean":
+            scores = (rollout.prefix_sums[indices + window_size] - rollout.prefix_sums[indices]) / float(window_size)
+        else:
+            offsets = torch.arange(window_size, dtype=torch.long, device=rollout.log_probs.device)
+            scores = rollout.log_probs[indices[:, None] + offsets[None, :]].amin(dim=1).to(dtype=torch.float64)
+        sampled.append(scores)
+        sampled_rollout_ids.extend([rollout.rollout_id] * len(starts))
+        sampled_starts.append(indices)
     if not sampled:
-        empty = torch.empty(0, dtype=torch.float64)
-        return LearnabilityReference(window_size, empty, empty.clone(), 0)
+        device = prefixes[0].prefix_sums.device if prefixes else None
+        empty = torch.empty(0, dtype=torch.float64, device=device)
+        return LearnabilityReference(
+            window_size=window_size,
+            logprob_statistic=logprob_statistic,
+            window_scores=empty,
+            window_weights=empty.clone(),
+            window_rollout_ids=(),
+            window_starts=torch.empty(0, dtype=torch.long, device=device),
+            eligible_rollouts=0,
+        )
     eligible_rollouts = len(sampled)
     weights = [torch.full_like(values, 1.0 / (eligible_rollouts * values.numel())) for values in sampled]
     return LearnabilityReference(
         window_size=window_size,
-        window_means=torch.cat(sampled),
+        logprob_statistic=logprob_statistic,
+        window_scores=torch.cat(sampled),
         window_weights=torch.cat(weights),
+        window_rollout_ids=tuple(sampled_rollout_ids),
+        window_starts=torch.cat(sampled_starts),
         eligible_rollouts=eligible_rollouts,
     )
 
 
 def score_seed_learnability(
-    seed_mean_log_prob: float,
+    seed_score: float,
     reference: LearnabilityReference,
     *,
     minimum_percentile: float,
@@ -265,16 +322,14 @@ def score_seed_learnability(
 ) -> LearnabilityScore:
     """Gate a replacement seed and linearly ramp reward credit by percentile."""
 
-    if not math.isfinite(seed_mean_log_prob):
-        raise ValueError("replacement seed mean log probability must be finite")
+    if not math.isfinite(seed_score):
+        raise ValueError("replacement seed log-probability score must be finite")
     if not 0.0 <= minimum_percentile < full_credit_percentile <= 1.0:
         raise ValueError("learnability percentiles must satisfy 0 <= minimum < full credit <= 1")
     if reference.sampled_windows == 0:
         percentile = 0.0
     else:
-        percentile = float(
-            reference.window_weights[reference.window_means <= seed_mean_log_prob].sum().detach().cpu().item()
-        )
+        percentile = float(reference.window_weights[reference.window_scores <= seed_score].sum().detach().cpu().item())
         percentile = min(max(percentile, 0.0), 1.0)
     accepted = reference.sampled_windows > 0 and percentile >= minimum_percentile
     reward_weight = min(
@@ -282,7 +337,8 @@ def score_seed_learnability(
         1.0,
     )
     return LearnabilityScore(
-        seed_mean_log_prob=float(seed_mean_log_prob),
+        logprob_statistic=reference.logprob_statistic,
+        seed_score=float(seed_score),
         percentile=percentile,
         reward_weight=reward_weight,
         accepted=accepted,

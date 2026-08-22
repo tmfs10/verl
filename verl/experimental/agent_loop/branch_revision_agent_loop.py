@@ -25,6 +25,7 @@ from verl.trainer.config import BranchRevisionGRPOConfig
 from verl.trainer.ppo.branch_revision_grpo import (
     decode_exact,
     encode_followup_user_turn,
+    normalize_log_probs_float32,
     parse_branch_revision,
     strip_terminal_eos,
 )
@@ -80,6 +81,44 @@ def _as_float_list(value: Any, name: str) -> list[float]:
     if not result:
         raise ValueError(f"{name} must be non-empty")
     return result
+
+
+async def _gather_and_drain(
+    tasks: list[asyncio.Task],
+    *,
+    phase: str,
+    indices: list[int],
+) -> list[Any]:
+    """Await every request and leave no child task live when the parent exits."""
+
+    if len(tasks) != len(indices):
+        raise ValueError("branch-revision task labels do not match the task count")
+    try:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+    except BaseException as primary_error:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        cleanup_results = await asyncio.gather(*tasks, return_exceptions=True)
+        cleanup_errors = [
+            result
+            for result in cleanup_results
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
+        ]
+        add_note = getattr(primary_error, "add_note", None)
+        if callable(add_note) and cleanup_errors:
+            add_note(f"{phase} task cleanup also returned: {cleanup_errors!r}")
+        raise
+    errors = [
+        f"{phase}[{index}]: {result!r}"
+        for index, result in zip(indices, results, strict=True)
+        if isinstance(result, BaseException)
+    ]
+    if errors:
+        raise RuntimeError(
+            f"branch-revision {phase} generation failed after draining every request: " + "; ".join(errors)
+        )
+    return results
 
 
 @register(BRANCH_REVISION_AGENT_NAME)
@@ -224,55 +263,50 @@ class BranchRevisionAgentLoop(AgentLoopBase):
             )
             for index in range(num_critiques)
         ]
-        critique_results = await asyncio.gather(*critique_tasks, return_exceptions=True)
-        critique_errors = [
-            f"critique[{index}]: {result!r}"
-            for index, result in enumerate(critique_results)
-            if isinstance(result, BaseException)
-        ]
-        if critique_errors:
-            raise RuntimeError(
-                "branch-revision critique generation failed after draining every request: " + "; ".join(critique_errors)
-            )
+        critique_results = await _gather_and_drain(
+            critique_tasks,
+            phase="critique",
+            indices=list(range(num_critiques)),
+        )
 
-        parsed_records: list[dict[str, Any]] = []
-        continuation_tasks: list[asyncio.Task] = []
-        continuation_indices: list[int] = []
+        parsed_records: list[dict[str, Any] | None] = [None] * num_critiques
+        continuation_specs: list[tuple[int, int]] = []
+        processing_errors: list[str] = []
         num_preempted = 0
         for index, raw_output in enumerate(critique_results):
-            if not isinstance(raw_output, TokenOutput):
-                raise TypeError(f"critique[{index}] returned unexpected type {type(raw_output)!r}")
-            num_preempted += int(raw_output.num_preempted or 0)
-            critique_ids, critique_log_probs = self._validated_output(
-                raw_output,
-                cap=critique_cap,
-                kind=f"critique[{index}]",
-            )
-            parsed = parse_branch_revision(
-                solution_ids,
-                critique_ids,
-                self.tokenizer,
-                branch_max_tokens=self.feature.branch_max_tokens,
-                new_continuation_max_tokens=self.feature.new_continuation_max_tokens,
-            )
-            parse_reason = parsed.reason
-            branch_prefix_ids = list(parsed.branch_prefix_ids)
-            new_continuation_ids = list(parsed.new_continuation_ids)
-            revised_prefix_ids = list(parsed.revised_prefix_ids)
-            continuation_max_tokens = 0
-            if parsed.valid:
-                continuation_max_tokens = min(
-                    self.response_length - len(revised_prefix_ids),
-                    self.max_model_len - len(prompt_ids) - len(revised_prefix_ids),
+            try:
+                if not isinstance(raw_output, TokenOutput):
+                    raise TypeError(f"critique[{index}] returned unexpected type {type(raw_output)!r}")
+                num_preempted += int(raw_output.num_preempted or 0)
+                critique_ids, critique_log_probs = self._validated_output(
+                    raw_output,
+                    cap=critique_cap,
+                    kind=f"critique[{index}]",
                 )
-                if continuation_max_tokens < self.feature.min_continuation_tokens:
-                    parse_reason = "insufficient_continuation_budget"
-                    branch_prefix_ids = []
-                    new_continuation_ids = []
-                    revised_prefix_ids = []
-                    continuation_max_tokens = 0
-            parsed_records.append(
-                {
+                parsed = parse_branch_revision(
+                    solution_ids,
+                    critique_ids,
+                    self.tokenizer,
+                    branch_max_tokens=self.feature.branch_max_tokens,
+                    new_continuation_max_tokens=self.feature.new_continuation_max_tokens,
+                )
+                parse_reason = parsed.reason
+                branch_prefix_ids = list(parsed.branch_prefix_ids)
+                new_continuation_ids = list(parsed.new_continuation_ids)
+                revised_prefix_ids = list(parsed.revised_prefix_ids)
+                continuation_max_tokens = 0
+                if parsed.valid:
+                    continuation_max_tokens = min(
+                        self.response_length - len(revised_prefix_ids),
+                        self.max_model_len - len(prompt_ids) - len(revised_prefix_ids),
+                    )
+                    if continuation_max_tokens < self.feature.min_continuation_tokens:
+                        parse_reason = "insufficient_continuation_budget"
+                        branch_prefix_ids = []
+                        new_continuation_ids = []
+                        revised_prefix_ids = []
+                        continuation_max_tokens = 0
+                parsed_records[index] = {
                     "token_ids": critique_ids,
                     "log_probs": critique_log_probs,
                     "finish_reason": self._finish_reason(raw_output),
@@ -284,53 +318,54 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                     "revised_prefix_ids": revised_prefix_ids,
                     "continuation_max_tokens": continuation_max_tokens,
                 }
+                if parse_reason == "valid":
+                    if continuation_max_tokens < self.feature.min_continuation_tokens:
+                        raise RuntimeError("valid branch revision unexpectedly lacks its minimum continuation capacity")
+                    continuation_specs.append((index, continuation_max_tokens))
+            except Exception as error:
+                processing_errors.append(f"critique[{index}]: {error!r}")
+        if processing_errors:
+            raise RuntimeError(
+                "branch-revision critique validation failed before continuation launch: " + "; ".join(processing_errors)
             )
-            if parse_reason != "valid":
-                continue
-            max_tokens = continuation_max_tokens
-            if max_tokens < self.feature.min_continuation_tokens:
-                raise RuntimeError("valid branch revision unexpectedly lacks its minimum continuation capacity")
-            continuation_tasks.append(
-                asyncio.create_task(
-                    self._generate(
-                        f"{rollout_id}:continuation:{index}",
-                        [*prompt_ids, *revised_prefix_ids],
-                        sampling_params,
-                        max_tokens=max_tokens,
-                        kind=f"continuation[{index}]",
-                        prompt_logprob_start=len(prompt_ids) + len(branch_prefix_ids),
-                    )
+        if any(record is None for record in parsed_records):
+            raise RuntimeError("branch-revision critique validation did not produce every parsed record")
+        complete_records = [record for record in parsed_records if record is not None]
+
+        continuation_indices = [index for index, _ in continuation_specs]
+        continuation_tasks = [
+            asyncio.create_task(
+                self._generate(
+                    f"{rollout_id}:continuation:{index}",
+                    [*prompt_ids, *complete_records[index]["revised_prefix_ids"]],
+                    sampling_params,
+                    max_tokens=max_tokens,
+                    kind=f"continuation[{index}]",
+                    prompt_logprob_start=len(prompt_ids) + len(complete_records[index]["branch_prefix_ids"]),
                 )
             )
-            continuation_indices.append(index)
-
-        continuation_results = (
-            await asyncio.gather(*continuation_tasks, return_exceptions=True) if continuation_tasks else []
-        )
-        continuation_errors = [
-            f"continuation[{index}]: {result!r}"
-            for index, result in zip(continuation_indices, continuation_results, strict=True)
-            if isinstance(result, BaseException)
+            for index, max_tokens in continuation_specs
         ]
-        if continuation_errors:
-            raise RuntimeError(
-                "branch-revision continuation generation failed after draining every request: "
-                + "; ".join(continuation_errors)
-            )
+
+        continuation_results = await _gather_and_drain(
+            continuation_tasks,
+            phase="continuation",
+            indices=continuation_indices,
+        )
         for index, raw_output in zip(continuation_indices, continuation_results, strict=True):
             if not isinstance(raw_output, TokenOutput):
                 raise TypeError(f"continuation[{index}] returned unexpected type {type(raw_output)!r}")
             num_preempted += int(raw_output.num_preempted or 0)
-            max_tokens = self.response_length - len(parsed_records[index]["revised_prefix_ids"])
+            max_tokens = self.response_length - len(complete_records[index]["revised_prefix_ids"])
             continuation_ids, continuation_log_probs = self._validated_output(
                 raw_output,
-                cap=min(max_tokens, int(parsed_records[index]["continuation_max_tokens"])),
+                cap=min(max_tokens, int(complete_records[index]["continuation_max_tokens"])),
                 kind=f"continuation[{index}]",
             )
-            expected_seed_ids = [int(token) for token in parsed_records[index]["new_continuation_ids"]]
+            expected_seed_ids = [int(token) for token in complete_records[index]["new_continuation_ids"]]
             prompt_seed_ids = raw_output.prompt_log_prob_token_ids
             prompt_seed_log_probs = raw_output.prompt_log_probs
-            expected_start = len(prompt_ids) + len(parsed_records[index]["branch_prefix_ids"])
+            expected_start = len(prompt_ids) + len(complete_records[index]["branch_prefix_ids"])
             if raw_output.prompt_log_prob_start != expected_start:
                 raise RuntimeError(
                     f"continuation[{index}] prompt log-probability slice starts at "
@@ -348,11 +383,14 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 raise RuntimeError(
                     f"continuation[{index}] replacement token unexpectedly lacks a prompt log probability"
                 )
-            parsed_records[index]["continuation_ids"] = continuation_ids
-            parsed_records[index]["continuation_log_probs"] = continuation_log_probs
-            parsed_records[index]["continuation_finish_reason"] = self._finish_reason(raw_output)
-            parsed_records[index]["new_continuation_log_probs"] = [
-                float(value) for value in prompt_seed_log_probs if value is not None
+            normalized_seed_log_probs = normalize_log_probs_float32(
+                value for value in prompt_seed_log_probs if value is not None
+            )
+            complete_records[index]["continuation_ids"] = continuation_ids
+            complete_records[index]["continuation_log_probs"] = continuation_log_probs
+            complete_records[index]["continuation_finish_reason"] = self._finish_reason(raw_output)
+            complete_records[index]["new_continuation_log_probs"] = [
+                float(value) for value in normalized_seed_log_probs.tolist()
             ]
 
         critiques = tuple(
@@ -372,7 +410,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 continuation_finish_reason=record.get("continuation_finish_reason"),
                 continuation_max_tokens=int(record["continuation_max_tokens"]),
             )
-            for record in parsed_records
+            for record in complete_records
         )
         record = BranchRevisionGenerationRecord(
             rollout_id=rollout_id,

@@ -15,9 +15,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
+import socket
+import uuid
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any
@@ -38,8 +41,11 @@ from verl.trainer.config import BranchRevisionGRPOConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.branch_revision_grpo import (
     LearnabilityScore,
+    aggregate_log_probs,
     build_learnability_reference,
     build_rollout_logprob_prefixes,
+    encode_followup_user_turn,
+    normalize_log_probs_float32,
     score_seed_learnability,
     strip_terminal_eos,
     validate_binary_reward_row,
@@ -49,6 +55,8 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.metric import reduce_metrics
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import marked_timer
+
+_AUDIT_SCHEMA_VERSION = 2
 
 
 def _add_exception_note(error: BaseException, note: str) -> None:
@@ -69,6 +77,15 @@ def _is_moe_model(model_config) -> bool:
         if isinstance(value, int) and value > 1:
             return True
     return getattr(model_config, "moe_intermediate_size", None) is not None
+
+
+def _canonical_sha256(values: Any, *, dtype: str) -> str:
+    array = np.asarray(values, dtype=np.dtype(dtype))
+    return hashlib.sha256(array.tobytes(order="C")).hexdigest()
+
+
+def _float32_list(values: Any) -> list[float]:
+    return [float(value) for value in normalize_log_probs_float32(values).tolist()]
 
 
 def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_model_path: str | None = None) -> None:
@@ -169,6 +186,40 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
     if actor_tokenizer is not None:
         if not callable(getattr(actor_tokenizer, "apply_chat_template", None)):
             raise ValueError("branch-revision GRPO requires an actor tokenizer chat template")
+        raw_template_kwargs = OmegaConf.select(config, "data.train_apply_chat_template_kwargs", default=None)
+        if raw_template_kwargs is None:
+            raw_template_kwargs = OmegaConf.select(config, "data.apply_chat_template_kwargs", default=None)
+        if OmegaConf.is_config(raw_template_kwargs):
+            template_kwargs = OmegaConf.to_container(raw_template_kwargs, resolve=True)
+        else:
+            template_kwargs = raw_template_kwargs
+        if template_kwargs is not None and not isinstance(template_kwargs, dict):
+            raise ValueError("branch-revision training chat-template kwargs must be a mapping or null")
+        instructions = [("recovery", feature.critique_prompt)]
+        if feature.enable_positive_compression:
+            instructions.append(("compression", feature.positive_critique_prompt))
+        critique_cap = int(feature.critique_max_response_length or config.data.max_response_length)
+        for objective, instruction in instructions:
+            followup_tokens = len(
+                encode_followup_user_turn(
+                    instruction,
+                    actor_tokenizer,
+                    chat_template_kwargs=template_kwargs,
+                )
+            )
+            components = {
+                "max_prompt": int(config.data.max_prompt_length),
+                "max_response": int(config.data.max_response_length),
+                "followup": followup_tokens,
+                "critique_cap": critique_cap,
+            }
+            required = sum(components.values())
+            if required > int(rollout.max_model_len):
+                rendered = ", ".join(f"{name}={value}" for name, value in components.items())
+                raise ValueError(
+                    f"branch-revision {objective} critique exceeds rollout.max_model_len: "
+                    f"{rendered}, required={required}, limit={int(rollout.max_model_len)}"
+                )
     if actor_model_path is not None:
         actor_hf_config = AutoConfig.from_pretrained(
             actor_model_path,
@@ -208,6 +259,7 @@ class _Bundle:
 
 @dataclass(frozen=True)
 class _ActorRow:
+    audit_row_id: str
     full_ids: list[int]
     train_start: int
     behavior_log_probs: list[float]
@@ -233,11 +285,13 @@ class BranchRevisionGRPOController:
             raise ValueError("branch-revision GRPO currently supports only text-only models and datasets")
         if trainer.reward_fn is None:
             raise ValueError("branch-revision GRPO requires a synchronous environment reward function")
+        self.audit_root = None
         self.audit_dir = None
+        self.audit_attempt_id = None
         self._initialized_audit_steps: set[int] = set()
         if self.feature.audit_output_dir:
-            self.audit_dir = os.path.abspath(os.path.expanduser(self.feature.audit_output_dir))
-            os.makedirs(self.audit_dir, exist_ok=True)
+            self.audit_root = os.path.abspath(os.path.expanduser(self.feature.audit_output_dir))
+            os.makedirs(self.audit_root, exist_ok=True)
 
     def _encode(self, text: str) -> list[int]:
         result = [int(token) for token in self.tokenizer.encode(text, add_special_tokens=False)]
@@ -245,16 +299,44 @@ class BranchRevisionGRPOController:
             raise ValueError(f"branch-revision boundary tokenized empty: {text!r}")
         return result
 
-    def _audit(self, event: str, **payload: object) -> None:
-        if self.audit_dir is None:
+    def _ensure_audit_attempt(self) -> None:
+        if self.audit_root is None or self.audit_dir is not None:
             return
+        self.audit_attempt_id = uuid.uuid4().hex
+        self.audit_dir = os.path.join(self.audit_root, f"attempt_{self.audit_attempt_id}")
+        os.mkdir(self.audit_dir)
+        resolved_config = OmegaConf.to_container(self.config, resolve=True)
+        config_json = json.dumps(resolved_config, sort_keys=True, default=str, ensure_ascii=False)
+        metadata = {
+            "schema_version": _AUDIT_SCHEMA_VERSION,
+            "attempt_id": self.audit_attempt_id,
+            "starting_global_step": int(self.trainer.global_steps),
+            "resolved_config_sha256": hashlib.sha256(config_json.encode("utf-8")).hexdigest(),
+            "hostname": socket.gethostname(),
+            "pid": os.getpid(),
+        }
+        with open(os.path.join(self.audit_dir, "attempt.json"), "x", encoding="utf-8") as handle:
+            handle.write(json.dumps(metadata, sort_keys=True, ensure_ascii=False) + "\n")
+
+    def _audit(self, event: str, **payload: object) -> None:
+        if self.audit_root is None:
+            return
+        self._ensure_audit_attempt()
+        if self.audit_dir is None or self.audit_attempt_id is None:
+            raise RuntimeError("branch-revision audit attempt initialization failed")
         step = int(self.trainer.global_steps)
         path = os.path.join(self.audit_dir, f"step_{step:08d}.jsonl")
         if step not in self._initialized_audit_steps:
             with open(path, "x", encoding="utf-8") as handle:
                 handle.write("")
             self._initialized_audit_steps.add(step)
-        record = {"event": event, "global_step": step, **payload}
+        record = {
+            "schema_version": _AUDIT_SCHEMA_VERSION,
+            "attempt_id": self.audit_attempt_id,
+            "event": event,
+            "global_step": step,
+            **payload,
+        }
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True, default=str, ensure_ascii=False) + "\n")
 
@@ -339,6 +421,21 @@ class BranchRevisionGRPOController:
             )
         return bundles
 
+    def _audit_originals(self, bundles: list[_Bundle]) -> None:
+        for bundle in bundles:
+            editable_length = len(strip_terminal_eos(bundle.solution_ids, self.tokenizer))
+            self._audit(
+                "original",
+                rollout_id=bundle.rollout_id,
+                prompt_group_id=bundle.prompt_group_id,
+                source_row=bundle.source_row,
+                prompt_ids=bundle.prompt_ids,
+                solution_ids=bundle.solution_ids,
+                solution_log_probs=_float32_list(bundle.solution_log_probs),
+                editable_solution_length=editable_length,
+                reward=bundle.original_reward,
+            )
+
     def _make_child_request(self, source: DataProto, bundles: list[_Bundle]) -> DataProto | None:
         selected = [
             bundle
@@ -418,6 +515,7 @@ class BranchRevisionGRPOController:
             return value
         if not isinstance(value, dict):
             raise TypeError(f"invalid branch-revision critique record {type(value)!r}")
+        seed_log_probs = value.get("new_continuation_log_probs", ())
         return BranchRevisionCritiqueGeneration(
             token_ids=tuple(int(token) for token in value["token_ids"]),
             log_probs=tuple(float(item) for item in value["log_probs"]),
@@ -427,9 +525,7 @@ class BranchRevisionGRPOController:
             new_continuation_text=str(value.get("new_continuation_text", "")),
             branch_prefix_ids=tuple(int(token) for token in value.get("branch_prefix_ids", ())),
             new_continuation_ids=tuple(int(token) for token in value.get("new_continuation_ids", ())),
-            new_continuation_log_probs=tuple(
-                float(item) for item in value.get("new_continuation_log_probs", ())
-            ),
+            new_continuation_log_probs=tuple(_float32_list(seed_log_probs)) if seed_log_probs else (),
             revised_prefix_ids=tuple(int(token) for token in value.get("revised_prefix_ids", ())),
             continuation_ids=tuple(int(token) for token in value.get("continuation_ids", ())),
             continuation_log_probs=tuple(float(item) for item in value.get("continuation_log_probs", ())),
@@ -519,7 +615,8 @@ class BranchRevisionGRPOController:
             [bundle.rollout_id for bundle in bundles],
             editable_log_probs,
         )
-        references: dict[int, Any] = {}
+        statistic = self.feature.learnability_logprob_statistic
+        references: dict[tuple[str, int], Any] = {}
         for bundle in bundles:
             if bundle.record is None:
                 continue
@@ -534,24 +631,53 @@ class BranchRevisionGRPOController:
                 ):
                     raise RuntimeError("valid branch revision has inconsistent branch/replacement token boundaries")
                 seed_length = len(critique.new_continuation_ids)
-                seed_values = critique.new_continuation_log_probs
+                seed_values = _float32_list(critique.new_continuation_log_probs)
                 if len(seed_values) != seed_length:
                     raise RuntimeError(
                         "valid branch revision does not have one vLLM prompt log probability per replacement token"
                     )
                 if not all(math.isfinite(value) for value in seed_values):
                     raise RuntimeError("vLLM returned non-finite replacement-seed prompt log probabilities")
-                reference = references.get(seed_length)
+                reference_key = (statistic, seed_length)
+                reference = references.get(reference_key)
                 if reference is None:
                     reference = build_learnability_reference(
                         prefixes,
                         window_size=seed_length,
                         windows_per_rollout=self.feature.learnability_windows_per_rollout,
                         seed=int(self.trainer.global_steps),
+                        logprob_statistic=statistic,
                     )
-                    references[seed_length] = reference
+                    references[reference_key] = reference
+                    starts = reference.window_starts.detach().cpu().tolist()
+                    scores = reference.window_scores.detach().cpu().tolist()
+                    weights = reference.window_weights.detach().cpu().tolist()
+                    self._audit(
+                        "learnability_reference",
+                        reference_key=f"{statistic}:{seed_length}",
+                        logprob_statistic=statistic,
+                        seed_tokens=seed_length,
+                        eligible_rollouts=reference.eligible_rollouts,
+                        sampled_windows=reference.sampled_windows,
+                        windows=[
+                            {
+                                "rollout_id": rollout_id,
+                                "start": int(start),
+                                "score": float(score_value),
+                                "weight": float(weight),
+                            }
+                            for rollout_id, start, score_value, weight in zip(
+                                reference.window_rollout_ids,
+                                starts,
+                                scores,
+                                weights,
+                                strict=True,
+                            )
+                        ],
+                    )
+                seed_score = aggregate_log_probs(seed_values, statistic=statistic)
                 score = score_seed_learnability(
-                    math.fsum(seed_values) / seed_length,
+                    seed_score,
                     reference,
                     minimum_percentile=self.feature.min_seed_window_percentile,
                     full_credit_percentile=self.feature.full_credit_seed_window_percentile,
@@ -560,11 +686,21 @@ class BranchRevisionGRPOController:
                 self._audit(
                     "learnability",
                     score_source="vllm_prompt_logprobs",
+                    reference_key=f"{statistic}:{seed_length}",
                     rollout_id=bundle.rollout_id,
                     objective=bundle.record.objective,
                     critique_index=critique_index,
                     seed_tokens=seed_length,
-                    seed_mean_log_prob=score.seed_mean_log_prob,
+                    logprob_statistic=score.logprob_statistic,
+                    seed_score=score.seed_score,
+                    scoring_prompt_ids=[
+                        *bundle.prompt_ids,
+                        *critique.branch_prefix_ids,
+                        *critique.new_continuation_ids,
+                    ],
+                    prompt_logprob_start=len(bundle.prompt_ids) + len(critique.branch_prefix_ids),
+                    scored_token_ids=list(critique.new_continuation_ids),
+                    scored_token_log_probs=seed_values,
                     percentile=score.percentile,
                     reward_weight=score.reward_weight,
                     accepted=score.accepted,
@@ -685,6 +821,7 @@ class BranchRevisionGRPOController:
                 bundle.compression_credits[critique_index] = compression_credit
             self._audit(
                 "continuation",
+                actor_row_id=f"continuation:{bundle.rollout_id}:{critique_index}",
                 rollout_id=bundle.rollout_id,
                 objective=bundle.record.objective,
                 critique_index=critique_index,
@@ -693,7 +830,7 @@ class BranchRevisionGRPOController:
                 compression_credit=bundle.compression_credits.get(critique_index),
                 revised_prefix_ids=list(critique.revised_prefix_ids),
                 continuation_ids=list(critique.continuation_ids),
-                continuation_log_probs=list(critique.continuation_log_probs),
+                continuation_log_probs=_float32_list(critique.continuation_log_probs),
                 continuation_max_tokens=critique.continuation_max_tokens,
                 finish_reason=critique.continuation_finish_reason,
             )
@@ -715,6 +852,7 @@ class BranchRevisionGRPOController:
             solution_group = f"solution:{bundle.prompt_group_id}"
             rows.append(
                 _ActorRow(
+                    audit_row_id=f"original:{bundle.rollout_id}",
                     full_ids=[*bundle.prompt_ids, *bundle.solution_ids],
                     train_start=len(bundle.prompt_ids),
                     behavior_log_probs=bundle.solution_log_probs,
@@ -742,6 +880,7 @@ class BranchRevisionGRPOController:
                     raise RuntimeError(f"unknown branch-revision objective {bundle.record.objective!r}")
                 rows.append(
                     _ActorRow(
+                        audit_row_id=f"critique:{bundle.rollout_id}:{critique_index}",
                         full_ids=[*critique_prompt, *critique.token_ids],
                         train_start=len(critique_prompt),
                         behavior_log_probs=list(critique.log_probs),
@@ -753,6 +892,7 @@ class BranchRevisionGRPOController:
                 if critique.valid and accepted:
                     rows.append(
                         _ActorRow(
+                            audit_row_id=f"continuation:{bundle.rollout_id}:{critique_index}",
                             full_ids=[*bundle.prompt_ids, *critique.revised_prefix_ids, *critique.continuation_ids],
                             train_start=len(bundle.prompt_ids) + len(critique.revised_prefix_ids),
                             behavior_log_probs=list(critique.continuation_log_probs),
@@ -763,6 +903,8 @@ class BranchRevisionGRPOController:
                     )
                 self._audit(
                     "critique",
+                    actor_row_id=f"critique:{bundle.rollout_id}:{critique_index}",
+                    continuation_actor_row_id=f"continuation:{bundle.rollout_id}:{critique_index}",
                     rollout_id=bundle.rollout_id,
                     prompt_group_id=bundle.prompt_group_id,
                     objective=bundle.record.objective,
@@ -777,12 +919,23 @@ class BranchRevisionGRPOController:
                     compression_fraction=bundle.compression_fractions.get(critique_index),
                     compression_credit=bundle.compression_credits.get(critique_index),
                     generated_continuation_tokens=len(critique.continuation_ids),
+                    continuation_reward_evaluated=critique_index in bundle.continuation_rewards,
                     continuation_wasted_by_learnability=bool(critique.valid and not accepted),
                     parse_reason=critique.parse_reason,
                     branch=critique.branch_text,
                     new_continuation=critique.new_continuation_text,
+                    branch_prefix_ids=list(critique.branch_prefix_ids),
+                    new_continuation_ids=list(critique.new_continuation_ids),
+                    new_continuation_log_probs=_float32_list(critique.new_continuation_log_probs)
+                    if critique.new_continuation_log_probs
+                    else [],
+                    revised_prefix_ids=list(critique.revised_prefix_ids),
+                    generated_continuation_ids=list(critique.continuation_ids),
+                    generated_continuation_log_probs=_float32_list(critique.continuation_log_probs)
+                    if critique.continuation_log_probs
+                    else [],
                     critique_ids=list(critique.token_ids),
-                    critique_log_probs=list(critique.log_probs),
+                    critique_log_probs=_float32_list(critique.log_probs),
                     critique_prompt_ids=critique_prompt,
                     finish_reason=critique.finish_reason,
                 )
@@ -811,6 +964,7 @@ class BranchRevisionGRPOController:
         token_level_rewards = torch.zeros_like(old_log_probs)
         group_ids: list[str] = []
         kinds: list[str] = []
+        audit_row_ids: list[str] = []
         scalar_rewards: list[float] = []
         for row_index, row in enumerate(rows):
             behavior = row.behavior_log_probs
@@ -830,12 +984,14 @@ class BranchRevisionGRPOController:
             token_level_rewards[row_index, stop - 1] = row.reward
             group_ids.append(row.group_id)
             kinds.append(row.kind)
+            audit_row_ids.append(row.audit_row_id)
             scalar_rewards.append(row.reward)
         for padding_index in range(padding_rows):
             row_index = len(rows) + padding_index
             attention_mask[row_index, 0] = 1
             group_ids.append(f"padding:{padding_index}")
             kinds.append("padding")
+            audit_row_ids.append(f"padding:{padding_index}")
             scalar_rewards.append(0.0)
 
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
@@ -863,6 +1019,7 @@ class BranchRevisionGRPOController:
             non_tensors={
                 "uid": np.array(group_ids, dtype=object),
                 "branch_revision_actor_kind": np.array(kinds, dtype=object),
+                "branch_revision_audit_row_id": np.array(audit_row_ids, dtype=object),
                 "branch_revision_reward": np.array(scalar_rewards, dtype=np.float32),
             },
         )
@@ -873,21 +1030,60 @@ class BranchRevisionGRPOController:
                 "use_global_loss_normalization": True,
             }
         )
+        return actor_batch, padding_rows
+
+    def _audit_actor_batch(self, actor_batch: DataProto, *, padding_rows: int) -> None:
+        kinds = actor_batch.non_tensor_batch["branch_revision_actor_kind"]
+        group_ids = actor_batch.non_tensor_batch["uid"]
+        audit_row_ids = actor_batch.non_tensor_batch["branch_revision_audit_row_id"]
+        scalar_rewards = actor_batch.non_tensor_batch["branch_revision_reward"]
+        if len(set(str(value) for value in audit_row_ids)) != len(actor_batch):
+            raise RuntimeError("branch-revision actor audit row IDs must be unique after balancing")
+        actor_rows: list[dict[str, Any]] = []
+        for row_index in range(len(actor_batch)):
+            attention_mask = actor_batch.batch["attention_mask"][row_index].bool()
+            input_ids = actor_batch.batch["input_ids"][row_index][attention_mask].detach().cpu().tolist()
+            response_mask = actor_batch.batch["response_mask"][row_index].to(dtype=torch.uint8)
+            trained = response_mask.bool()
+            trained_positions = trained.nonzero(as_tuple=False).flatten()
+            train_start = int(trained_positions[0].item() + 1) if trained_positions.numel() else None
+            train_stop = int(trained_positions[-1].item() + 2) if trained_positions.numel() else None
+            old_log_probs = actor_batch.batch["old_log_probs"][row_index][trained]
+            rollout_log_probs = actor_batch.batch["rollout_log_probs"][row_index][trained]
+            actor_rows.append(
+                {
+                    "balanced_row_index": row_index,
+                    "actor_row_id": str(audit_row_ids[row_index]),
+                    "kind": str(kinds[row_index]),
+                    "group_id": str(group_ids[row_index]),
+                    "reward": float(scalar_rewards[row_index]),
+                    "sequence_length": len(input_ids),
+                    "response_width": int(response_mask.numel()),
+                    "train_start": train_start,
+                    "train_stop": train_stop,
+                    "input_ids_sha256": _canonical_sha256(input_ids, dtype="<i8"),
+                    "response_mask_sha256": _canonical_sha256(response_mask.detach().cpu().tolist(), dtype="u1"),
+                    "old_log_probs_sha256": _canonical_sha256(old_log_probs.detach().cpu().tolist(), dtype="<f4"),
+                    "rollout_log_probs_sha256": _canonical_sha256(
+                        rollout_log_probs.detach().cpu().tolist(), dtype="<f4"
+                    ),
+                }
+            )
         self._audit(
             "actor_batch",
-            rows=len(rows),
-            original=sum(row.kind == "original" for row in rows),
-            critiques=sum(row.kind == "critique" for row in rows),
-            continuations=sum(row.kind == "continuation" for row in rows),
+            rows=len(actor_batch) - padding_rows,
+            original=int(np.sum(kinds == "original")),
+            critiques=int(np.sum(kinds == "critique")),
+            continuations=int(np.sum(kinds == "continuation")),
             padding=padding_rows,
+            pad_token_id=self._pad_token_id(),
             policy_loss_mode=str(self.config.actor_rollout_ref.actor.policy_loss.loss_mode),
             clip_ratio=float(self.config.actor_rollout_ref.actor.clip_ratio),
             clip_ratio_low=self.config.actor_rollout_ref.actor.clip_ratio_low,
             clip_ratio_high=self.config.actor_rollout_ref.actor.clip_ratio_high,
             clip_ratio_c=float(self.config.actor_rollout_ref.actor.clip_ratio_c),
-            actor_rows=[{"kind": row.kind, "group_id": row.group_id, "reward": row.reward} for row in rows],
+            actor_rows=actor_rows,
         )
-        return actor_batch, padding_rows
 
     @staticmethod
     def _set_source_metric_advantages(
@@ -929,6 +1125,9 @@ class BranchRevisionGRPOController:
         valid_count = sum(critique.valid for critique in critiques)
         accepted_count = sum(score.accepted for bundle in selected for score in bundle.learnability.values())
         incorrect_accepted = sum(score.accepted for bundle in incorrect for score in bundle.learnability.values())
+        incorrect_valid = sum(
+            critique.valid for bundle in incorrect if bundle.record is not None for critique in bundle.record.critiques
+        )
         successes = sum(sum(bundle.continuation_rewards.values()) for bundle in incorrect)
         incorrect_any = sum(any(value == 1.0 for value in bundle.continuation_rewards.values()) for bundle in incorrect)
         prompts_with_incorrect = {bundle.prompt_group_id for bundle in incorrect}
@@ -965,6 +1164,9 @@ class BranchRevisionGRPOController:
             ),
             "branch_revision/flip/success_per_valid_continuation": (
                 float(successes / incorrect_accepted) if incorrect_accepted else 0.0
+            ),
+            "branch_revision/flip/success_per_continuation": (
+                float(successes / incorrect_valid) if incorrect_valid else 0.0
             ),
             "branch_revision/flip/incorrect_originals_with_any_success": (
                 float(incorrect_any / len(incorrect)) if incorrect else 0.0
@@ -1033,6 +1235,7 @@ class BranchRevisionGRPOController:
     ) -> bool:
         rewards = self._original_rewards(reward_tensor)
         bundles = self._build_bundles(source, rewards)
+        self._audit_originals(bundles)
         request = self._make_child_request(source, bundles)
         if request is not None:
             with marked_timer("branch_revision_children", timing_raw, color="red"):
@@ -1057,6 +1260,7 @@ class BranchRevisionGRPOController:
                 worker_group=self.trainer.actor_rollout_wg,
                 role="actor",
             )
+        self._audit_actor_batch(actor_batch, padding_rows=padding_rows)
         with marked_timer("update_actor", timing_raw, color="red"):
             actor_output = self.trainer._update_actor(actor_batch)
         metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
@@ -1067,10 +1271,12 @@ class BranchRevisionGRPOController:
             incorrect=sum(bundle.original_reward == 0.0 for bundle in bundles),
             correct=sum(bundle.original_reward == 1.0 for bundle in bundles),
             positive_compression_enabled=self.feature.enable_positive_compression,
+            learnability_logprob_statistic=self.feature.learnability_logprob_statistic,
             original_rewards=rewards,
             prompt_pass_at_1={
                 prompt_group_id: sum(group_rewards) / len(group_rewards)
                 for prompt_group_id, group_rewards in self._prompt_rewards(bundles).items()
             },
         )
+        self._audit("step_complete")
         return True

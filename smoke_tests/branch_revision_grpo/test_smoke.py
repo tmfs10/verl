@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -22,7 +23,7 @@ from omegaconf import OmegaConf
 
 from smoke_tests.branch_revision_grpo.main_ppo_smoke import _validate_contract
 from smoke_tests.branch_revision_grpo.submit_oci_iad import _extra_args, build_command
-from smoke_tests.branch_revision_grpo.verify_smoke import verify
+from smoke_tests.branch_revision_grpo.verify_smoke import _aggregate, _canonical_sha256, verify
 
 
 def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(tmp_path: Path) -> None:
@@ -46,6 +47,7 @@ def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(t
     assert "algorithm.branch_revision_grpo.enable_positive_compression=true" in rendered
     assert "algorithm.branch_revision_grpo.num_positive_critiques=4" in rendered
     assert "algorithm.branch_revision_grpo.min_seed_window_percentile=0.20" in rendered
+    assert "algorithm.branch_revision_grpo.learnability_logprob_statistic=mean" in rendered
     assert "actor_rollout_ref.rollout.n=4" in rendered
     assert "algorithm.branch_revision_grpo.min_continuation_tokens=128" in rendered
     assert "data.max_response_length=2048" in rendered
@@ -103,6 +105,22 @@ def test_rendered_smoke_can_select_native_clipped_ppo(tmp_path: Path) -> None:
     assert "+branch_revision_smoke.loss_mode=vanilla" in rendered
 
 
+def test_rendered_smoke_can_select_minimum_logprob_learnability(tmp_path: Path) -> None:
+    command, _ = build_command(
+        run_tag="minimum",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        learnability_logprob_statistic="min",
+    )
+    rendered = " ".join(command)
+    assert "algorithm.branch_revision_grpo.learnability_logprob_statistic=min" in rendered
+    assert "+branch_revision_smoke.learnability_logprob_statistic=min" in rendered
+
+
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
@@ -113,6 +131,7 @@ def test_rendered_smoke_can_select_native_clipped_ppo(tmp_path: Path) -> None:
         ({"seed": -1}, "nonnegative"),
         ({"model_path": "/hf_models/not-supported"}, "model_path"),
         ({"loss_mode": "not-supported"}, "loss_mode"),
+        ({"learnability_logprob_statistic": "median"}, "learnability_logprob_statistic"),
     ],
 )
 def test_rendered_smoke_rejects_invalid_scale(overrides: dict[str, int | str], match: str, tmp_path: Path) -> None:
@@ -170,6 +189,7 @@ def _scaled_runtime_config(tmp_path: Path):
                     "num_critiques": 6,
                     "enable_positive_compression": True,
                     "num_positive_critiques": 6,
+                    "learnability_logprob_statistic": "mean",
                     "critique_max_response_length": 2560,
                     "min_continuation_tokens": 128,
                     "audit_output_dir": str(tmp_path / "audit"),
@@ -202,6 +222,7 @@ def test_scaled_runtime_contract_accepts_matching_resolved_dimensions(tmp_path: 
             "n_samples": 4,
             "num_critiques": 6,
             "loss_mode": "dppo_tv",
+            "learnability_logprob_statistic": "mean",
         },
     )
 
@@ -218,6 +239,7 @@ def test_scaled_runtime_contract_rejects_stale_fixed_dimension(tmp_path: Path) -
                 "n_samples": 4,
                 "num_critiques": 6,
                 "loss_mode": "dppo_tv",
+                "learnability_logprob_statistic": "mean",
             },
         )
 
@@ -232,8 +254,57 @@ def _write_jsonl(path: Path, rows) -> None:
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
-def _fixture(root: Path, *, include_continuation: bool = True) -> None:
-    _write_json(root / "completed.json", {"status": "completed", "wall_seconds": 2.0})
+def _actor_audit_row(source: dict, *, row_index: int, response_width: int) -> dict:
+    full_ids = [int(token) for token in source["full_ids"]]
+    behavior = [float(value) for value in source["behavior_log_probs"]]
+    train_start = source["train_start"]
+    response_mask = [0] * response_width
+    if train_start is None:
+        train_stop = None
+    else:
+        train_stop = int(train_start) + len(behavior)
+        response_mask[int(train_start) - 1 : train_stop - 1] = [1] * len(behavior)
+    return {
+        "balanced_row_index": row_index,
+        "actor_row_id": source["actor_row_id"],
+        "kind": source["kind"],
+        "group_id": source["group_id"],
+        "reward": source["reward"],
+        "sequence_length": len(full_ids),
+        "response_width": response_width,
+        "train_start": train_start,
+        "train_stop": train_stop,
+        "input_ids_sha256": _canonical_sha256(full_ids, dtype="<i8"),
+        "response_mask_sha256": _canonical_sha256(response_mask, dtype="u1"),
+        "old_log_probs_sha256": _canonical_sha256(behavior, dtype="<f4"),
+        "rollout_log_probs_sha256": _canonical_sha256(behavior, dtype="<f4"),
+    }
+
+
+def _audit_path(root: Path, attempt_id: str = "fixture") -> Path:
+    return root / "audit" / f"attempt_{attempt_id}" / "step_00000001.jsonl"
+
+
+def _refresh_attempt_config_hash(root: Path, attempt_id: str = "fixture") -> None:
+    config = json.loads((root / "resolved_config.json").read_text(encoding="utf-8"))
+    rendered = json.dumps(config, sort_keys=True, default=str, ensure_ascii=False)
+    path = root / "audit" / f"attempt_{attempt_id}" / "attempt.json"
+    attempt = json.loads(path.read_text(encoding="utf-8"))
+    attempt["resolved_config_sha256"] = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+    _write_json(path, attempt)
+
+
+def _fixture(root: Path, *, include_continuation: bool = True, statistic: str = "mean") -> None:
+    attempt_id = "fixture"
+    invocation_id = "invocation"
+    completion = {
+        "status": "completed",
+        "invocation_id": invocation_id,
+        "audit_attempt_id": attempt_id,
+        "wall_seconds": 2.0,
+    }
+    _write_json(root / "status.json", completion)
+    _write_json(root / "completed.json", completion)
     _write_json(
         root / "resolved_config.json",
         {
@@ -243,6 +314,9 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                     "enable_positive_compression": True,
                     "num_positive_critiques": 2,
                     "positive_compression_target": 0.25,
+                    "learnability_logprob_statistic": statistic,
+                    "min_seed_window_percentile": 0.2,
+                    "full_credit_seed_window_percentile": 0.5,
                     "min_continuation_tokens": 128,
                 }
             },
@@ -253,109 +327,239 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
             },
         },
     )
-    events = []
-    original_rewards = [0.0, 1.0, 0.0, 1.0] + [1.0] * 12
-    actor_rows = [
+    resolved_config = json.loads((root / "resolved_config.json").read_text(encoding="utf-8"))
+    resolved_config_json = json.dumps(resolved_config, sort_keys=True, default=str, ensure_ascii=False)
+    attempt_dir = root / "audit" / f"attempt_{attempt_id}"
+    _write_json(
+        attempt_dir / "attempt.json",
         {
-            "kind": "original",
-            "group_id": f"solution:prompt-{index // 2}",
-            "reward": original_rewards[index],
-        }
-        for index in range(16)
-    ]
-    continuation_count = 0
-    structurally_valid_count = 0
+            "schema_version": 2,
+            "attempt_id": attempt_id,
+            "starting_global_step": 1,
+            "resolved_config_sha256": hashlib.sha256(resolved_config_json.encode("utf-8")).hexdigest(),
+            "hostname": "fixture",
+            "pid": 1,
+        },
+    )
+
+    events: list[dict] = []
+    actor_sources: list[dict] = []
+    original_rewards = [0.0, 1.0, 0.0, 1.0] + [1.0] * 12
     prompt_pass_at_1 = {
         "prompt-0": 0.5,
         "prompt-1": 0.5,
         **{f"prompt-{index}": 1.0 for index in range(2, 8)},
     }
+    originals: dict[str, dict] = {}
     for original_index, original_reward in enumerate(original_rewards):
-        rollout = f"p:{original_index}"
+        rollout_id = f"p:{original_index}"
         prompt_group_id = f"prompt-{original_index // 2}"
+        prompt_ids = [10, original_index // 2]
+        solution_ids = [100 + original_index, 200 + original_index]
+        solution_log_probs = [-0.5, -0.5]
+        original = {
+            "event": "original",
+            "rollout_id": rollout_id,
+            "prompt_group_id": prompt_group_id,
+            "source_row": original_index,
+            "prompt_ids": prompt_ids,
+            "solution_ids": solution_ids,
+            "solution_log_probs": solution_log_probs,
+            "editable_solution_length": 2,
+            "reward": original_reward,
+        }
+        originals[rollout_id] = original
+        events.append(original)
+        actor_sources.append(
+            {
+                "actor_row_id": f"original:{rollout_id}",
+                "kind": "original",
+                "group_id": f"solution:{prompt_group_id}",
+                "reward": original_reward,
+                "full_ids": [*prompt_ids, *solution_ids],
+                "train_start": len(prompt_ids),
+                "behavior_log_probs": solution_log_probs,
+            }
+        )
+
+    if include_continuation:
+        reference_windows = [
+            {
+                "rollout_id": rollout_id,
+                "start": 0,
+                "score": _aggregate(original["solution_log_probs"], statistic),
+                "weight": 1.0 / len(originals),
+            }
+            for rollout_id, original in originals.items()
+        ]
+        events.append(
+            {
+                "event": "learnability_reference",
+                "reference_key": f"{statistic}:2",
+                "logprob_statistic": statistic,
+                "seed_tokens": 2,
+                "eligible_rollouts": len(originals),
+                "sampled_windows": len(reference_windows),
+                "windows": reference_windows,
+            }
+        )
+
+    continuation_count = 0
+    structurally_valid_count = 0
+    valid_recovery_count = 0
+    accepted_recovery_count = 0
+    successful_recoveries = 0.0
+    for original_index, original_reward in enumerate(original_rewards):
+        rollout_id = f"p:{original_index}"
+        original = originals[rollout_id]
+        prompt_group_id = original["prompt_group_id"]
         objective = "recovery" if original_reward == 0.0 else "compression"
         baseline = prompt_pass_at_1[prompt_group_id]
+        critique_prompt_ids = [*original["prompt_ids"], *original["solution_ids"], 999]
         for critique_index in range(2):
-            valid = include_continuation and original_index in {0, 1} and critique_index == 0
+            valid = include_continuation and (
+                (original_index == 0 and critique_index in {0, 1}) or (original_index == 1 and critique_index == 0)
+            )
+            accepted = valid and critique_index == 0
+            outcome = 1.0 if accepted else 0.0
+            objective_credit = outcome
+            reward = outcome - baseline if objective == "recovery" else objective_credit
+            critique_ids = [700 + original_index, 800 + critique_index]
+            branch_prefix_ids = [original["solution_ids"][0]] if valid else []
+            replacement_ids = [
+                500 + original_index * 4 + critique_index * 2,
+                501 + original_index * 4 + critique_index * 2,
+            ]
+            replacement_ids = replacement_ids if valid else []
+            replacement_log_probs = ([-0.1, -0.1] if accepted else [-1.0, -1.0]) if valid else []
+            revised_prefix_ids = [*branch_prefix_ids, *replacement_ids] if valid else []
+            generated_ids = [900 + original_index * 2 + critique_index] if valid else []
+            generated_log_probs = [-0.2] if valid else []
             if valid:
                 structurally_valid_count += 1
+                if objective == "recovery":
+                    valid_recovery_count += 1
+                seed_score = _aggregate(replacement_log_probs, statistic)
+                percentile = 1.0 if accepted else 0.0
+                reward_weight = 1.0 if accepted else 0.0
                 events.append(
                     {
                         "event": "learnability",
                         "score_source": "vllm_prompt_logprobs",
-                        "rollout_id": rollout,
+                        "reference_key": f"{statistic}:2",
+                        "rollout_id": rollout_id,
                         "objective": objective,
                         "critique_index": critique_index,
                         "seed_tokens": 2,
-                        "seed_mean_log_prob": -0.1,
-                        "percentile": 1.0,
-                        "reward_weight": 1.0,
-                        "accepted": True,
-                        "eligible_rollouts": 16,
-                        "sampled_windows": 128,
+                        "logprob_statistic": statistic,
+                        "seed_score": seed_score,
+                        "scoring_prompt_ids": [*original["prompt_ids"], *branch_prefix_ids, *replacement_ids],
+                        "prompt_logprob_start": len(original["prompt_ids"]) + len(branch_prefix_ids),
+                        "scored_token_ids": replacement_ids,
+                        "scored_token_log_probs": replacement_log_probs,
+                        "percentile": percentile,
+                        "reward_weight": reward_weight,
+                        "accepted": accepted,
+                        "eligible_rollouts": len(originals),
+                        "sampled_windows": len(originals),
                     }
                 )
-            outcome = 1.0 if valid else 0.0
-            objective_credit = outcome
-            reward = outcome - baseline if objective == "recovery" else objective_credit
-            events.append(
+            compression_fraction = 0.25 if accepted and objective == "compression" else None
+            compression_credit = 1.0 if accepted and objective == "compression" else None
+            critique = {
+                "event": "critique",
+                "actor_row_id": f"critique:{rollout_id}:{critique_index}",
+                "continuation_actor_row_id": f"continuation:{rollout_id}:{critique_index}",
+                "rollout_id": rollout_id,
+                "prompt_group_id": prompt_group_id,
+                "objective": objective,
+                "critique_index": critique_index,
+                "reward": reward,
+                "objective_credit": objective_credit,
+                "continuation_outcome": outcome,
+                "prompt_pass_at_1": baseline,
+                "learnability_accepted": accepted,
+                "learnability_percentile": 1.0 if accepted else 0.0 if valid else None,
+                "learnability_weight": 1.0 if accepted else 0.0,
+                "compression_fraction": compression_fraction,
+                "compression_credit": compression_credit,
+                "generated_continuation_tokens": len(generated_ids),
+                "continuation_reward_evaluated": accepted,
+                "continuation_wasted_by_learnability": valid and not accepted,
+                "parse_reason": "valid" if valid else "tag_count",
+                "branch": "bad" if valid else "",
+                "new_continuation": "good" if valid else "",
+                "branch_prefix_ids": branch_prefix_ids,
+                "new_continuation_ids": replacement_ids,
+                "new_continuation_log_probs": replacement_log_probs,
+                "revised_prefix_ids": revised_prefix_ids,
+                "generated_continuation_ids": generated_ids,
+                "generated_continuation_log_probs": generated_log_probs,
+                "critique_prompt_ids": critique_prompt_ids,
+                "critique_ids": critique_ids,
+                "critique_log_probs": [-0.2, -0.3],
+            }
+            events.append(critique)
+            actor_sources.append(
                 {
-                    "event": "critique",
-                    "rollout_id": rollout,
-                    "prompt_group_id": prompt_group_id,
+                    "actor_row_id": critique["actor_row_id"],
+                    "kind": "critique",
+                    "group_id": f"critique:{rollout_id}",
+                    "reward": reward,
+                    "full_ids": [*critique_prompt_ids, *critique_ids],
+                    "train_start": len(critique_prompt_ids),
+                    "behavior_log_probs": critique["critique_log_probs"],
+                }
+            )
+            if accepted:
+                continuation_count += 1
+                if objective == "recovery":
+                    accepted_recovery_count += 1
+                    successful_recoveries += outcome
+                continuation = {
+                    "event": "continuation",
+                    "actor_row_id": critique["continuation_actor_row_id"],
+                    "rollout_id": rollout_id,
                     "objective": objective,
                     "critique_index": critique_index,
-                    "reward": reward,
-                    "objective_credit": objective_credit,
-                    "continuation_outcome": outcome,
-                    "prompt_pass_at_1": baseline,
-                    "learnability_accepted": valid,
-                    "learnability_percentile": 1.0 if valid else None,
-                    "learnability_weight": 1.0 if valid else 0.0,
-                    "compression_fraction": 0.25 if valid and objective == "compression" else None,
-                    "compression_credit": 1.0 if valid and objective == "compression" else None,
-                    "parse_reason": "valid" if valid else "tag_count",
-                    "branch": "bad" if valid else "",
-                    "new_continuation": "good" if valid else "",
-                    "critique_prompt_ids": [10, 11, original_index],
-                    "critique_ids": [20, critique_index],
-                    "critique_log_probs": [-0.2, -0.3],
+                    "reward": outcome,
+                    "revised_prefix_ids": revised_prefix_ids,
+                    "continuation_ids": generated_ids,
+                    "continuation_log_probs": generated_log_probs,
+                    "continuation_max_tokens": 128,
+                    "compression_fraction": compression_fraction,
+                    "compression_credit": compression_credit,
                 }
-            )
-            actor_rows.append(
-                {
-                    "kind": "critique",
-                    "group_id": f"critique:{rollout}",
-                    "reward": reward,
-                }
-            )
-            if valid:
-                continuation_count += 1
-                events.append(
+                events.append(continuation)
+                actor_sources.append(
                     {
-                        "event": "continuation",
-                        "rollout_id": rollout,
-                        "objective": objective,
-                        "critique_index": critique_index,
-                        "reward": 1.0,
-                        "revised_prefix_ids": [1],
-                        "continuation_ids": [2],
-                        "continuation_log_probs": [-0.2],
-                        "continuation_max_tokens": 128,
-                        "compression_fraction": 0.25 if objective == "compression" else None,
-                        "compression_credit": 1.0 if objective == "compression" else None,
-                    }
-                )
-                actor_rows.append(
-                    {
+                        "actor_row_id": continuation["actor_row_id"],
                         "kind": "continuation",
                         "group_id": f"solution:{prompt_group_id}",
-                        "reward": 1.0,
+                        "reward": outcome,
+                        "full_ids": [*original["prompt_ids"], *revised_prefix_ids, *generated_ids],
+                        "train_start": len(original["prompt_ids"]) + len(revised_prefix_ids),
+                        "behavior_log_probs": generated_log_probs,
                     }
                 )
+
     critique_count = 16 * 2
     rows = 16 + critique_count + continuation_count
     padding = (-rows) % 8
+    actor_sources.extend(
+        {
+            "actor_row_id": f"padding:{index}",
+            "kind": "padding",
+            "group_id": f"padding:{index}",
+            "reward": 0.0,
+            "full_ids": [0],
+            "train_start": None,
+            "behavior_log_probs": [],
+        }
+        for index in range(padding)
+    )
+    response_width = max(len(source["full_ids"]) for source in actor_sources) - 1
+    balanced_sources = list(reversed(actor_sources))
     events.extend(
         [
             {
@@ -365,8 +569,12 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                 "critiques": critique_count,
                 "continuations": continuation_count,
                 "padding": padding,
+                "pad_token_id": 0,
                 "policy_loss_mode": "dppo_tv",
-                "actor_rows": actor_rows,
+                "actor_rows": [
+                    _actor_audit_row(source, row_index=index, response_width=response_width)
+                    for index, source in enumerate(balanced_sources)
+                ],
             },
             {
                 "event": "iteration",
@@ -374,12 +582,15 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                 "incorrect": 2,
                 "correct": 14,
                 "positive_compression_enabled": True,
+                "learnability_logprob_statistic": statistic,
                 "original_rewards": original_rewards,
                 "prompt_pass_at_1": prompt_pass_at_1,
             },
+            {"event": "step_complete"},
         ]
     )
-    _write_jsonl(root / "audit" / "step_00000001.jsonl", events)
+    events = [{"schema_version": 2, "attempt_id": attempt_id, "global_step": 1, **event} for event in events]
+    _write_jsonl(_audit_path(root, attempt_id), events)
     _write_jsonl(
         root / "metrics.jsonl",
         [
@@ -395,6 +606,12 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                     "branch_revision/valid_edits": float(structurally_valid_count),
                     "branch_revision/learnability_accepted_edits": float(continuation_count),
                     "branch_revision/continuations": float(continuation_count),
+                    "branch_revision/flip/success_per_valid_continuation": (
+                        successful_recoveries / accepted_recovery_count if accepted_recovery_count else 0.0
+                    ),
+                    "branch_revision/flip/success_per_continuation": (
+                        successful_recoveries / valid_recovery_count if valid_recovery_count else 0.0
+                    ),
                     "branch_revision/policy_loss_is_dppo_tv": 1.0,
                     "actor/grad_norm": 1.0,
                     "actor/pg_loss": 0.1,
@@ -408,8 +625,15 @@ def test_verifier_accepts_complete_live_contract(tmp_path: Path) -> None:
     _fixture(tmp_path)
     result = verify(tmp_path)
     assert result["status"] == "verified"
-    assert result["valid_edits"] == 2
+    assert result["valid_edits"] == 3
     assert result["successful_compression_credit"] == 1.0
+
+
+def test_verifier_accepts_minimum_logprob_evidence_and_post_balance_reordering(tmp_path: Path) -> None:
+    _fixture(tmp_path, statistic="min")
+    result = verify(tmp_path)
+    assert result["learnability_logprob_statistic"] == "min"
+    assert result["audit_attempt_id"] == "fixture"
 
 
 def test_verifier_accepts_native_clipped_ppo_evidence(tmp_path: Path) -> None:
@@ -418,7 +642,8 @@ def test_verifier_accepts_native_clipped_ppo_evidence(tmp_path: Path) -> None:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config["actor_rollout_ref"]["actor"]["policy_loss"]["loss_mode"] = "vanilla"
     _write_json(config_path, config)
-    audit_path = tmp_path / "audit" / "step_00000001.jsonl"
+    _refresh_attempt_config_hash(tmp_path)
+    audit_path = _audit_path(tmp_path)
     events = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
     next(event for event in events if event["event"] == "actor_batch")["policy_loss_mode"] = "vanilla"
     _write_jsonl(audit_path, events)
@@ -435,6 +660,15 @@ def test_verifier_rejects_smoke_without_a_valid_revision(tmp_path: Path) -> None
         verify(tmp_path)
 
 
+def test_integrity_verifier_accepts_complete_zero_signal_run(tmp_path: Path) -> None:
+    _fixture(tmp_path, include_continuation=False)
+    result = verify(tmp_path, require_algorithm_signal=False)
+    assert result["status"] == "integrity-verified"
+    assert result["algorithm_signal_required"] is False
+    assert result["learnability_accepted_edits"] == 0
+    assert result["successful_revisions"] == 0.0
+
+
 def test_verifier_rejects_zero_signal_optimizer_step(tmp_path: Path) -> None:
     _fixture(tmp_path)
     path = tmp_path / "metrics.jsonl"
@@ -447,19 +681,19 @@ def test_verifier_rejects_zero_signal_optimizer_step(tmp_path: Path) -> None:
 
 def test_verifier_rejects_centered_critique_reward_on_revised_solution_row(tmp_path: Path) -> None:
     _fixture(tmp_path)
-    path = tmp_path / "audit" / "step_00000001.jsonl"
+    path = _audit_path(tmp_path)
     events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     actor_batch = next(event for event in events if event["event"] == "actor_batch")
     continuation = next(row for row in actor_batch["actor_rows"] if row["kind"] == "continuation")
     continuation["reward"] = 0.5
     _write_jsonl(path, events)
-    with pytest.raises(ValueError, match="continuation actor reward"):
+    with pytest.raises(ValueError, match="does not match its source tensors"):
         verify(tmp_path)
 
 
 def test_verifier_rejects_critique_baseline_from_wrong_prompt_group(tmp_path: Path) -> None:
     _fixture(tmp_path)
-    path = tmp_path / "audit" / "step_00000001.jsonl"
+    path = _audit_path(tmp_path)
     events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     critique = next(event for event in events if event["event"] == "critique")
     critique["prompt_group_id"] = "prompt-7"
@@ -470,12 +704,77 @@ def test_verifier_rejects_critique_baseline_from_wrong_prompt_group(tmp_path: Pa
 
 def test_verifier_requires_vllm_prompt_logprobs_for_learnability(tmp_path: Path) -> None:
     _fixture(tmp_path)
-    path = tmp_path / "audit" / "step_00000001.jsonl"
+    path = _audit_path(tmp_path)
     events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     learnability = next(event for event in events if event["event"] == "learnability")
     learnability["score_source"] = "actor_forward"
     _write_jsonl(path, events)
     with pytest.raises(ValueError, match="did not use vLLM prompt log probabilities"):
+        verify(tmp_path)
+
+
+def test_verifier_rejects_corrupted_reference_window_score(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    reference = next(event for event in events if event["event"] == "learnability_reference")
+    reference["windows"][0]["score"] -= 0.25
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="corrupted window score"):
+        verify(tmp_path)
+
+
+def test_verifier_rejects_corrupted_prompt_scoring_slice(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    learnability = next(event for event in events if event["event"] == "learnability")
+    learnability["prompt_logprob_start"] -= 1
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="corrupted prompt-scoring slice"):
+        verify(tmp_path)
+
+
+@pytest.mark.parametrize("field", ["response_mask_sha256", "old_log_probs_sha256", "rollout_log_probs_sha256"])
+def test_verifier_rejects_corrupted_actor_tensor_hash(field: str, tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    actor_batch = next(event for event in events if event["event"] == "actor_batch")
+    next(row for row in actor_batch["actor_rows"] if row["kind"] == "continuation")[field] = "0" * 64
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="does not match its source tensors"):
+        verify(tmp_path)
+
+
+def test_verifier_uses_explicit_completed_attempt_and_preserves_incomplete_prior_attempt(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    prior = tmp_path / "audit" / "attempt_prior"
+    _write_json(
+        prior / "attempt.json",
+        {"schema_version": 2, "attempt_id": "prior", "starting_global_step": 1},
+    )
+    _write_jsonl(
+        prior / "step_00000001.jsonl",
+        [{"schema_version": 2, "attempt_id": "prior", "global_step": 1, "event": "original"}],
+    )
+    _write_json(tmp_path / "failed.json", {"status": "failed", "invocation_id": "older"})
+    assert verify(tmp_path)["audit_attempt_id"] == "fixture"
+
+
+def test_verifier_rejects_missing_attempt_selection_or_step_completion(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    completed = json.loads((tmp_path / "completed.json").read_text(encoding="utf-8"))
+    completed.pop("audit_attempt_id")
+    _write_json(tmp_path / "completed.json", completed)
+    with pytest.raises(ValueError, match="omitted its audit attempt ID"):
+        verify(tmp_path)
+
+    _fixture(tmp_path)
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    _write_jsonl(path, [event for event in events if event["event"] != "step_complete"])
+    with pytest.raises(ValueError, match="audit step is incomplete"):
         verify(tmp_path)
 
 
@@ -486,5 +785,6 @@ def test_extra_args_contains_no_async_or_critic_training() -> None:
     assert "actor_rollout_ref.rollout.temperature=1.0" in rendered
     assert "actor_rollout_ref.rollout.repetition_penalty=1.0" in rendered
     assert "enable_positive_compression=true" in rendered
+    assert "learnability_logprob_statistic=mean" in rendered
     assert "critique_max_response_length=2560" in rendered
     assert "min_continuation_tokens=128" in rendered
