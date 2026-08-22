@@ -312,6 +312,7 @@ class BranchRevisionGRPOController:
             "attempt_id": self.audit_attempt_id,
             "starting_global_step": int(self.trainer.global_steps),
             "resolved_config_sha256": hashlib.sha256(config_json.encode("utf-8")).hexdigest(),
+            "resolved_config": resolved_config,
             "hostname": socket.gethostname(),
             "pid": os.getpid(),
         }

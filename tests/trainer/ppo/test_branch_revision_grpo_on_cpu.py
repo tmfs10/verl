@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -930,6 +931,9 @@ def test_audit_resume_creates_a_new_attempt_without_overwriting_incomplete_evide
     second_attempt = second.audit_attempt_id
 
     assert first_attempt and second_attempt and first_attempt != second_attempt
+    first_metadata = json.loads((audit_root / f"attempt_{first_attempt}" / "attempt.json").read_text())
+    rendered_config = json.dumps(first_metadata["resolved_config"], sort_keys=True, default=str, ensure_ascii=False)
+    assert first_metadata["resolved_config_sha256"] == hashlib.sha256(rendered_config.encode()).hexdigest()
     first_events = (audit_root / f"attempt_{first_attempt}" / "step_00000001.jsonl").read_text(encoding="utf-8")
     second_events = (audit_root / f"attempt_{second_attempt}" / "step_00000001.jsonl").read_text(encoding="utf-8")
     assert '"event": "step_complete"' not in first_events

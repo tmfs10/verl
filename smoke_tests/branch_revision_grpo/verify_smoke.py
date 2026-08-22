@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import math
@@ -84,6 +85,28 @@ def _aggregate(values: Any, statistic: str) -> float:
     raise ValueError(f"unsupported learnability log-probability statistic: {statistic!r}")
 
 
+def _expected_runtime_config(saved_config: dict[str, Any]) -> dict[str, Any]:
+    """Apply the native, deterministic mutations made before the first audit event."""
+
+    expected = copy.deepcopy(saved_config)
+    trainer = expected.get("trainer", {})
+    reward_model = expected.get("reward", {}).get("reward_model")
+    if isinstance(reward_model, dict) and not bool(reward_model.get("enable_resource_pool", False)):
+        if "nnodes" in trainer and "nnodes" in reward_model:
+            reward_model["nnodes"] = trainer["nnodes"]
+        if "n_gpus_per_node" in trainer and "n_gpus_per_node" in reward_model:
+            reward_model["n_gpus_per_node"] = trainer["n_gpus_per_node"]
+    total_training_steps = trainer.get("total_training_steps")
+    if total_training_steps is not None:
+        actor_optim = expected.get("actor_rollout_ref", {}).get("actor", {}).get("optim")
+        if isinstance(actor_optim, dict) and "total_training_steps" in actor_optim:
+            actor_optim["total_training_steps"] = total_training_steps
+        critic_optim = expected.get("critic", {}).get("optim")
+        if isinstance(critic_optim, dict) and "total_training_steps" in critic_optim:
+            critic_optim["total_training_steps"] = total_training_steps
+    return expected
+
+
 def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, Any]:
     root = root.expanduser().resolve()
     status = _read_json(root / "status.json")
@@ -121,8 +144,13 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     attempt = _read_json(attempt_dir / "attempt.json")
     if int(attempt.get("schema_version", -1)) != _AUDIT_SCHEMA_VERSION or attempt.get("attempt_id") != attempt_id:
         raise ValueError("audit attempt metadata has the wrong schema or attempt ID")
-    resolved_config_json = json.dumps(resolved_config, sort_keys=True, default=str, ensure_ascii=False)
-    if attempt.get("resolved_config_sha256") != hashlib.sha256(resolved_config_json.encode("utf-8")).hexdigest():
+    runtime_config = attempt.get("resolved_config")
+    if not isinstance(runtime_config, dict):
+        raise ValueError("audit attempt metadata omitted its exact runtime configuration")
+    runtime_config_json = json.dumps(runtime_config, sort_keys=True, default=str, ensure_ascii=False)
+    if attempt.get("resolved_config_sha256") != hashlib.sha256(runtime_config_json.encode("utf-8")).hexdigest():
+        raise ValueError("audit attempt runtime configuration does not match its recorded hash")
+    if runtime_config != _expected_runtime_config(resolved_config):
         raise ValueError("audit attempt metadata does not match the resolved configuration")
     audit_files = sorted(attempt_dir.glob("step_*.jsonl"))
     if len(audit_files) != 1:

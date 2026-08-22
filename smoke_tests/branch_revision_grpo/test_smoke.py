@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from pathlib import Path
@@ -290,6 +291,7 @@ def _refresh_attempt_config_hash(root: Path, attempt_id: str = "fixture") -> Non
     rendered = json.dumps(config, sort_keys=True, default=str, ensure_ascii=False)
     path = root / "audit" / f"attempt_{attempt_id}" / "attempt.json"
     attempt = json.loads(path.read_text(encoding="utf-8"))
+    attempt["resolved_config"] = config
     attempt["resolved_config_sha256"] = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
     _write_json(path, attempt)
 
@@ -337,6 +339,7 @@ def _fixture(root: Path, *, include_continuation: bool = True, statistic: str = 
             "attempt_id": attempt_id,
             "starting_global_step": 1,
             "resolved_config_sha256": hashlib.sha256(resolved_config_json.encode("utf-8")).hexdigest(),
+            "resolved_config": resolved_config,
             "hostname": "fixture",
             "pid": 1,
         },
@@ -652,6 +655,35 @@ def test_verifier_accepts_native_clipped_ppo_evidence(tmp_path: Path) -> None:
     metrics[0]["data"]["branch_revision/policy_loss_is_dppo_tv"] = 0.0
     _write_jsonl(metrics_path, metrics)
     assert verify(tmp_path)["policy_loss_mode"] == "vanilla"
+
+
+def test_verifier_accepts_only_expected_native_runtime_config_normalization(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    config_path = tmp_path / "resolved_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["trainer"] = {"nnodes": 1, "n_gpus_per_node": 8, "total_training_steps": 1}
+    config["reward"] = {"reward_model": {"enable_resource_pool": False, "nnodes": 0, "n_gpus_per_node": 1}}
+    config["actor_rollout_ref"]["actor"]["optim"] = {"total_training_steps": -1}
+    config["critic"] = {"optim": {"total_training_steps": -1}}
+    _write_json(config_path, config)
+    runtime_config = copy.deepcopy(config)
+    runtime_config["reward"]["reward_model"].update(nnodes=1, n_gpus_per_node=8)
+    runtime_config["actor_rollout_ref"]["actor"]["optim"]["total_training_steps"] = 1
+    runtime_config["critic"]["optim"]["total_training_steps"] = 1
+    attempt_path = tmp_path / "audit" / "attempt_fixture" / "attempt.json"
+    attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+    attempt["resolved_config"] = runtime_config
+    rendered = json.dumps(runtime_config, sort_keys=True, default=str, ensure_ascii=False)
+    attempt["resolved_config_sha256"] = hashlib.sha256(rendered.encode()).hexdigest()
+    _write_json(attempt_path, attempt)
+    assert verify(tmp_path)["status"] == "verified"
+
+    attempt["resolved_config"]["trainer"]["nnodes"] = 2
+    rendered = json.dumps(attempt["resolved_config"], sort_keys=True, default=str, ensure_ascii=False)
+    attempt["resolved_config_sha256"] = hashlib.sha256(rendered.encode()).hexdigest()
+    _write_json(attempt_path, attempt)
+    with pytest.raises(ValueError, match="does not match the resolved configuration"):
+        verify(tmp_path)
 
 
 def test_verifier_rejects_smoke_without_a_valid_revision(tmp_path: Path) -> None:
