@@ -329,6 +329,149 @@ def branch_prefix_open_block_reason(prefix_text: str) -> str | None:
     return None
 
 
+def _normalize_branch_match_text(text: str) -> tuple[str, tuple[int, ...]]:
+    """Lowercase alphanumerics and retain their source character offsets."""
+
+    normalized: list[str] = []
+    source_offsets: list[int] = []
+    for source_offset, character in enumerate(text):
+        if not character.isalnum():
+            continue
+        lowered = character.lower()
+        normalized.extend(lowered)
+        source_offsets.extend([source_offset] * len(lowered))
+    return "".join(normalized), tuple(source_offsets)
+
+
+def _z_prefix_lengths(pattern: str, text: str) -> list[int]:
+    """Return the pattern-prefix match length at every text position in linear time."""
+
+    if not pattern or not text:
+        return [0] * len(text)
+    # Normalized inputs contain only alphanumerics, so NUL is an unambiguous separator.
+    combined = f"{pattern}\0{text}"
+    z = [0] * len(combined)
+    left = 0
+    right = 0
+    for index in range(1, len(combined)):
+        if index <= right:
+            z[index] = min(right - index + 1, z[index - left])
+        while index + z[index] < len(combined) and combined[z[index]] == combined[index + z[index]]:
+            z[index] += 1
+        if index + z[index] - 1 > right:
+            left = index
+            right = index + z[index] - 1
+    start = len(pattern) + 1
+    return [min(value, len(pattern)) for value in z[start:]]
+
+
+def _normalized_unique_prefix_location(branch_text: str, solution_text: str) -> tuple[int, int] | None:
+    """Locate a uniquely best normalized branch prefix in the raw solution.
+
+    The returned pair contains the raw source offset of the first matched
+    alphanumeric and the raw offset immediately after the preceding source
+    alphanumeric. The latter bounds boundary recovery to deleted formatting.
+    """
+
+    normalized_branch, _ = _normalize_branch_match_text(branch_text)
+    normalized_solution, solution_offsets = _normalize_branch_match_text(solution_text)
+    if not normalized_branch or not normalized_solution:
+        return None
+    match_lengths = _z_prefix_lengths(normalized_branch, normalized_solution)
+    best_length = max(match_lengths, default=0)
+    if best_length <= 0:
+        return None
+    best_positions = [index for index, value in enumerate(match_lengths) if value == best_length]
+    if len(best_positions) != 1:
+        return (-1, -1)
+    normalized_start = best_positions[0]
+    semantic_start = solution_offsets[normalized_start]
+    previous_offset = solution_offsets[normalized_start - 1] if normalized_start else -1
+    formatting_gap_start = previous_offset + 1
+    return semantic_start, formatting_gap_start
+
+
+def _matching_explicit_block_opener(
+    branch_text: str,
+    solution_text: str,
+    *,
+    formatting_gap_start: int,
+    semantic_start: int,
+    open_block_reason: str,
+) -> int | None:
+    """Find an explicitly quoted opener that makes the intended boundary external."""
+
+    stripped = branch_text.lstrip()
+    delimiter: str | None = None
+    if open_block_reason == "branch_inside_display_math":
+        if stripped.startswith("$$"):
+            delimiter = "$$"
+        elif stripped.startswith(r"\["):
+            delimiter = r"\["
+    elif open_block_reason == "branch_inside_code_fence":
+        fence_match = _FENCE_PATTERN.match(stripped.splitlines()[0] if stripped else "")
+        if fence_match is not None:
+            delimiter = fence_match.group(1)
+    elif open_block_reason == "branch_inside_latex_environment":
+        environment_match = _LATEX_ENVIRONMENT_PATTERN.match(stripped)
+        if environment_match is not None and environment_match.group(1) == "begin":
+            delimiter = environment_match.group(0)
+    if delimiter is None:
+        return None
+    opener = solution_text.rfind(delimiter, formatting_gap_start, semantic_start + 1)
+    if opener < formatting_gap_start or _is_escaped(solution_text, opener):
+        return None
+    return opener
+
+
+def _revision_at_branch_start(
+    *,
+    editable_solution_ids: list[int],
+    solution_text: str,
+    critique_text: str,
+    analysis_text: str,
+    branch_text: str,
+    replacement_text: str,
+    branch_start: int,
+    tokenizer: Any,
+    new_continuation_max_tokens: int,
+) -> ParsedBranchRevision:
+    branch_prefix_text = solution_text[:branch_start]
+    open_block_reason = branch_prefix_open_block_reason(branch_prefix_text)
+    if open_block_reason is not None:
+        return _invalid(open_block_reason, solution_text, critique_text)
+    branch_prefix_ids = [int(token) for token in tokenizer.encode(branch_prefix_text, add_special_tokens=False)]
+    if decode_exact(branch_prefix_ids, tokenizer) != branch_prefix_text:
+        return _invalid("branch_prefix_not_roundtrip_exact", solution_text, critique_text)
+    if editable_solution_ids[: len(branch_prefix_ids)] != branch_prefix_ids:
+        return _invalid("branch_not_at_token_boundary", solution_text, critique_text)
+    revised_text = branch_prefix_text + replacement_text
+    revised_prefix_ids = [int(token) for token in tokenizer.encode(revised_text, add_special_tokens=False)]
+    if not revised_prefix_ids:
+        return _invalid("empty_revised_prefix", solution_text, critique_text)
+    if decode_exact(revised_prefix_ids, tokenizer) != revised_text:
+        return _invalid("revision_not_roundtrip_exact", solution_text, critique_text)
+    if revised_prefix_ids[: len(branch_prefix_ids)] != branch_prefix_ids:
+        return _invalid("new_continuation_retokenizes_prefix", solution_text, critique_text)
+    new_continuation_ids = revised_prefix_ids[len(branch_prefix_ids) :]
+    if not new_continuation_ids or len(new_continuation_ids) > new_continuation_max_tokens:
+        return _invalid("new_continuation_token_cap", solution_text, critique_text)
+    return ParsedBranchRevision(
+        valid=True,
+        reason="valid",
+        solution_text=solution_text,
+        critique_text=critique_text,
+        analysis_text=analysis_text,
+        branch_text=branch_text,
+        new_continuation_text=replacement_text,
+        branch_start=branch_start,
+        revised_text=revised_text,
+        branch_prefix_ids=tuple(branch_prefix_ids),
+        new_continuation_ids=tuple(new_continuation_ids),
+        revised_prefix_ids=tuple(revised_prefix_ids),
+    )
+
+
 def build_learnability_reference(
     prefixes: Sequence[RolloutLogProbPrefix],
     *,
@@ -435,7 +578,7 @@ def parse_branch_revision(
     branch_max_tokens: int,
     new_continuation_max_tokens: int,
 ) -> ParsedBranchRevision:
-    """Parse an exact structured edit without normalizing generated text."""
+    """Parse a structured edit using exact matching with a unique-prefix fallback."""
 
     editable_solution_ids = strip_terminal_eos(solution_ids, tokenizer)
     canonical_critique_ids = strip_terminal_eos(critique_ids, tokenizer)
@@ -476,45 +619,73 @@ def parse_branch_revision(
     if not branch_ids or len(branch_ids) > branch_max_tokens:
         return _invalid("branch_token_cap", solution_text, critique_text)
     branch_start = solution_text.find(branch_text)
-    if branch_start < 0:
+    if branch_start >= 0:
+        if solution_text.find(branch_text, branch_start + 1) >= 0:
+            return _invalid("branch_not_unique", solution_text, critique_text)
+        return _revision_at_branch_start(
+            editable_solution_ids=editable_solution_ids,
+            solution_text=solution_text,
+            critique_text=critique_text,
+            analysis_text=analysis_text,
+            branch_text=branch_text,
+            replacement_text=replacement_text,
+            branch_start=branch_start,
+            tokenizer=tokenizer,
+            new_continuation_max_tokens=new_continuation_max_tokens,
+        )
+
+    normalized_location = _normalized_unique_prefix_location(branch_text, solution_text)
+    if normalized_location is None:
         return _invalid("branch_not_found", solution_text, critique_text)
-    if solution_text.find(branch_text, branch_start + 1) >= 0:
+    semantic_start, formatting_gap_start = normalized_location
+    if semantic_start < 0:
         return _invalid("branch_not_unique", solution_text, critique_text)
 
-    branch_prefix_text = solution_text[:branch_start]
-    open_block_reason = branch_prefix_open_block_reason(branch_prefix_text)
-    if open_block_reason is not None:
-        return _invalid(open_block_reason, solution_text, critique_text)
-    branch_prefix_ids = [int(token) for token in tokenizer.encode(branch_prefix_text, add_special_tokens=False)]
-    if decode_exact(branch_prefix_ids, tokenizer) != branch_prefix_text:
-        return _invalid("branch_prefix_not_roundtrip_exact", solution_text, critique_text)
-    if editable_solution_ids[: len(branch_prefix_ids)] != branch_prefix_ids:
-        return _invalid("branch_not_at_token_boundary", solution_text, critique_text)
-    revised_text = branch_prefix_text + replacement_text
-    revised_prefix_ids = [int(token) for token in tokenizer.encode(revised_text, add_special_tokens=False)]
-    if not revised_prefix_ids:
-        return _invalid("empty_revised_prefix", solution_text, critique_text)
-    if decode_exact(revised_prefix_ids, tokenizer) != revised_text:
-        return _invalid("revision_not_roundtrip_exact", solution_text, critique_text)
-    if revised_prefix_ids[: len(branch_prefix_ids)] != branch_prefix_ids:
-        return _invalid("new_continuation_retokenizes_prefix", solution_text, critique_text)
-    new_continuation_ids = revised_prefix_ids[len(branch_prefix_ids) :]
-    if not new_continuation_ids or len(new_continuation_ids) > new_continuation_max_tokens:
-        return _invalid("new_continuation_token_cap", solution_text, critique_text)
-    return ParsedBranchRevision(
-        valid=True,
-        reason="valid",
-        solution_text=solution_text,
-        critique_text=critique_text,
-        analysis_text=analysis_text,
-        branch_text=branch_text,
-        new_continuation_text=replacement_text,
-        branch_start=branch_start,
-        revised_text=revised_text,
-        branch_prefix_ids=tuple(branch_prefix_ids),
-        new_continuation_ids=tuple(new_continuation_ids),
-        revised_prefix_ids=tuple(revised_prefix_ids),
+    semantic_open_reason = branch_prefix_open_block_reason(solution_text[:semantic_start])
+    latest_boundary = semantic_start
+    if semantic_open_reason is not None:
+        explicit_opener = _matching_explicit_block_opener(
+            branch_text,
+            solution_text,
+            formatting_gap_start=formatting_gap_start,
+            semantic_start=semantic_start,
+            open_block_reason=semantic_open_reason,
+        )
+        if explicit_opener is None:
+            return _invalid(semantic_open_reason, solution_text, critique_text)
+        latest_boundary = explicit_opener
+
+    candidate_failures: list[str] = []
+    for candidate_start in range(latest_boundary, formatting_gap_start - 1, -1):
+        if branch_prefix_open_block_reason(solution_text[:candidate_start]) is not None:
+            continue
+        candidate = _revision_at_branch_start(
+            editable_solution_ids=editable_solution_ids,
+            solution_text=solution_text,
+            critique_text=critique_text,
+            analysis_text=analysis_text,
+            branch_text=branch_text,
+            replacement_text=replacement_text,
+            branch_start=candidate_start,
+            tokenizer=tokenizer,
+            new_continuation_max_tokens=new_continuation_max_tokens,
+        )
+        if candidate.valid:
+            return candidate
+        candidate_failures.append(candidate.reason)
+        if candidate.reason == "new_continuation_token_cap":
+            return candidate
+
+    failure_priority = (
+        "new_continuation_retokenizes_prefix",
+        "revision_not_roundtrip_exact",
+        "branch_not_at_token_boundary",
+        "branch_prefix_not_roundtrip_exact",
     )
+    for reason in failure_priority:
+        if reason in candidate_failures:
+            return _invalid(reason, solution_text, critique_text)
+    return _invalid("branch_not_at_token_boundary", solution_text, critique_text)
 
 
 def validate_binary_reward_row(values: Iterable[float], *, tolerance: float) -> float:

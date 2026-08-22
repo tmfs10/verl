@@ -222,7 +222,7 @@ def test_terminal_eos_stripping_preserves_interior_special_token() -> None:
         (_structured("x", "\\boxed{7}"), "new_continuation_final_answer"),
         (_structured("x", "#### 7"), "new_continuation_final_answer"),
         (_structured("same", "new"), "branch_not_unique"),
-        (_structured("invented", "new"), "branch_not_found"),
+        (_structured("zzz", "new"), "branch_not_found"),
         (_structured("x", "new") + " trailing", "text_after_tags"),
         (
             VALID_ANALYSIS + "<branch>x</branch> not whitespace <new continuation>new</new continuation>",
@@ -263,6 +263,99 @@ def test_parser_treats_overlapping_branch_occurrences_as_nonunique() -> None:
         new_continuation_max_tokens=256,
     )
     assert parsed.reason == "branch_not_unique"
+
+
+def test_parser_recovers_a_unique_case_and_formatting_insensitive_branch() -> None:
+    solution = "prefix\nSo N*K = 9,143\nthen waste"
+    parsed = parse_branch_revision(
+        _ids(solution),
+        _ids(_structured("So, n * k = 9 143", "Check the next locally justified factor.")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.valid
+    assert parsed.branch_start == len("prefix\n")
+    assert parsed.revised_text == "prefix\nCheck the next locally justified factor."
+
+
+def test_parser_accepts_a_unique_partial_prefix_without_a_length_threshold() -> None:
+    solution = "abcqdef"
+    parsed = parse_branch_revision(
+        _ids(solution),
+        _ids(_structured("Q completely different hindsight", "x")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.valid
+    assert parsed.branch_start == 3
+    assert parsed.revised_text == "abcx"
+
+
+def test_parser_rejects_a_tied_normalized_maximum() -> None:
+    parsed = parse_branch_revision(
+        _ids("first target then target again"),
+        _ids(_structured("TARGET but reformatted", "new")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.reason == "branch_not_unique"
+
+
+def test_parser_rejects_a_branch_with_no_normalized_overlap() -> None:
+    parsed = parse_branch_revision(
+        _ids("abc"),
+        _ids(_structured("$$", "new")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.reason == "branch_not_found"
+
+
+def test_normalized_match_searches_only_the_adjacent_formatting_gap_for_a_stable_boundary() -> None:
+    class WhitespaceMergeTokenizer(_CharTokenizer):
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            result = []
+            index = 0
+            while index < len(text):
+                if text.startswith(" b", index):
+                    result.append(900)
+                    index += 2
+                elif text.startswith(" x", index):
+                    result.append(901)
+                    index += 2
+                else:
+                    result.append(ord(text[index]) + 100)
+                    index += 1
+            return result
+
+        def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+            del skip_special_tokens, clean_up_tokenization_spaces
+            pieces = []
+            for token in token_ids:
+                if int(token) == 900:
+                    pieces.append(" b")
+                elif int(token) == 901:
+                    pieces.append(" x")
+                else:
+                    pieces.append(chr(int(token) - 100))
+            return "".join(pieces)
+
+    tokenizer = WhitespaceMergeTokenizer()
+    parsed = parse_branch_revision(
+        tokenizer.encode("a, b"),
+        tokenizer.encode(_structured("B changed", "x")),
+        tokenizer,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.valid
+    assert parsed.branch_start == 2
+    assert parsed.revised_text == "a,x"
 
 
 def test_parser_rejects_a_branch_inside_an_existing_token_boundary() -> None:
@@ -354,6 +447,58 @@ def test_parser_rejects_branch_points_inside_open_blocks(solution: str, branch: 
     )
     assert not parsed.valid
     assert parsed.reason == reason
+
+
+@pytest.mark.parametrize(
+    ("solution", "branch", "reason"),
+    [
+        ("before\n$$\nx + 1\n$$\nafter", "X plus one", "branch_inside_display_math"),
+        ("before\n\\[\nx + 1\n\\]\nafter", "X plus one", "branch_inside_display_math"),
+        (
+            "before\n\\begin{align}\nx + 1\n\\end{align}\nafter",
+            "X plus one",
+            "branch_inside_latex_environment",
+        ),
+        ("before\n```python\nx + 1\n```\nafter", "X plus one", "branch_inside_code_fence"),
+    ],
+)
+def test_normalized_match_does_not_move_an_inside_block_branch_before_its_opener(
+    solution: str,
+    branch: str,
+    reason: str,
+) -> None:
+    parsed = parse_branch_revision(
+        _ids(solution),
+        _ids(_structured(branch, "take another local step")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.reason == reason
+
+
+@pytest.mark.parametrize(
+    ("solution", "branch", "expected_prefix"),
+    [
+        ("before\n$$\nx + 1\n$$\nafter", "$$\nX + 1\n$$", "before\n"),
+        ("before\n\\[\nx + 1\n\\]\nafter", "\\[\nX + 1\n\\]", "before\n"),
+        ("before\n```python\nx + 1\n```\nafter", "```python\nX + 1\n```", "before\n"),
+    ],
+)
+def test_normalized_match_honors_an_explicitly_quoted_block_opener(
+    solution: str,
+    branch: str,
+    expected_prefix: str,
+) -> None:
+    parsed = parse_branch_revision(
+        _ids(solution),
+        _ids(_structured(branch, "take another local step")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.valid
+    assert decode_exact(parsed.branch_prefix_ids, TOKENIZER) == expected_prefix
 
 
 @pytest.mark.parametrize(
