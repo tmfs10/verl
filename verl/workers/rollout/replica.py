@@ -13,8 +13,10 @@
 # limitations under the License.
 import asyncio
 import logging
+import math
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
 from enum import Enum
 from typing import Any, Callable, Optional
 
@@ -35,12 +37,67 @@ logger = logging.getLogger(__file__)
 # excluding calls to generate method.
 CONTROL_METHOD_CONCURRENCY = 16
 
+# Internal sampling-parameter key consumed by VeRL's vLLM replica before it
+# constructs vLLM SamplingParams. This lets callers avoid transporting prompt
+# log probabilities for an unneeded prefix.
+PROMPT_LOGPROBS_SLICE_START = "_verl_prompt_logprobs_slice_start"
+
+
+def extract_chosen_prompt_log_probs(
+    prompt_token_ids: Sequence[int],
+    prompt_logprobs: Sequence[Mapping[int, Any] | None],
+    *,
+    start: int = 0,
+) -> tuple[list[int], list[float | None]]:
+    """Extract the observed token's prompt log probability from a vLLM result.
+
+    vLLM returns one mapping per prompt position. The observed prompt token is
+    guaranteed to be present even when only one top alternative is requested.
+    The first prompt token may have no conditional log probability.
+    """
+
+    token_ids = [int(token_id) for token_id in prompt_token_ids]
+    if len(prompt_logprobs) != len(token_ids):
+        raise RuntimeError(
+            "vLLM prompt token/log-probability length mismatch: "
+            f"tokens={len(token_ids)} log_probs={len(prompt_logprobs)}"
+        )
+    if isinstance(start, bool) or not isinstance(start, int) or not 0 <= start <= len(token_ids):
+        raise ValueError(f"prompt log-probability slice start {start!r} is outside [0, {len(token_ids)}]")
+
+    selected_token_ids = token_ids[start:]
+    selected_log_probs: list[float | None] = []
+    for position in range(start, len(token_ids)):
+        candidates = prompt_logprobs[position]
+        if candidates is None:
+            if position != 0:
+                raise RuntimeError(f"vLLM omitted prompt log probability at scored position {position}")
+            selected_log_probs.append(None)
+            continue
+        token_id = token_ids[position]
+        if token_id not in candidates:
+            raise RuntimeError(
+                f"vLLM prompt log probabilities omit observed token {token_id} at position {position}"
+            )
+        value = candidates[token_id]
+        log_prob = float(getattr(value, "logprob", value))
+        if not math.isfinite(log_prob):
+            raise RuntimeError(f"vLLM returned non-finite prompt log probability at position {position}")
+        selected_log_probs.append(log_prob)
+    return selected_token_ids, selected_log_probs
+
 
 class TokenOutput(BaseModel):
     token_ids: list[int]
     """response token ids"""
     log_probs: Optional[list[float]] = None
     """logprobs of response token ids"""
+    prompt_log_prob_token_ids: Optional[list[int]] = None
+    """prompt token ids aligned with the optionally sliced prompt logprobs"""
+    prompt_log_probs: Optional[list[Optional[float]]] = None
+    """chosen-token prompt logprobs; only prompt position zero may be None"""
+    prompt_log_prob_start: Optional[int] = None
+    """offset in the complete prompt at which prompt_log_probs begins"""
     routed_experts: Optional[Any] = None
     """routed experts of response token ids"""
     stop_reason: Optional[str] = None

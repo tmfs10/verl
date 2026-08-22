@@ -37,6 +37,10 @@ from verl.experimental.agent_loop.branch_revision_agent_loop import (
 from verl.trainer.config import BranchRevisionGRPOConfig
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.branch_revision_grpo import (
+    LearnabilityScore,
+    build_learnability_reference,
+    build_rollout_logprob_prefixes,
+    score_seed_learnability,
     strip_terminal_eos,
     validate_binary_reward_row,
 )
@@ -117,6 +121,11 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
         raise ValueError("branch-revision GRPO requires an explicit positive rollout.max_model_len")
     if str(rollout.get("logprobs_mode", "")) != "processed_logprobs":
         raise ValueError("branch-revision GRPO requires rollout.logprobs_mode=processed_logprobs")
+    if float(rollout.top_p) != 1.0 or int(rollout.top_k) != -1 or float(rollout.repetition_penalty) != 1.0:
+        raise ValueError("branch-revision learnability comparisons require top_p=1, top_k=-1, and repetition_penalty=1")
+    val_kwargs = rollout.val_kwargs
+    if float(val_kwargs.top_p) != 1.0 or int(val_kwargs.top_k) != -1:
+        raise ValueError("branch-revision validation requires val_kwargs.top_p=1 and val_kwargs.top_k=-1")
     if int(config.data.max_prompt_length) + int(config.data.max_response_length) >= int(rollout.max_model_len):
         raise ValueError("configured prompt plus response lengths must leave branch-critique context headroom")
     if int(config.data.max_response_length) < feature.min_continuation_tokens:
@@ -191,7 +200,10 @@ class _Bundle:
     solution_log_probs: list[float]
     original_reward: float
     record: BranchRevisionGenerationRecord | None = None
+    learnability: dict[int, LearnabilityScore] = field(default_factory=dict)
     continuation_rewards: dict[int, float] = field(default_factory=dict)
+    compression_fractions: dict[int, float] = field(default_factory=dict)
+    compression_credits: dict[int, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -328,7 +340,12 @@ class BranchRevisionGRPOController:
         return bundles
 
     def _make_child_request(self, source: DataProto, bundles: list[_Bundle]) -> DataProto | None:
-        selected = [bundle for bundle in bundles if bundle.original_reward == 0.0]
+        selected = [
+            bundle
+            for bundle in bundles
+            if bundle.original_reward == 0.0
+            or (self.feature.enable_positive_compression and bundle.original_reward == 1.0)
+        ]
         if not selected:
             return None
         rows = [bundle.source_row for bundle in selected]
@@ -347,6 +364,15 @@ class BranchRevisionGRPOController:
         )
         non_tensors["branch_revision_parent_solution_log_probs"] = self._object_array(
             [bundle.solution_log_probs for bundle in selected]
+        )
+        objectives = ["recovery" if bundle.original_reward == 0.0 else "compression" for bundle in selected]
+        non_tensors["branch_revision_parent_objective"] = np.array(objectives, dtype=object)
+        non_tensors["branch_revision_num_critiques"] = np.array(
+            [
+                self.feature.num_critiques if objective == "recovery" else self.feature.num_positive_critiques
+                for objective in objectives
+            ],
+            dtype=np.int64,
         )
         return DataProto.from_dict(
             non_tensors=non_tensors,
@@ -399,6 +425,11 @@ class BranchRevisionGRPOController:
             parse_reason=str(value["parse_reason"]),
             branch_text=str(value.get("branch_text", "")),
             new_continuation_text=str(value.get("new_continuation_text", "")),
+            branch_prefix_ids=tuple(int(token) for token in value.get("branch_prefix_ids", ())),
+            new_continuation_ids=tuple(int(token) for token in value.get("new_continuation_ids", ())),
+            new_continuation_log_probs=tuple(
+                float(item) for item in value.get("new_continuation_log_probs", ())
+            ),
             revised_prefix_ids=tuple(int(token) for token in value.get("revised_prefix_ids", ())),
             continuation_ids=tuple(int(token) for token in value.get("continuation_ids", ())),
             continuation_log_probs=tuple(float(item) for item in value.get("continuation_log_probs", ())),
@@ -414,6 +445,7 @@ class BranchRevisionGRPOController:
             raise TypeError(f"invalid branch-revision child record {type(value)!r}")
         return BranchRevisionGenerationRecord(
             rollout_id=str(value["rollout_id"]),
+            objective=str(value["objective"]),
             critiques=tuple(cls._coerce_critique(item) for item in value["critiques"]),
             critique_prompt_ids=tuple(int(token) for token in value["critique_prompt_ids"]),
         )
@@ -421,27 +453,47 @@ class BranchRevisionGRPOController:
     def _extract_records(self, output: DataProto) -> dict[str, BranchRevisionGenerationRecord]:
         raw = output.non_tensor_batch.pop(BRANCH_REVISION_CHILD_FIELD, None)
         if raw is None or len(raw) != len(output):
-            raise RuntimeError("branch-revision child rollout did not return one record per incorrect solution")
+            raise RuntimeError("branch-revision child rollout did not return one record per selected solution")
         records: dict[str, BranchRevisionGenerationRecord] = {}
         for value in raw:
             record = self._coerce_record(value)
             if record.rollout_id in records:
                 raise RuntimeError(f"duplicate branch-revision rollout id {record.rollout_id!r}")
-            if len(record.critiques) != self.feature.num_critiques:
+            expected_critiques = (
+                self.feature.num_critiques
+                if record.objective == "recovery"
+                else self.feature.num_positive_critiques
+                if record.objective == "compression"
+                else None
+            )
+            if expected_critiques is None:
+                raise RuntimeError(f"rollout {record.rollout_id!r} returned unknown objective {record.objective!r}")
+            if len(record.critiques) != expected_critiques:
                 raise RuntimeError(
                     f"rollout {record.rollout_id!r} returned {len(record.critiques)} critiques; "
-                    f"expected {self.feature.num_critiques}"
+                    f"expected {expected_critiques}"
                 )
             records[record.rollout_id] = record
         return records
 
     def _attach_records(self, bundles: list[_Bundle], records: dict[str, BranchRevisionGenerationRecord]) -> None:
-        expected = {bundle.rollout_id for bundle in bundles if bundle.original_reward == 0.0}
+        expected = {
+            bundle.rollout_id
+            for bundle in bundles
+            if bundle.original_reward == 0.0
+            or (self.feature.enable_positive_compression and bundle.original_reward == 1.0)
+        }
         if set(records) != expected:
             raise RuntimeError("branch-revision child stage returned an unexpected rollout-id set")
         for bundle in bundles:
-            if bundle.original_reward == 0.0:
+            if bundle.rollout_id in expected:
                 bundle.record = records[bundle.rollout_id]
+                expected_objective = "recovery" if bundle.original_reward == 0.0 else "compression"
+                if bundle.record.objective != expected_objective:
+                    raise RuntimeError(
+                        f"rollout {bundle.rollout_id!r} returned {bundle.record.objective!r}; "
+                        f"expected {expected_objective!r}"
+                    )
                 editable_solution = strip_terminal_eos(bundle.solution_ids, self.tokenizer)
                 expected_prefix = [*bundle.prompt_ids, *editable_solution]
                 critique_prompt = list(bundle.record.critique_prompt_ids)
@@ -454,7 +506,71 @@ class BranchRevisionGRPOController:
                         "original prompt/solution prefix"
                     )
             elif bundle.rollout_id in records:
-                raise RuntimeError("correct original solution unexpectedly received branch critiques")
+                raise RuntimeError("unselected original solution unexpectedly received branch critiques")
+
+    def _score_seed_learnability(self, bundles: list[_Bundle]) -> None:
+        """Score proposal seeds from vLLM prompt logprobs at their actual context."""
+
+        editable_log_probs: list[list[float]] = []
+        for bundle in bundles:
+            editable_length = len(strip_terminal_eos(bundle.solution_ids, self.tokenizer))
+            editable_log_probs.append(bundle.solution_log_probs[:editable_length])
+        prefixes = build_rollout_logprob_prefixes(
+            [bundle.rollout_id for bundle in bundles],
+            editable_log_probs,
+        )
+        references: dict[int, Any] = {}
+        for bundle in bundles:
+            if bundle.record is None:
+                continue
+            for critique_index, critique in enumerate(bundle.record.critiques):
+                if not critique.valid:
+                    continue
+                if (
+                    not critique.new_continuation_ids
+                    or not critique.revised_prefix_ids
+                    or [*critique.branch_prefix_ids, *critique.new_continuation_ids]
+                    != list(critique.revised_prefix_ids)
+                ):
+                    raise RuntimeError("valid branch revision has inconsistent branch/replacement token boundaries")
+                seed_length = len(critique.new_continuation_ids)
+                seed_values = critique.new_continuation_log_probs
+                if len(seed_values) != seed_length:
+                    raise RuntimeError(
+                        "valid branch revision does not have one vLLM prompt log probability per replacement token"
+                    )
+                if not all(math.isfinite(value) for value in seed_values):
+                    raise RuntimeError("vLLM returned non-finite replacement-seed prompt log probabilities")
+                reference = references.get(seed_length)
+                if reference is None:
+                    reference = build_learnability_reference(
+                        prefixes,
+                        window_size=seed_length,
+                        windows_per_rollout=self.feature.learnability_windows_per_rollout,
+                        seed=int(self.trainer.global_steps),
+                    )
+                    references[seed_length] = reference
+                score = score_seed_learnability(
+                    math.fsum(seed_values) / seed_length,
+                    reference,
+                    minimum_percentile=self.feature.min_seed_window_percentile,
+                    full_credit_percentile=self.feature.full_credit_seed_window_percentile,
+                )
+                bundle.learnability[critique_index] = score
+                self._audit(
+                    "learnability",
+                    score_source="vllm_prompt_logprobs",
+                    rollout_id=bundle.rollout_id,
+                    objective=bundle.record.objective,
+                    critique_index=critique_index,
+                    seed_tokens=seed_length,
+                    seed_mean_log_prob=score.seed_mean_log_prob,
+                    percentile=score.percentile,
+                    reward_weight=score.reward_weight,
+                    accepted=score.accepted,
+                    eligible_rollouts=score.eligible_rollouts,
+                    sampled_windows=score.sampled_windows,
+                )
 
     def _make_reward_batch(
         self,
@@ -512,7 +628,8 @@ class BranchRevisionGRPOController:
                     raise RuntimeError("branch-revision critique contains non-finite behavior log probabilities")
                 if critique.valid:
                     if (
-                        not critique.revised_prefix_ids
+                        not critique.new_continuation_ids
+                        or not critique.revised_prefix_ids
                         or not critique.continuation_ids
                         or len(critique.continuation_ids) != len(critique.continuation_log_probs)
                         or critique.continuation_max_tokens < self.feature.min_continuation_tokens
@@ -522,11 +639,21 @@ class BranchRevisionGRPOController:
                         raise RuntimeError(
                             "branch-revision continuation contains non-finite behavior log probabilities"
                         )
-                    rows.append(bundle.source_row)
-                    prompts.append(bundle.prompt_ids)
-                    responses.append([*critique.revised_prefix_ids, *critique.continuation_ids])
-                    mapping.append((bundle_index, critique_index))
-                elif critique.revised_prefix_ids or critique.continuation_ids or critique.continuation_log_probs:
+                    learnability = bundle.learnability.get(critique_index)
+                    if learnability is None:
+                        raise RuntimeError("valid branch revision is missing its learnability assessment")
+                    if learnability.accepted:
+                        rows.append(bundle.source_row)
+                        prompts.append(bundle.prompt_ids)
+                        responses.append([*critique.revised_prefix_ids, *critique.continuation_ids])
+                        mapping.append((bundle_index, critique_index))
+                elif (
+                    critique.branch_prefix_ids
+                    or critique.new_continuation_ids
+                    or critique.revised_prefix_ids
+                    or critique.continuation_ids
+                    or critique.continuation_log_probs
+                ):
                     raise RuntimeError("invalid branch revision unexpectedly launched or retained a continuation")
         if not mapping:
             return
@@ -541,13 +668,29 @@ class BranchRevisionGRPOController:
             raise RuntimeError("branch-revision continuation reward count does not match generated continuations")
         for (bundle_index, critique_index), row in zip(mapping, reward_rows, strict=True):
             reward = validate_binary_reward_row(row, tolerance=self.feature.reward_tolerance)
-            bundles[bundle_index].continuation_rewards[critique_index] = reward
-            critique = bundles[bundle_index].record.critiques[critique_index]
+            bundle = bundles[bundle_index]
+            bundle.continuation_rewards[critique_index] = reward
+            critique = bundle.record.critiques[critique_index]
+            if bundle.record.objective == "compression":
+                original_length = len(strip_terminal_eos(bundle.solution_ids, self.tokenizer))
+                revised_length = len(
+                    strip_terminal_eos([*critique.revised_prefix_ids, *critique.continuation_ids], self.tokenizer)
+                )
+                compression_fraction = max(0.0, (original_length - revised_length) / original_length)
+                compression_credit = reward * min(
+                    compression_fraction / self.feature.positive_compression_target,
+                    1.0,
+                )
+                bundle.compression_fractions[critique_index] = compression_fraction
+                bundle.compression_credits[critique_index] = compression_credit
             self._audit(
                 "continuation",
-                rollout_id=bundles[bundle_index].rollout_id,
+                rollout_id=bundle.rollout_id,
+                objective=bundle.record.objective,
                 critique_index=critique_index,
                 reward=reward,
+                compression_fraction=bundle.compression_fractions.get(critique_index),
+                compression_credit=bundle.compression_credits.get(critique_index),
                 revised_prefix_ids=list(critique.revised_prefix_ids),
                 continuation_ids=list(critique.continuation_ids),
                 continuation_log_probs=list(critique.continuation_log_probs),
@@ -586,7 +729,17 @@ class BranchRevisionGRPOController:
             for critique_index, critique in enumerate(bundle.record.critiques):
                 continuation_outcome = bundle.continuation_rewards.get(critique_index, 0.0)
                 baseline = prompt_pass_at_1[bundle.prompt_group_id]
-                critique_reward = continuation_outcome - baseline
+                learnability = bundle.learnability.get(critique_index)
+                learnability_weight = learnability.reward_weight if learnability is not None else 0.0
+                accepted = bool(learnability is not None and learnability.accepted)
+                if bundle.record.objective == "recovery":
+                    objective_credit = continuation_outcome
+                    critique_reward = objective_credit * learnability_weight - baseline
+                elif bundle.record.objective == "compression":
+                    objective_credit = bundle.compression_credits.get(critique_index, 0.0)
+                    critique_reward = objective_credit * learnability_weight
+                else:
+                    raise RuntimeError(f"unknown branch-revision objective {bundle.record.objective!r}")
                 rows.append(
                     _ActorRow(
                         full_ids=[*critique_prompt, *critique.token_ids],
@@ -597,45 +750,34 @@ class BranchRevisionGRPOController:
                         kind="critique",
                     )
                 )
-                if not critique.valid:
-                    continue
-                rows.append(
-                    _ActorRow(
-                        full_ids=[*bundle.prompt_ids, *critique.revised_prefix_ids, *critique.continuation_ids],
-                        train_start=len(bundle.prompt_ids) + len(critique.revised_prefix_ids),
-                        behavior_log_probs=list(critique.continuation_log_probs),
-                        reward=continuation_outcome,
-                        group_id=solution_group,
-                        kind="continuation",
+                if critique.valid and accepted:
+                    rows.append(
+                        _ActorRow(
+                            full_ids=[*bundle.prompt_ids, *critique.revised_prefix_ids, *critique.continuation_ids],
+                            train_start=len(bundle.prompt_ids) + len(critique.revised_prefix_ids),
+                            behavior_log_probs=list(critique.continuation_log_probs),
+                            reward=continuation_outcome,
+                            group_id=solution_group,
+                            kind="continuation",
+                        )
                     )
-                )
                 self._audit(
                     "critique",
                     rollout_id=bundle.rollout_id,
                     prompt_group_id=bundle.prompt_group_id,
+                    objective=bundle.record.objective,
                     critique_index=critique_index,
                     reward=critique_reward,
+                    objective_credit=objective_credit,
                     continuation_outcome=continuation_outcome,
                     prompt_pass_at_1=baseline,
-                    parse_reason=critique.parse_reason,
-                    branch=critique.branch_text,
-                    new_continuation=critique.new_continuation_text,
-                    critique_ids=list(critique.token_ids),
-                    critique_log_probs=list(critique.log_probs),
-                    critique_prompt_ids=critique_prompt,
-                    finish_reason=critique.finish_reason,
-                )
-            for critique_index, critique in enumerate(bundle.record.critiques):
-                if critique.valid:
-                    continue
-                self._audit(
-                    "critique",
-                    rollout_id=bundle.rollout_id,
-                    prompt_group_id=bundle.prompt_group_id,
-                    critique_index=critique_index,
-                    reward=-prompt_pass_at_1[bundle.prompt_group_id],
-                    continuation_outcome=0.0,
-                    prompt_pass_at_1=prompt_pass_at_1[bundle.prompt_group_id],
+                    learnability_accepted=accepted,
+                    learnability_percentile=learnability.percentile if learnability is not None else None,
+                    learnability_weight=learnability_weight,
+                    compression_fraction=bundle.compression_fractions.get(critique_index),
+                    compression_credit=bundle.compression_credits.get(critique_index),
+                    generated_continuation_tokens=len(critique.continuation_ids),
+                    continuation_wasted_by_learnability=bool(critique.valid and not accepted),
                     parse_reason=critique.parse_reason,
                     branch=critique.branch_text,
                     new_continuation=critique.new_continuation_text,
@@ -779,8 +921,14 @@ class BranchRevisionGRPOController:
     def _metrics(self, bundles: list[_Bundle], actor_batch: DataProto, padding_rows: int) -> dict[str, float]:
         originals = [bundle.original_reward for bundle in bundles]
         incorrect = [bundle for bundle in bundles if bundle.original_reward == 0.0]
-        critiques = [critique for bundle in incorrect for critique in bundle.record.critiques]
+        correct = [bundle for bundle in bundles if bundle.original_reward == 1.0]
+        selected = [bundle for bundle in bundles if bundle.record is not None]
+        critiques = [critique for bundle in selected for critique in bundle.record.critiques]
+        incorrect_critiques = [critique for bundle in incorrect for critique in bundle.record.critiques]
+        correct_critiques = [critique for bundle in correct if bundle.record for critique in bundle.record.critiques]
         valid_count = sum(critique.valid for critique in critiques)
+        accepted_count = sum(score.accepted for bundle in selected for score in bundle.learnability.values())
+        incorrect_accepted = sum(score.accepted for bundle in incorrect for score in bundle.learnability.values())
         successes = sum(sum(bundle.continuation_rewards.values()) for bundle in incorrect)
         incorrect_any = sum(any(value == 1.0 for value in bundle.continuation_rewards.values()) for bundle in incorrect)
         prompts_with_incorrect = {bundle.prompt_group_id for bundle in incorrect}
@@ -791,15 +939,32 @@ class BranchRevisionGRPOController:
         }
         all_prompts = {bundle.prompt_group_id for bundle in bundles}
         parse_counts = Counter(critique.parse_reason for critique in critiques)
+        learnability_scores = [score for bundle in selected for score in bundle.learnability.values()]
+        compression_fractions = [value for bundle in correct for value in bundle.compression_fractions.values()]
+        compression_credits = [value for bundle in correct for value in bundle.compression_credits.values()]
+        generated_continuation_tokens = [
+            len(critique.continuation_ids)
+            for bundle in selected
+            for critique in bundle.record.critiques
+            if critique.valid
+        ]
+        rejected_continuation_tokens = [
+            len(critique.continuation_ids)
+            for bundle in selected
+            for critique_index, critique in enumerate(bundle.record.critiques)
+            if critique.valid and not bundle.learnability[critique_index].accepted
+        ]
         actor_kinds = actor_batch.non_tensor_batch["branch_revision_actor_kind"]
         global_minibatch = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * int(
             self.config.actor_rollout_ref.rollout.n
         )
         metrics = {
             "branch_revision/original/pass_at_1": float(sum(originals) / len(originals)),
-            "branch_revision/flip/success_per_all_critiques": float(successes / len(critiques)) if critiques else 0.0,
+            "branch_revision/flip/success_per_all_critiques": (
+                float(successes / len(incorrect_critiques)) if incorrect_critiques else 0.0
+            ),
             "branch_revision/flip/success_per_valid_continuation": (
-                float(successes / valid_count) if valid_count else 0.0
+                float(successes / incorrect_accepted) if incorrect_accepted else 0.0
             ),
             "branch_revision/flip/incorrect_originals_with_any_success": (
                 float(incorrect_any / len(incorrect)) if incorrect else 0.0
@@ -812,9 +977,32 @@ class BranchRevisionGRPOController:
             ),
             "branch_revision/originals": float(len(bundles)),
             "branch_revision/incorrect_originals": float(len(incorrect)),
+            "branch_revision/correct_originals": float(len(correct)),
             "branch_revision/critiques": float(len(critiques)),
+            "branch_revision/recovery_critiques": float(len(incorrect_critiques)),
+            "branch_revision/compression_critiques": float(len(correct_critiques)),
             "branch_revision/valid_edits": float(valid_count),
-            "branch_revision/continuations": float(valid_count),
+            "branch_revision/learnability_accepted_edits": float(accepted_count),
+            "branch_revision/learnability_rejected_edits": float(valid_count - accepted_count),
+            "branch_revision/continuations": float(accepted_count),
+            "branch_revision/learnability/mean_percentile": (
+                float(sum(score.percentile for score in learnability_scores) / len(learnability_scores))
+                if learnability_scores
+                else 0.0
+            ),
+            "branch_revision/learnability/mean_reward_weight": (
+                float(sum(score.reward_weight for score in learnability_scores) / len(learnability_scores))
+                if learnability_scores
+                else 0.0
+            ),
+            "branch_revision/compression/mean_fraction": (
+                float(sum(compression_fractions) / len(compression_fractions)) if compression_fractions else 0.0
+            ),
+            "branch_revision/compression/mean_credit": (
+                float(sum(compression_credits) / len(compression_credits)) if compression_credits else 0.0
+            ),
+            "branch_revision/tokens/generated_continuations": float(sum(generated_continuation_tokens)),
+            "branch_revision/tokens/learnability_rejected_continuations": float(sum(rejected_continuation_tokens)),
             "branch_revision/actor_rows": float(len(actor_batch) - padding_rows),
             "branch_revision/padding_rows": float(padding_rows),
             "branch_revision/actor_optimizer_minibatches": float(
@@ -855,6 +1043,8 @@ class BranchRevisionGRPOController:
         else:
             self._attach_records(bundles, {})
 
+        with marked_timer("branch_revision_learnability", timing_raw, color="blue"):
+            self._score_seed_learnability(bundles)
         with marked_timer("branch_revision_rewards", timing_raw, color="yellow"):
             self._evaluate_continuations(source, bundles)
         actor_batch, padding_rows = self._make_actor_batch(bundles)
@@ -875,6 +1065,8 @@ class BranchRevisionGRPOController:
             "iteration",
             originals=len(bundles),
             incorrect=sum(bundle.original_reward == 0.0 for bundle in bundles),
+            correct=sum(bundle.original_reward == 1.0 for bundle in bundles),
+            positive_compression_enabled=self.feature.enable_positive_compression,
             original_rewards=rewards,
             prompt_pass_at_1={
                 prompt_group_id: sum(group_rewards) / len(group_rewards)

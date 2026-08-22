@@ -16,6 +16,7 @@ import asyncio
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -29,12 +30,21 @@ from verl.experimental.agent_loop.branch_revision_agent_loop import (
     BranchRevisionCritiqueGeneration,
     BranchRevisionGenerationRecord,
 )
-from verl.trainer.config import BRANCH_REVISION_CRITIQUE_PROMPT, BranchRevisionGRPOConfig
+from verl.trainer.config import (
+    BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT,
+    BRANCH_REVISION_CRITIQUE_PROMPT,
+    BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT,
+    BranchRevisionGRPOConfig,
+)
 from verl.trainer.ppo import ray_trainer_branch_revision as branch_controller_module
 from verl.trainer.ppo.branch_revision_grpo import (
+    LearnabilityScore,
+    build_learnability_reference,
+    build_rollout_logprob_prefixes,
     decode_exact,
     encode_followup_user_turn,
     parse_branch_revision,
+    score_seed_learnability,
     strip_terminal_eos,
     validate_binary_reward_row,
 )
@@ -45,7 +55,11 @@ from verl.trainer.ppo.ray_trainer_branch_revision import (
     validate_branch_revision_runtime_config,
 )
 from verl.workers.actor import dp_actor
-from verl.workers.rollout.replica import TokenOutput
+from verl.workers.rollout.replica import (
+    PROMPT_LOGPROBS_SLICE_START,
+    TokenOutput,
+    extract_chosen_prompt_log_probs,
+)
 
 
 class _CharTokenizer:
@@ -99,32 +113,31 @@ def test_agent_loop_package_registers_branch_revision_in_a_fresh_worker_process(
     assert result.returncode == 0, result.stderr
 
 
-VALID_ANALYSIS = (
-    "1. PRUNING: The setup pruned candidates; the algebra did not.\n"
-    "2. SWITCH: Switch at the equality and use an invariant.\n"
-    "3. EDIT: Replace the equality with the invariant.\n"
-)
+VALID_ANALYSIS = "The setup narrowed the choices. A local alternative is justified here.\n"
 
 
 def _structured(branch: str, replacement: str, prefix: str = VALID_ANALYSIS) -> str:
     return f"{prefix}<branch>{branch}</branch>\n<new continuation>{replacement}</new continuation>"
 
 
-def test_critique_prompt_is_bounded_and_has_no_copyable_placeholder_values() -> None:
-    assert "do not continue it or solve the problem again" in BRANCH_REVISION_CRITIQUE_PROMPT
-    assert "three short numbered paragraphs" in BRANCH_REVISION_CRITIQUE_PROMPT
-    assert "open <branch> before the numbered critique" in BRANCH_REVISION_CRITIQUE_PROMPT
-    assert "inside <branch> is not analysis" in BRANCH_REVISION_CRITIQUE_PROMPT
-    assert "Do not paraphrase, correct, normalize, or reformat" in BRANCH_REVISION_CRITIQUE_PROMPT
-    assert "the exact quoted section to replace" not in BRANCH_REVISION_CRITIQUE_PROMPT
-    assert "the replacement text" not in BRANCH_REVISION_CRITIQUE_PROMPT
-    assert "not write anything after" in BRANCH_REVISION_CRITIQUE_PROMPT
+def test_objective_prompts_share_the_causal_and_exact_edit_contract() -> None:
+    assert BRANCH_REVISION_CRITIQUE_PROMPT == BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT
+    assert "attempted solution above is incorrect" in BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT
+    assert "solution above is correct" in BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT
+    for prompt in (BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT, BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT):
+        assert "point immediately before <branch> as the information boundary" in prompt
+        assert "trajectory counterfactually with everything after the branch" in prompt
+        assert "hidden. If work performed after the branch" in prompt
+        assert "Do not compress a sequence of later developments" in prompt
+        assert "After the free-form analysis" in prompt
+        assert "write nothing" in prompt
+        assert "1. PRUNING:" not in prompt
 
 
 def test_critique_instruction_is_a_new_user_turn_with_visible_assistant_output() -> None:
     ids = encode_followup_user_turn(BRANCH_REVISION_CRITIQUE_PROMPT, TOKENIZER)
     text = decode_exact(ids, TOKENIZER)
-    assert text.startswith("</assistant><user>--- BEGIN CRITIQUE TASK ---")
+    assert text.startswith("</assistant><user>The attempted solution above is incorrect.")
     assert text.endswith("</user><assistant><think>\n\n</think>\n\n")
 
 
@@ -178,6 +191,8 @@ def test_exact_parser_preserves_whitespace_unicode_and_truncates_at_unique_branc
     assert parsed.branch_text == "  dead end\n"
     assert parsed.new_continuation_text == "  try β instead\n"
     assert parsed.revised_text == "use α\n  try β instead\n"
+    assert decode_exact(parsed.branch_prefix_ids, TOKENIZER) == "use α\n"
+    assert decode_exact(parsed.new_continuation_ids, TOKENIZER) == "  try β instead\n"
     assert decode_exact(parsed.revised_prefix_ids, TOKENIZER) == parsed.revised_text
 
 
@@ -192,27 +207,19 @@ def test_terminal_eos_stripping_preserves_interior_special_token() -> None:
     ("critique", "reason"),
     [
         ("<branch>x</branch>", "tag_count"),
-        ("<branch>x</branch>\n<new continuation>new</new continuation>", "critique_section_count"),
-        (
-            "2. SWITCH: switch\n1. PRUNING: prune\n3. EDIT: edit\n"
-            "<branch>x</branch><new continuation>new</new continuation>",
-            "critique_section_order",
-        ),
-        (
-            "preamble\n" + VALID_ANALYSIS + "<branch>x</branch><new continuation>new</new continuation>",
-            "text_before_critique",
-        ),
-        (
-            "1. PRUNING: \n2. SWITCH: switch\n3. EDIT: edit\n"
-            "<branch>x</branch><new continuation>new</new continuation>",
-            "empty_pruning",
-        ),
+        ("<branch>x</branch>\n<new continuation>new</new continuation>", "empty_analysis"),
         (_structured("", "new"), "empty_branch"),
         (_structured("x", "   "), "empty_new_continuation"),
+        (_structured("x", "The final answer is 7"), "new_continuation_final_answer"),
+        (_structured("x", "\\boxed{7}"), "new_continuation_final_answer"),
+        (_structured("x", "#### 7"), "new_continuation_final_answer"),
         (_structured("same", "new"), "branch_not_unique"),
         (_structured("invented", "new"), "branch_not_found"),
         (_structured("x", "new") + " trailing", "text_after_tags"),
-        ("<branch>x</branch> not whitespace <new continuation>new</new continuation>", "text_between_tags"),
+        (
+            VALID_ANALYSIS + "<branch>x</branch> not whitespace <new continuation>new</new continuation>",
+            "text_between_tags",
+        ),
     ],
 )
 def test_parser_fails_closed_with_reason(critique: str, reason: str) -> None:
@@ -239,6 +246,119 @@ def test_parser_enforces_token_caps_without_trimming_contents() -> None:
     assert parsed.reason == "branch_token_cap"
 
 
+def test_parser_treats_overlapping_branch_occurrences_as_nonunique() -> None:
+    parsed = parse_branch_revision(
+        _ids("aaa"),
+        _ids(_structured("aa", "new")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.reason == "branch_not_unique"
+
+
+def test_parser_rejects_a_branch_inside_an_existing_token_boundary() -> None:
+    class MergeTokenizer(_CharTokenizer):
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            result = []
+            index = 0
+            while index < len(text):
+                if text.startswith("ab", index):
+                    result.append(900)
+                    index += 2
+                else:
+                    result.append(ord(text[index]) + 100)
+                    index += 1
+            return result
+
+        def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+            del skip_special_tokens, clean_up_tokenization_spaces
+            return "".join("ab" if int(token) == 900 else chr(int(token) - 100) for token in token_ids)
+
+    tokenizer = MergeTokenizer()
+    parsed = parse_branch_revision(
+        tokenizer.encode("abc"),
+        tokenizer.encode(_structured("b", "x")),
+        tokenizer,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.reason == "branch_not_at_token_boundary"
+
+
+def test_parser_rejects_a_replacement_that_retokenizes_the_preserved_prefix() -> None:
+    class MergeTokenizer(_CharTokenizer):
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            result = []
+            index = 0
+            while index < len(text):
+                if text.startswith("ax", index):
+                    result.append(901)
+                    index += 2
+                else:
+                    result.append(ord(text[index]) + 100)
+                    index += 1
+            return result
+
+        def decode(self, token_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False):
+            del skip_special_tokens, clean_up_tokenization_spaces
+            return "".join("ax" if int(token) == 901 else chr(int(token) - 100) for token in token_ids)
+
+    tokenizer = MergeTokenizer()
+    parsed = parse_branch_revision(
+        tokenizer.encode("ab"),
+        tokenizer.encode(_structured("b", "x")),
+        tokenizer,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.reason == "new_continuation_retokenizes_prefix"
+
+
+def test_length_matched_learnability_windows_are_deterministic_and_rollout_balanced() -> None:
+    prefixes = build_rollout_logprob_prefixes(
+        ["short", "long"],
+        [[-1.0, -1.0, -1.0], [-3.0] * 20],
+    )
+    first = build_learnability_reference(prefixes, window_size=2, windows_per_rollout=4, seed=9)
+    second = build_learnability_reference(prefixes, window_size=2, windows_per_rollout=4, seed=9)
+    torch.testing.assert_close(first.window_means, second.window_means)
+    torch.testing.assert_close(first.window_weights, second.window_weights)
+    assert first.eligible_rollouts == 2
+    assert first.sampled_windows == 6
+    assert first.window_weights[first.window_means == -1.0].sum().item() == pytest.approx(0.5)
+    assert first.window_weights[first.window_means == -3.0].sum().item() == pytest.approx(0.5)
+
+
+def test_learnability_percentile_gates_and_ramps_reward_credit() -> None:
+    prefixes = build_rollout_logprob_prefixes(["r"], [[-4.0, -3.0, -2.0, -1.0]])
+    reference = build_learnability_reference(prefixes, window_size=1, windows_per_rollout=8, seed=0)
+    rejected = score_seed_learnability(
+        -4.1,
+        reference,
+        minimum_percentile=0.20,
+        full_credit_percentile=0.50,
+    )
+    partial = score_seed_learnability(
+        -3.0,
+        reference,
+        minimum_percentile=0.20,
+        full_credit_percentile=0.70,
+    )
+    full = score_seed_learnability(
+        -1.0,
+        reference,
+        minimum_percentile=0.20,
+        full_credit_percentile=0.50,
+    )
+    assert not rejected.accepted and rejected.reward_weight == 0.0
+    assert partial.accepted and partial.percentile == pytest.approx(0.5)
+    assert partial.reward_weight == pytest.approx(0.6)
+    assert full.accepted and full.reward_weight == 1.0
+
+
 @pytest.mark.parametrize(("row", "expected"), [([0.0, 0.0], 0.0), ([0.0, 1.0, 0.0], 1.0)])
 def test_binary_reward_validation_accepts_only_one_terminal_unit(row, expected) -> None:
     assert validate_binary_reward_row(row, tolerance=1e-6) == expected
@@ -258,12 +378,19 @@ def _runtime_config(loss_mode="dppo_tv"):
                     "_target_": "verl.trainer.config.BranchRevisionGRPOConfig",
                     "enable": True,
                     "num_critiques": 4,
+                    "enable_positive_compression": True,
+                    "num_positive_critiques": 4,
+                    "positive_compression_target": 0.25,
+                    "min_seed_window_percentile": 0.20,
+                    "full_credit_seed_window_percentile": 0.50,
+                    "learnability_windows_per_rollout": 8,
                     "critique_max_response_length": 16,
                     "branch_max_tokens": 8,
                     "new_continuation_max_tokens": 8,
                     "min_continuation_tokens": 8,
                     "reward_tolerance": 1e-6,
                     "critique_prompt": BRANCH_REVISION_CRITIQUE_PROMPT,
+                    "positive_critique_prompt": BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT,
                     "audit_output_dir": None,
                 },
                 "intermediate_mc_value": {"enable": False},
@@ -289,13 +416,16 @@ def _runtime_config(loss_mode="dppo_tv"):
                     "name": "vllm",
                     "n": 2,
                     "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "repetition_penalty": 1.0,
                     "calculate_log_probs": False,
                     "max_model_len": 128,
                     "logprobs_mode": "processed_logprobs",
                     "skip_rollout": False,
                     "enable_rollout_routing_replay": False,
                     "multi_turn": {"enable": False},
-                    "val_kwargs": {"temperature": 1.0},
+                    "val_kwargs": {"temperature": 1.0, "top_p": 1.0, "top_k": -1},
                 },
             },
             "critic": {"enable": False},
@@ -338,6 +468,7 @@ def test_runtime_config_accepts_both_native_policy_losses_and_forces_behavior_lo
         ("actor_rollout_ref.rollout.n", 1, "rollout.n>=2"),
         ("actor_rollout_ref.actor.policy_loss.loss_mode", "gpg", "dppo_tv and vanilla"),
         ("actor_rollout_ref.rollout.temperature", 0.9, "temperature=1.0"),
+        ("actor_rollout_ref.rollout.top_p", 0.9, "top_p=1"),
         ("actor_rollout_ref.actor.use_kl_loss", True, "does not support"),
         ("reward.reward_model.launch_reward_fn_async", True, "blocking iteration barrier"),
         ("algorithm.branch_revision_grpo.min_continuation_tokens", 33, "smaller than"),
@@ -355,13 +486,15 @@ def _loop() -> BranchRevisionAgentLoop:
     loop.feature = BranchRevisionGRPOConfig(
         enable=True,
         num_critiques=2,
+        enable_positive_compression=True,
+        num_positive_critiques=2,
         critique_max_response_length=256,
         branch_max_tokens=128,
         new_continuation_max_tokens=256,
         min_continuation_tokens=128,
     )
     loop.response_length = 256
-    loop.max_model_len = 2048
+    loop.max_model_len = 10000
     loop.tokenizer = TOKENIZER
     return loop
 
@@ -371,18 +504,52 @@ def test_child_sampling_always_uses_temperature_one_and_processed_logprobs() -> 
         {"temperature": 0.2, "logprobs": False, "max_new_tokens": 999, "top_p": 0.9},
         max_tokens=17,
     )
-    assert params == {"temperature": 1.0, "logprobs": True, "max_tokens": 17, "top_p": 0.9}
+    assert params == {
+        "temperature": 1.0,
+        "logprobs": True,
+        "max_tokens": 17,
+        "top_p": 1.0,
+        "top_k": -1,
+        "repetition_penalty": 1.0,
+    }
+
+    scored = BranchRevisionAgentLoop._sampling_params(
+        {"prompt_logprobs": -1, PROMPT_LOGPROBS_SLICE_START: 999},
+        max_tokens=17,
+        prompt_logprob_start=23,
+    )
+    assert scored["prompt_logprobs"] == 1
+    assert scored[PROMPT_LOGPROBS_SLICE_START] == 23
+
+
+def test_extract_chosen_prompt_log_probs_slices_and_checks_observed_tokens() -> None:
+    class Logprob:
+        def __init__(self, value):
+            self.logprob = value
+
+    token_ids = [10, 11, 12, 13]
+    prompt_logprobs = [
+        None,
+        {99: Logprob(-0.1), 11: Logprob(-1.1)},
+        {12: Logprob(-1.2)},
+        {13: Logprob(-1.3), 98: Logprob(-0.2)},
+    ]
+    selected_ids, selected_logprobs = extract_chosen_prompt_log_probs(token_ids, prompt_logprobs, start=2)
+    assert selected_ids == [12, 13]
+    assert selected_logprobs == pytest.approx([-1.2, -1.3])
+    with pytest.raises(RuntimeError, match="omit observed token"):
+        extract_chosen_prompt_log_probs(token_ids, [None, {11: -1.0}, {99: -1.0}, {13: -1.0}], start=2)
 
 
 def test_agent_loop_generates_all_critiques_then_one_continuation_per_valid_edit() -> None:
     loop = _loop()
     calls: list[tuple[str, int, float, bool]] = []
 
-    async def fake_generate(_route, prompt, params, *, max_tokens, kind):
+    async def fake_generate(_route, prompt, params, *, max_tokens, kind, prompt_logprob_start=None):
         calls.append((kind, max_tokens, params.get("temperature", 1.0), params.get("logprobs", True)))
         if kind.startswith("critique"):
             decoded_prompt = decode_exact(prompt, TOKENIZER)
-            assert "</assistant><user>--- BEGIN CRITIQUE TASK ---" in decoded_prompt
+            assert "</assistant><user>The attempted solution above is incorrect." in decoded_prompt
             assert decoded_prompt.endswith("</user><assistant><think>\n\n</think>\n\n")
         if kind == "critique[0]":
             text = _structured("dead", "better")
@@ -392,7 +559,15 @@ def test_agent_loop_generates_all_critiques_then_one_continuation_per_valid_edit
             return TokenOutput(token_ids=_ids(text), log_probs=[-0.3] * len(_ids(text)))
         assert kind == "continuation[0]"
         assert decode_exact(prompt[-len(_ids("start better")) :], TOKENIZER) == "start better"
-        return TokenOutput(token_ids=_ids(" solved"), log_probs=[-0.4] * len(_ids(" solved")))
+        seed_ids = _ids("better")
+        assert prompt_logprob_start == len(prompt) - len(seed_ids)
+        return TokenOutput(
+            token_ids=_ids(" solved"),
+            log_probs=[-0.4] * len(_ids(" solved")),
+            prompt_log_prob_token_ids=seed_ids,
+            prompt_log_probs=[-0.25] * len(seed_ids),
+            prompt_log_prob_start=prompt_logprob_start,
+        )
 
     loop._generate = fake_generate
     solution_ids = _ids("start dead and waste")
@@ -400,6 +575,8 @@ def test_agent_loop_generates_all_critiques_then_one_continuation_per_valid_edit
         loop.run(
             {"temperature": 0.2, "logprobs": False},
             branch_revision_rollout_id="p:0",
+            branch_revision_parent_objective="recovery",
+            branch_revision_num_critiques=2,
             branch_revision_parent_prompt_ids=_ids("q"),
             branch_revision_parent_solution_ids=solution_ids,
             branch_revision_parent_solution_log_probs=[-0.1] * len(solution_ids),
@@ -409,13 +586,13 @@ def test_agent_loop_generates_all_critiques_then_one_continuation_per_valid_edit
     record = output.extra_fields[BRANCH_REVISION_CHILD_FIELD]
     assert list(record.critique_prompt_ids[: len(_ids("qstart dead and waste"))]) == _ids("qstart dead and waste")
     assert decode_exact(record.critique_prompt_ids, TOKENIZER).endswith(
-        "</assistant><user>--- BEGIN CRITIQUE TASK ---"
-        + BRANCH_REVISION_CRITIQUE_PROMPT.removeprefix("--- BEGIN CRITIQUE TASK ---")
-        + "</user><assistant><think>\n\n</think>\n\n"
+        "</assistant><user>" + BRANCH_REVISION_CRITIQUE_PROMPT + "</user><assistant><think>\n\n</think>\n\n"
     )
     assert [critique.parse_reason for critique in record.critiques] == ["valid", "tag_count"]
+    assert record.objective == "recovery"
     assert len(record.critiques[0].continuation_ids) > 0
     assert record.critiques[0].continuation_max_tokens >= loop.feature.min_continuation_tokens
+    assert record.critiques[0].new_continuation_log_probs == pytest.approx([-0.25] * len(_ids("better")))
     assert record.critiques[1].continuation_ids == ()
     assert [call[0] for call in calls] == ["critique[0]", "critique[1]", "continuation[0]"]
 
@@ -425,8 +602,9 @@ def test_agent_loop_rejects_edits_without_the_configured_continuation_budget() -
     loop.response_length = 100
     calls: list[str] = []
 
-    async def fake_generate(_route, _prompt, _params, *, max_tokens, kind):
+    async def fake_generate(_route, _prompt, _params, *, max_tokens, kind, prompt_logprob_start=None):
         del max_tokens
+        assert prompt_logprob_start is None
         calls.append(kind)
         text = _structured("dead", "better")
         return TokenOutput(token_ids=_ids(text), log_probs=[-0.2] * len(_ids(text)))
@@ -437,6 +615,8 @@ def test_agent_loop_rejects_edits_without_the_configured_continuation_budget() -
         loop.run(
             {},
             branch_revision_rollout_id="p:0",
+            branch_revision_parent_objective="recovery",
+            branch_revision_num_critiques=2,
             branch_revision_parent_prompt_ids=_ids("q"),
             branch_revision_parent_solution_ids=solution_ids,
             branch_revision_parent_solution_log_probs=[-0.1] * len(solution_ids),
@@ -451,12 +631,44 @@ def test_agent_loop_rejects_edits_without_the_configured_continuation_budget() -
     assert calls == ["critique[0]", "critique[1]"]
 
 
+def test_agent_loop_uses_the_positive_compression_prompt_for_correct_parents() -> None:
+    loop = _loop()
+
+    async def fake_generate(_route, prompt, _params, *, max_tokens, kind, prompt_logprob_start=None):
+        del max_tokens
+        assert prompt_logprob_start is None
+        assert kind.startswith("critique")
+        decoded_prompt = decode_exact(prompt, TOKENIZER)
+        assert "</assistant><user>The solution above is correct." in decoded_prompt
+        text = "free analysis without tags"
+        return TokenOutput(token_ids=_ids(text), log_probs=[-0.2] * len(_ids(text)))
+
+    loop._generate = fake_generate
+    solution_ids = _ids("correct but verbose")
+    output = asyncio.run(
+        loop.run(
+            {},
+            branch_revision_rollout_id="p:1",
+            branch_revision_parent_objective="compression",
+            branch_revision_num_critiques=2,
+            branch_revision_parent_prompt_ids=_ids("q"),
+            branch_revision_parent_solution_ids=solution_ids,
+            branch_revision_parent_solution_log_probs=[-0.1] * len(solution_ids),
+            raw_prompt=[{"role": "user", "content": "q"}],
+        )
+    )
+    record = output.extra_fields[BRANCH_REVISION_CHILD_FIELD]
+    assert record.objective == "compression"
+    assert len(record.critiques) == 2
+
+
 def test_agent_loop_drains_all_sibling_failures_before_raising() -> None:
     loop = _loop()
     completed: list[str] = []
 
-    async def fake_generate(_route, _prompt, _params, *, max_tokens, kind):
+    async def fake_generate(_route, _prompt, _params, *, max_tokens, kind, prompt_logprob_start=None):
         del max_tokens
+        assert prompt_logprob_start is None
         await asyncio.sleep(0.001 if kind == "critique[0]" else 0.003)
         completed.append(kind)
         if kind == "critique[0]":
@@ -470,6 +682,8 @@ def test_agent_loop_drains_all_sibling_failures_before_raising() -> None:
             loop.run(
                 {},
                 branch_revision_rollout_id="p:0",
+                branch_revision_parent_objective="recovery",
+                branch_revision_num_critiques=2,
                 branch_revision_parent_prompt_ids=_ids("q"),
                 branch_revision_parent_solution_ids=solution_ids,
                 branch_revision_parent_solution_log_probs=[-0.1] * len(solution_ids),
@@ -521,6 +735,9 @@ def _critique(text: str, *, valid: bool, continuation: str = "") -> BranchRevisi
             parse_reason="valid",
             branch_text="dead",
             new_continuation_text="better",
+            branch_prefix_ids=tuple(_ids("start ")),
+            new_continuation_ids=tuple(_ids("better")),
+            new_continuation_log_probs=tuple([-0.05] * len(_ids("better"))),
             revised_prefix_ids=tuple(_ids("start better")),
             continuation_ids=tuple(_ids(continuation)),
             continuation_log_probs=tuple([-0.3] * len(_ids(continuation))),
@@ -534,8 +751,47 @@ def _critique(text: str, *, valid: bool, continuation: str = "") -> BranchRevisi
         parse_reason="tag_count",
         branch_text="",
         new_continuation_text="",
+        branch_prefix_ids=(),
+        new_continuation_ids=(),
+        new_continuation_log_probs=(),
         revised_prefix_ids=(),
     )
+
+
+def _learnability(*, percentile: float = 1.0, weight: float = 1.0, accepted: bool = True) -> LearnabilityScore:
+    return LearnabilityScore(
+        seed_mean_log_prob=-0.1,
+        percentile=percentile,
+        reward_weight=weight,
+        accepted=accepted,
+        eligible_rollouts=2,
+        sampled_windows=4,
+    )
+
+
+def test_learnability_fails_closed_without_aligned_vllm_prompt_scores() -> None:
+    controller = _controller()
+    valid = replace(
+        _critique(_structured("dead", "better"), valid=True, continuation=" solved"),
+        new_continuation_log_probs=(),
+    )
+    bundle = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord(
+            "p:0",
+            "recovery",
+            (valid, _critique("invalid", valid=False)),
+            tuple(_ids("prompt")),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="one vLLM prompt log probability"):
+        controller._score_seed_learnability([bundle])
 
 
 def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revision_seed() -> None:
@@ -552,9 +808,11 @@ def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revis
         original_reward=0.0,
         record=BranchRevisionGenerationRecord(
             "p:0",
+            "recovery",
             (valid, invalid),
             tuple([*_ids("q"), *_ids("start dead and waste"), *_ids("<followup>")]),
         ),
+        learnability={0: _learnability()},
         continuation_rewards={0: 1.0},
     )
     correct = _Bundle(
@@ -592,6 +850,110 @@ def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revis
     assert actor_batch.batch["advantages"][original_rows[0]].min().item() < 0
     assert actor_batch.batch["advantages"][original_rows[1]].max().item() > 0
     assert actor_batch.meta_info["use_global_loss_normalization"] is True
+
+
+def test_positive_critique_reward_combines_compression_and_learnability_credit() -> None:
+    controller = _controller()
+    valid = _critique(_structured("dead", "better"), valid=True, continuation=" done")
+    invalid = _critique("invalid", valid=False)
+    bundle = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and a very long waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and a very long waste")),
+        original_reward=1.0,
+        record=BranchRevisionGenerationRecord(
+            "p:0",
+            "compression",
+            (valid, invalid),
+            tuple([*_ids("q"), *_ids("start dead and a very long waste"), *_ids("<followup>")]),
+        ),
+        learnability={0: _learnability(percentile=0.35, weight=0.5)},
+        continuation_rewards={0: 1.0},
+        compression_fractions={0: 0.25},
+        compression_credits={0: 1.0},
+    )
+    rows = controller._actor_rows([bundle])
+    assert [row.kind for row in rows] == ["original", "critique", "continuation", "critique"]
+    assert [row.reward for row in rows if row.kind == "critique"] == pytest.approx([0.5, 0.0])
+    assert next(row for row in rows if row.kind == "continuation").reward == 1.0
+
+
+def test_recovery_critique_reward_applies_learnability_before_prompt_baseline() -> None:
+    controller = _controller()
+    valid = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    invalid = _critique("invalid", valid=False)
+    wrong = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord("p:0", "recovery", (valid, invalid), tuple(_ids("prompt"))),
+        learnability={0: _learnability(weight=0.5)},
+        continuation_rewards={0: 1.0},
+    )
+    correct = _Bundle(
+        source_row=1,
+        rollout_id="p:1",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("correct"),
+        solution_log_probs=[-0.1] * len(_ids("correct")),
+        original_reward=1.0,
+    )
+    rows = controller._actor_rows([wrong, correct])
+    assert [row.reward for row in rows if row.kind == "critique"] == pytest.approx([0.0, -0.5])
+
+
+def test_positive_continuation_credit_uses_completed_editable_length(monkeypatch) -> None:
+    controller = _controller()
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        num_critiques=2,
+        enable_positive_compression=True,
+        num_positive_critiques=2,
+        positive_compression_target=0.5,
+    )
+    controller.config.actor_rollout_ref.rollout.prompt_length = 8
+    controller.config.actor_rollout_ref.rollout.response_length = 256
+    controller.trainer.reward_fn = object()
+    source, _ = _source_batch()
+    valid = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    bundle = _Bundle(
+        source_row=1,
+        rollout_id="p:1",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and a very long waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and a very long waste")),
+        original_reward=1.0,
+        record=BranchRevisionGenerationRecord(
+            "p:1",
+            "compression",
+            (valid, _critique("invalid", valid=False)),
+            tuple(_ids("prompt")),
+        ),
+        learnability={0: _learnability()},
+    )
+
+    def fake_compute_reward(batch, reward_fn, actor_wg):
+        del reward_fn, actor_wg
+        tensor = torch.zeros_like(batch.batch["responses"], dtype=torch.float32)
+        tensor[0, int(batch.batch["response_mask"][0].sum()) - 1] = 1.0
+        return tensor, {}
+
+    monkeypatch.setattr(branch_controller_module, "compute_reward", fake_compute_reward)
+    controller._evaluate_continuations(source, [bundle])
+    original_length = len(_ids("start dead and a very long waste"))
+    revised_length = len(_ids("start better solved"))
+    expected_fraction = (original_length - revised_length) / original_length
+    assert bundle.compression_fractions[0] == pytest.approx(expected_fraction)
+    assert bundle.compression_credits[0] == pytest.approx(min(expected_fraction / 0.5, 1.0))
 
 
 @pytest.mark.parametrize("loss_fn", [compute_policy_loss_vanilla, compute_policy_loss_dppo_tv])
@@ -692,6 +1054,69 @@ def _source_batch() -> tuple[object, torch.Tensor]:
     return source, rewards
 
 
+def test_child_request_selects_correct_rollouts_only_when_positive_compression_is_enabled() -> None:
+    controller = _controller()
+    source, reward_tensor = _source_batch()
+    rewards = controller._original_rewards(reward_tensor)
+    bundles = controller._build_bundles(source, rewards)
+    negative_only = controller._make_child_request(source, bundles)
+    assert len(negative_only) == 1
+    assert negative_only.non_tensor_batch["branch_revision_parent_objective"].tolist() == ["recovery"]
+
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        num_critiques=2,
+        enable_positive_compression=True,
+        num_positive_critiques=3,
+    )
+    both = controller._make_child_request(source, bundles)
+    assert len(both) == 2
+    assert both.non_tensor_batch["branch_revision_parent_objective"].tolist() == ["recovery", "compression"]
+    assert both.non_tensor_batch["branch_revision_num_critiques"].tolist() == [2, 3]
+
+
+def test_low_learnability_edit_is_not_rewarded_or_solution_trained(monkeypatch) -> None:
+    controller = _controller()
+    source, _ = _source_batch()
+    valid = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    invalid = _critique("invalid", valid=False)
+    rejected = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord(
+            "p:0",
+            "recovery",
+            (valid, invalid),
+            tuple([*_ids("q"), *_ids("start dead and waste"), *_ids("<followup>")]),
+        ),
+        learnability={0: _learnability(percentile=0.1, weight=0.0, accepted=False)},
+    )
+    correct = _Bundle(
+        source_row=1,
+        rollout_id="p:1",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("correct"),
+        solution_log_probs=[-0.1] * len(_ids("correct")),
+        original_reward=1.0,
+    )
+    monkeypatch.setattr(
+        branch_controller_module,
+        "compute_reward",
+        lambda *_args, **_kwargs: pytest.fail("rejected continuation reached the reward function"),
+    )
+    controller._evaluate_continuations(source, [rejected, correct])
+    assert rejected.continuation_rewards == {}
+    rows = controller._actor_rows([rejected, correct])
+    assert all(row.kind != "continuation" for row in rows)
+    assert [row.reward for row in rows if row.kind == "critique"] == [-0.5, -0.5]
+
+
 def test_full_controller_update_critiques_only_incorrect_and_trains_one_combined_batch(monkeypatch) -> None:
     controller = _controller()
     controller.config.actor_rollout_ref.rollout.prompt_length = 8
@@ -701,6 +1126,7 @@ def test_full_controller_update_critiques_only_incorrect_and_trains_one_combined
     invalid = _critique("invalid", valid=False)
     record = BranchRevisionGenerationRecord(
         "p:0",
+        "recovery",
         (valid, invalid),
         tuple([*_ids("q"), *_ids("start dead and waste"), *_ids("<followup>")]),
     )
@@ -723,7 +1149,7 @@ def test_full_controller_update_critiques_only_incorrect_and_trains_one_combined
 
     controller.trainer = SimpleNamespace(
         global_steps=1,
-        actor_rollout_wg=object(),
+        actor_rollout_wg=SimpleNamespace(world_size=2),
         checkpoint_manager=SimpleNamespace(
             update_weights=lambda _step: events.append("restore"),
             sleep_replicas=lambda: events.append("sleep"),

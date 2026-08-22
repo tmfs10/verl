@@ -54,7 +54,10 @@ def _extra_args(
     n_samples: int = 4,
     num_critiques: int = 4,
     model_path: str = MODEL_PATH,
+    loss_mode: str = "dppo_tv",
 ) -> str:
+    if loss_mode not in {"dppo_tv", "vanilla"}:
+        raise ValueError("loss_mode must be dppo_tv or vanilla")
     overrides = [
         "~critic.append_solution_to_prompt",
         "algorithm.adv_estimator=grpo",
@@ -62,6 +65,12 @@ def _extra_args(
         "algorithm.intermediate_mc_value.enable=false",
         "algorithm.branch_revision_grpo.enable=true",
         f"algorithm.branch_revision_grpo.num_critiques={num_critiques}",
+        "algorithm.branch_revision_grpo.enable_positive_compression=true",
+        f"algorithm.branch_revision_grpo.num_positive_critiques={num_critiques}",
+        "algorithm.branch_revision_grpo.positive_compression_target=0.25",
+        "algorithm.branch_revision_grpo.min_seed_window_percentile=0.20",
+        "algorithm.branch_revision_grpo.full_credit_seed_window_percentile=0.50",
+        "algorithm.branch_revision_grpo.learnability_windows_per_rollout=8",
         "algorithm.branch_revision_grpo.critique_max_response_length=2560",
         "algorithm.branch_revision_grpo.branch_max_tokens=128",
         "algorithm.branch_revision_grpo.new_continuation_max_tokens=256",
@@ -84,7 +93,7 @@ def _extra_args(
         "actor_rollout_ref.actor.use_dynamic_bsz=true",
         "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192",
         "actor_rollout_ref.actor.use_kl_loss=false",
-        "actor_rollout_ref.actor.policy_loss.loss_mode=dppo_tv",
+        f"actor_rollout_ref.actor.policy_loss.loss_mode={loss_mode}",
         "actor_rollout_ref.actor.fsdp_config.param_offload=false",
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=false",
         "actor_rollout_ref.rollout.name=vllm",
@@ -92,8 +101,11 @@ def _extra_args(
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.top_p=1.0",
         "actor_rollout_ref.rollout.top_k=-1",
+        "actor_rollout_ref.rollout.repetition_penalty=1.0",
         "actor_rollout_ref.rollout.logprobs_mode=processed_logprobs",
         "actor_rollout_ref.rollout.val_kwargs.temperature=1.0",
+        "actor_rollout_ref.rollout.val_kwargs.top_p=1.0",
+        "actor_rollout_ref.rollout.val_kwargs.top_k=-1",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.max_model_len=6144",
         "actor_rollout_ref.rollout.max_num_batched_tokens=8192",
@@ -110,7 +122,7 @@ def _extra_args(
         "trainer.critic_warmup=0",
         "trainer.logger=[file]",
         "trainer.project_name=branch_revision_grpo_smoke",
-        "trainer.experiment_name=qwen3_1p7b_dppo_tv",
+        f"trainer.experiment_name=branch_revision_{loss_mode}",
         f"trainer.default_local_dir={remote_evidence}/checkpoints",
         "trainer.total_training_steps=1",
         "trainer.total_epochs=1",
@@ -127,6 +139,7 @@ def _extra_args(
         f"+branch_revision_smoke.n_samples={n_samples}",
         f"+branch_revision_smoke.num_critiques={num_critiques}",
         f"+branch_revision_smoke.model_path={model_path}",
+        f"+branch_revision_smoke.loss_mode={loss_mode}",
     ]
     return " ".join(overrides)
 
@@ -145,6 +158,7 @@ def build_command(
     num_critiques: int = 4,
     seed: int = 43,
     model_path: str = MODEL_PATH,
+    loss_mode: str = "dppo_tv",
 ) -> tuple[list[str], str]:
     positive = {
         "n_prompts": n_prompts,
@@ -162,6 +176,8 @@ def build_command(
         raise ValueError("seed must be a nonnegative integer")
     if model_path not in SUPPORTED_MODEL_PATHS:
         raise ValueError(f"model_path must be one of {sorted(SUPPORTED_MODEL_PATHS)!r}")
+    if loss_mode not in {"dppo_tv", "vanilla"}:
+        raise ValueError("loss_mode must be dppo_tv or vanilla")
     remote_output = f"/output/smoke_tests/branch_revision_grpo/{run_tag}"
     remote_evidence = f"{remote_output}/evidence"
     command = [
@@ -254,6 +270,7 @@ def build_command(
             n_samples=n_samples,
             num_critiques=num_critiques,
             model_path=model_path,
+            loss_mode=loss_mode,
         ),
     ]
     if dry_run:
@@ -285,6 +302,7 @@ def main() -> None:
     parser.add_argument("--num-critiques", type=int, default=4)
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument("--model-path", choices=sorted(SUPPORTED_MODEL_PATHS), default=MODEL_PATH)
+    parser.add_argument("--loss-mode", choices=("dppo_tv", "vanilla"), default="dppo_tv")
     args = parser.parse_args()
 
     local_run_dir = args.local_run_dir.expanduser().resolve()
@@ -339,6 +357,7 @@ def main() -> None:
         num_critiques=args.num_critiques,
         seed=args.seed,
         model_path=args.model_path,
+        loss_mode=args.loss_mode,
     )
     git = _git_provenance(repo_root)
     provenance = {
@@ -366,6 +385,7 @@ def main() -> None:
             num_critiques=args.num_critiques,
             seed=args.seed,
             model_path=args.model_path,
+            loss_mode=args.loss_mode,
         )
         result = _run(dry_command, local_run_dir / "dry_run.log")
         if result.returncode:

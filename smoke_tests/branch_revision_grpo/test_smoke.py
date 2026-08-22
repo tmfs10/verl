@@ -43,6 +43,9 @@ def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(t
     assert "actor_rollout_ref.rollout.val_kwargs.temperature=1.0" in rendered
     assert "actor_rollout_ref.actor.policy_loss.loss_mode=dppo_tv" in rendered
     assert "algorithm.branch_revision_grpo.num_critiques=4" in rendered
+    assert "algorithm.branch_revision_grpo.enable_positive_compression=true" in rendered
+    assert "algorithm.branch_revision_grpo.num_positive_critiques=4" in rendered
+    assert "algorithm.branch_revision_grpo.min_seed_window_percentile=0.20" in rendered
     assert "actor_rollout_ref.rollout.n=4" in rendered
     assert "algorithm.branch_revision_grpo.min_continuation_tokens=128" in rendered
     assert "data.max_response_length=2048" in rendered
@@ -77,10 +80,27 @@ def test_rendered_smoke_scales_dataset_batch_rollouts_and_critiques_together(tmp
     assert "++data.gen_batch_size=32" in rendered
     assert "actor_rollout_ref.rollout.n=4" in rendered
     assert "algorithm.branch_revision_grpo.num_critiques=6" in rendered
+    assert "algorithm.branch_revision_grpo.num_positive_critiques=6" in rendered
     assert "+branch_revision_smoke.n_prompts=32" in rendered
     assert "+branch_revision_smoke.n_samples=4" in rendered
     assert "+branch_revision_smoke.num_critiques=6" in rendered
     assert "+branch_revision_smoke.model_path=/hf_models/Qwen3-4B" in rendered
+
+
+def test_rendered_smoke_can_select_native_clipped_ppo(tmp_path: Path) -> None:
+    command, _ = build_command(
+        run_tag="vanilla",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        loss_mode="vanilla",
+    )
+    rendered = " ".join(command)
+    assert "actor_rollout_ref.actor.policy_loss.loss_mode=vanilla" in rendered
+    assert "+branch_revision_smoke.loss_mode=vanilla" in rendered
 
 
 @pytest.mark.parametrize(
@@ -92,6 +112,7 @@ def test_rendered_smoke_scales_dataset_batch_rollouts_and_critiques_together(tmp
         ({"num_critiques": 1}, "at least 2"),
         ({"seed": -1}, "nonnegative"),
         ({"model_path": "/hf_models/not-supported"}, "model_path"),
+        ({"loss_mode": "not-supported"}, "loss_mode"),
     ],
 )
 def test_rendered_smoke_rejects_invalid_scale(overrides: dict[str, int | str], match: str, tmp_path: Path) -> None:
@@ -130,6 +151,9 @@ def _scaled_runtime_config(tmp_path: Path):
                     "n": 4,
                     "max_model_len": 6144,
                     "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": -1,
+                    "repetition_penalty": 1.0,
                     "val_kwargs": {"temperature": 1.0},
                 },
                 "actor": {
@@ -144,6 +168,8 @@ def _scaled_runtime_config(tmp_path: Path):
                 "branch_revision_grpo": {
                     "enable": True,
                     "num_critiques": 6,
+                    "enable_positive_compression": True,
+                    "num_positive_critiques": 6,
                     "critique_max_response_length": 2560,
                     "min_continuation_tokens": 128,
                     "audit_output_dir": str(tmp_path / "audit"),
@@ -170,7 +196,13 @@ def test_scaled_runtime_contract_accepts_matching_resolved_dimensions(tmp_path: 
     _validate_contract(
         config,
         tmp_path,
-        {"model_path": str(tmp_path / "model"), "n_prompts": 32, "n_samples": 4, "num_critiques": 6},
+        {
+            "model_path": str(tmp_path / "model"),
+            "n_prompts": 32,
+            "n_samples": 4,
+            "num_critiques": 6,
+            "loss_mode": "dppo_tv",
+        },
     )
 
 
@@ -180,7 +212,13 @@ def test_scaled_runtime_contract_rejects_stale_fixed_dimension(tmp_path: Path) -
         _validate_contract(
             config,
             tmp_path,
-            {"model_path": str(tmp_path / "model"), "n_prompts": 8, "n_samples": 4, "num_critiques": 6},
+            {
+                "model_path": str(tmp_path / "model"),
+                "n_prompts": 8,
+                "n_samples": 4,
+                "num_critiques": 6,
+                "loss_mode": "dppo_tv",
+            },
         )
 
 
@@ -199,9 +237,20 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
     _write_json(
         root / "resolved_config.json",
         {
-            "algorithm": {"branch_revision_grpo": {"num_critiques": 2, "min_continuation_tokens": 128}},
+            "algorithm": {
+                "branch_revision_grpo": {
+                    "num_critiques": 2,
+                    "enable_positive_compression": True,
+                    "num_positive_critiques": 2,
+                    "positive_compression_target": 0.25,
+                    "min_continuation_tokens": 128,
+                }
+            },
             "data": {"train_batch_size": 8},
-            "actor_rollout_ref": {"rollout": {"n": 2}},
+            "actor_rollout_ref": {
+                "rollout": {"n": 2},
+                "actor": {"policy_loss": {"loss_mode": "dppo_tv"}},
+            },
         },
     )
     events = []
@@ -215,20 +264,56 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
         for index in range(16)
     ]
     continuation_count = 0
-    for original_index in range(2):
+    structurally_valid_count = 0
+    prompt_pass_at_1 = {
+        "prompt-0": 0.5,
+        "prompt-1": 0.5,
+        **{f"prompt-{index}": 1.0 for index in range(2, 8)},
+    }
+    for original_index, original_reward in enumerate(original_rewards):
         rollout = f"p:{original_index}"
-        prompt_group_id = f"prompt-{original_index}"
+        prompt_group_id = f"prompt-{original_index // 2}"
+        objective = "recovery" if original_reward == 0.0 else "compression"
+        baseline = prompt_pass_at_1[prompt_group_id]
         for critique_index in range(2):
-            valid = include_continuation and original_index == 0 and critique_index == 0
+            valid = include_continuation and original_index in {0, 1} and critique_index == 0
+            if valid:
+                structurally_valid_count += 1
+                events.append(
+                    {
+                        "event": "learnability",
+                        "score_source": "vllm_prompt_logprobs",
+                        "rollout_id": rollout,
+                        "objective": objective,
+                        "critique_index": critique_index,
+                        "seed_tokens": 2,
+                        "seed_mean_log_prob": -0.1,
+                        "percentile": 1.0,
+                        "reward_weight": 1.0,
+                        "accepted": True,
+                        "eligible_rollouts": 16,
+                        "sampled_windows": 128,
+                    }
+                )
+            outcome = 1.0 if valid else 0.0
+            objective_credit = outcome
+            reward = outcome - baseline if objective == "recovery" else objective_credit
             events.append(
                 {
                     "event": "critique",
                     "rollout_id": rollout,
                     "prompt_group_id": prompt_group_id,
+                    "objective": objective,
                     "critique_index": critique_index,
-                    "reward": 0.5 if valid else -0.5,
-                    "continuation_outcome": 1.0 if valid else 0.0,
-                    "prompt_pass_at_1": 0.5,
+                    "reward": reward,
+                    "objective_credit": objective_credit,
+                    "continuation_outcome": outcome,
+                    "prompt_pass_at_1": baseline,
+                    "learnability_accepted": valid,
+                    "learnability_percentile": 1.0 if valid else None,
+                    "learnability_weight": 1.0 if valid else 0.0,
+                    "compression_fraction": 0.25 if valid and objective == "compression" else None,
+                    "compression_credit": 1.0 if valid and objective == "compression" else None,
                     "parse_reason": "valid" if valid else "tag_count",
                     "branch": "bad" if valid else "",
                     "new_continuation": "good" if valid else "",
@@ -241,7 +326,7 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                 {
                     "kind": "critique",
                     "group_id": f"critique:{rollout}",
-                    "reward": 0.5 if valid else -0.5,
+                    "reward": reward,
                 }
             )
             if valid:
@@ -250,12 +335,15 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                     {
                         "event": "continuation",
                         "rollout_id": rollout,
+                        "objective": objective,
                         "critique_index": critique_index,
                         "reward": 1.0,
                         "revised_prefix_ids": [1],
                         "continuation_ids": [2],
                         "continuation_log_probs": [-0.2],
                         "continuation_max_tokens": 128,
+                        "compression_fraction": 0.25 if objective == "compression" else None,
+                        "compression_credit": 1.0 if objective == "compression" else None,
                     }
                 )
                 actor_rows.append(
@@ -265,7 +353,8 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                         "reward": 1.0,
                     }
                 )
-    rows = 16 + 4 + continuation_count
+    critique_count = 16 * 2
+    rows = 16 + critique_count + continuation_count
     padding = (-rows) % 8
     events.extend(
         [
@@ -273,7 +362,7 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                 "event": "actor_batch",
                 "rows": rows,
                 "original": 16,
-                "critiques": 4,
+                "critiques": critique_count,
                 "continuations": continuation_count,
                 "padding": padding,
                 "policy_loss_mode": "dppo_tv",
@@ -283,12 +372,10 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                 "event": "iteration",
                 "originals": 16,
                 "incorrect": 2,
+                "correct": 14,
+                "positive_compression_enabled": True,
                 "original_rewards": original_rewards,
-                "prompt_pass_at_1": {
-                    "prompt-0": 0.5,
-                    "prompt-1": 0.5,
-                    **{f"prompt-{index}": 1.0 for index in range(2, 8)},
-                },
+                "prompt_pass_at_1": prompt_pass_at_1,
             },
         ]
     )
@@ -301,8 +388,12 @@ def _fixture(root: Path, *, include_continuation: bool = True) -> None:
                 "data": {
                     "branch_revision/originals": 16.0,
                     "branch_revision/incorrect_originals": 2.0,
-                    "branch_revision/critiques": 4.0,
-                    "branch_revision/valid_edits": float(continuation_count),
+                    "branch_revision/correct_originals": 14.0,
+                    "branch_revision/critiques": float(critique_count),
+                    "branch_revision/recovery_critiques": 4.0,
+                    "branch_revision/compression_critiques": 28.0,
+                    "branch_revision/valid_edits": float(structurally_valid_count),
+                    "branch_revision/learnability_accepted_edits": float(continuation_count),
                     "branch_revision/continuations": float(continuation_count),
                     "branch_revision/policy_loss_is_dppo_tv": 1.0,
                     "actor/grad_norm": 1.0,
@@ -317,7 +408,25 @@ def test_verifier_accepts_complete_live_contract(tmp_path: Path) -> None:
     _fixture(tmp_path)
     result = verify(tmp_path)
     assert result["status"] == "verified"
-    assert result["valid_edits"] == 1
+    assert result["valid_edits"] == 2
+    assert result["successful_compression_credit"] == 1.0
+
+
+def test_verifier_accepts_native_clipped_ppo_evidence(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    config_path = tmp_path / "resolved_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["actor_rollout_ref"]["actor"]["policy_loss"]["loss_mode"] = "vanilla"
+    _write_json(config_path, config)
+    audit_path = tmp_path / "audit" / "step_00000001.jsonl"
+    events = [json.loads(line) for line in audit_path.read_text(encoding="utf-8").splitlines()]
+    next(event for event in events if event["event"] == "actor_batch")["policy_loss_mode"] = "vanilla"
+    _write_jsonl(audit_path, events)
+    metrics_path = tmp_path / "metrics.jsonl"
+    metrics = [json.loads(line) for line in metrics_path.read_text(encoding="utf-8").splitlines()]
+    metrics[0]["data"]["branch_revision/policy_loss_is_dppo_tv"] = 0.0
+    _write_jsonl(metrics_path, metrics)
+    assert verify(tmp_path)["policy_loss_mode"] == "vanilla"
 
 
 def test_verifier_rejects_smoke_without_a_valid_revision(tmp_path: Path) -> None:
@@ -359,10 +468,23 @@ def test_verifier_rejects_critique_baseline_from_wrong_prompt_group(tmp_path: Pa
         verify(tmp_path)
 
 
+def test_verifier_requires_vllm_prompt_logprobs_for_learnability(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    path = tmp_path / "audit" / "step_00000001.jsonl"
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    learnability = next(event for event in events if event["event"] == "learnability")
+    learnability["score_source"] = "actor_forward"
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="did not use vLLM prompt log probabilities"):
+        verify(tmp_path)
+
+
 def test_extra_args_contains_no_async_or_critic_training() -> None:
     rendered = _extra_args("/output/evidence")
     assert "critic.enable=false" in rendered
     assert "launch_reward_fn_async=false" in rendered
     assert "actor_rollout_ref.rollout.temperature=1.0" in rendered
+    assert "actor_rollout_ref.rollout.repetition_penalty=1.0" in rendered
+    assert "enable_positive_compression=true" in rendered
     assert "critique_max_response_length=2560" in rendered
     assert "min_continuation_tokens=128" in rendered

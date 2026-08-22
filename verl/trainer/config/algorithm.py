@@ -22,6 +22,8 @@ from verl.base_config import BaseConfig
 __all__ = [
     "AlgoConfig",
     "BRANCH_REVISION_CRITIQUE_PROMPT",
+    "BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT",
+    "BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT",
     "BranchRevisionGRPOConfig",
     "FilterGroupsConfig",
     "INTERMEDIATE_MC_CRITIQUE_PROMPT",
@@ -36,31 +38,101 @@ __all__ = [
 ]
 
 
-BRANCH_REVISION_CRITIQUE_PROMPT = """--- BEGIN CRITIQUE TASK ---
-The immediately preceding assistant turn is a completed, incorrect attempted
-solution. Critique that attempt; do not continue it or solve the problem again.
+BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT = """\
+The attempted solution above is incorrect. Analyze it with the goal of improving
+its chance of solving the task within the remaining token budget.
 
-Your entire response must be concise, have no preamble, and begin with these
-exact labels in this order:
-1. PRUNING: State which steps meaningfully pruned the search space and which
-   steps did not.
-2. SWITCH: State the earliest point where the attempt should have changed
-   direction and the better direction it should have taken.
-3. EDIT: Identify the earliest useful replacement that would move the remaining
-   reasoning away from a dead end and improve its chance of success within the
-   remaining token budget.
+Reason about which parts/steps meaningfully narrowed the available
+possibilities or pruned the search space and which parts/steps did not. Explain when the trajectory should have
+changed direction and what direction would have been more productive. Then
+select an appropriate point at which to revise the trajectory.
 
-After those three short numbered paragraphs, end with exactly one <branch> tag
-pair followed by exactly one <new continuation> tag pair, with at most
-whitespace between the pairs. The text inside <branch> is not analysis: copy
-and paste it character-for-character from one complete line or a short span of
-the attempted solution. Include enough adjacent distinctive text that the span
-occurs exactly once. Do not paraphrase, correct, normalize, or reformat anything
-inside <branch>; put every correction only inside <new continuation>. The text inside
-<new continuation> is the replacement reasoning to use at that point. Do not
-open <branch> before the numbered critique. Do not write anything after the
-closing </new continuation> tag.
---- END CRITIQUE TASK ---"""
+Treat the point immediately before <branch> as the information boundary for
+the replacement. Choose <branch> so that this boundary falls between coherent
+steps, not in the middle of a thought or action.
+
+The replacement may use an idea that also appears later in the trajectory only
+when the task and the trajectory before the branch already provide a reasonable
+basis for proposing that idea as the next direction.
+
+Consider the trajectory counterfactually with everything after the branch
+hidden. If work performed after the branch materially changed what was known,
+narrowed the available possibilities, or made the idea substantially more
+plausible, do not place that idea directly in the replacement. Instead, propose
+the next local step needed to make that progress. We do not want to
+short-circuit useful exploration with hindsight.
+
+Do not compress a sequence of later developments into one hindsight statement.
+The replacement should express one locally justified next move or direction
+and leave subsequent work for the continuation rollout to perform. In your
+analysis, explain why the information available before the branch supports the
+proposed replacement.
+
+Copy the text inside <branch> character-for-character from one complete line or
+short coherent span of the attempted solution. Include enough distinctive
+adjacent text that the span occurs exactly once. Do not correct, normalize,
+paraphrase, or reformat anything inside <branch>. Put the proposed replacement
+only inside <new continuation>.
+
+The text inside <new continuation> must be nonempty and concise. It must not
+state the final result in any form, declare that the task has been completed,
+or contain a boxed answer, answer delimiter, or final-answer phrase.
+
+After the free-form analysis, end with exactly one <branch> tag pair followed
+by exactly one <new continuation> tag pair. Do not use either tag anywhere
+else. Permit only whitespace between the two tag pairs, and write nothing
+after the closing </new continuation> tag."""
+
+
+BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT = """\
+The solution above is correct. Analyze it with the goal of improving reasoning
+efficiency: reducing the amount of reasoning needed to reach the correct result
+without sacrificing correctness.
+
+Reason about which parts/steps meaningfully narrowed the available
+possibilities or pruned the search space and which parts/steps did not. Explain when the trajectory should have
+changed direction and what direction would have been more productive. Then
+select an appropriate point at which to revise the trajectory.
+
+Treat the point immediately before <branch> as the information boundary for
+the replacement. Choose <branch> so that this boundary falls between coherent
+steps, not in the middle of a thought or action.
+
+The replacement may use an idea that also appears later in the trajectory only
+when the task and the trajectory before the branch already provide a reasonable
+basis for proposing that idea as the next direction.
+
+Consider the trajectory counterfactually with everything after the branch
+hidden. If work performed after the branch materially changed what was known,
+narrowed the available possibilities, or made the idea substantially more
+plausible, do not place that idea directly in the replacement. Instead, propose
+the next local step needed to make that progress. We do not want to
+short-circuit useful exploration with hindsight.
+
+Do not compress a sequence of later developments into one hindsight statement.
+The replacement should express one locally justified next move or direction
+and leave subsequent work for the continuation rollout to perform. In your
+analysis, explain why the information available before the branch supports the
+proposed replacement.
+
+Copy the text inside <branch> character-for-character from one complete line or
+short coherent span of the solution. Include enough distinctive adjacent text
+that the span occurs exactly once. Do not correct, normalize, paraphrase, or
+reformat anything inside <branch>. Put the proposed replacement only inside
+<new continuation>.
+
+The text inside <new continuation> must be nonempty and concise. It must not
+state the final result in any form, declare that the task has been completed,
+or contain a boxed answer, answer delimiter, or final-answer phrase.
+
+After the free-form analysis, end with exactly one <branch> tag pair followed
+by exactly one <new continuation> tag pair. Do not use either tag anywhere
+else. Permit only whitespace between the two tag pairs, and write nothing
+after the closing </new continuation> tag."""
+
+
+# Backwards-compatible name for the incorrect-rollout instruction.
+BRANCH_REVISION_CRITIQUE_PROMPT = BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT
 
 
 @dataclass
@@ -69,17 +141,26 @@ class BranchRevisionGRPOConfig(BaseConfig):
 
     enable: bool = False
     num_critiques: int = 4
+    enable_positive_compression: bool = False
+    num_positive_critiques: int = 4
+    positive_compression_target: float = 0.25
+    min_seed_window_percentile: float = 0.20
+    full_credit_seed_window_percentile: float = 0.50
+    learnability_windows_per_rollout: int = 8
     critique_max_response_length: Optional[int] = 8192
     branch_max_tokens: int = 128
     new_continuation_max_tokens: int = 256
     min_continuation_tokens: int = 128
     reward_tolerance: float = 1e-6
     critique_prompt: str = BRANCH_REVISION_CRITIQUE_PROMPT
+    positive_critique_prompt: str = BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT
     audit_output_dir: Optional[str] = None
 
     def __post_init__(self):
         positive_ints = {
             "num_critiques": self.num_critiques,
+            "num_positive_critiques": self.num_positive_critiques,
+            "learnability_windows_per_rollout": self.learnability_windows_per_rollout,
             "branch_max_tokens": self.branch_max_tokens,
             "new_continuation_max_tokens": self.new_continuation_max_tokens,
             "min_continuation_tokens": self.min_continuation_tokens,
@@ -89,6 +170,10 @@ class BranchRevisionGRPOConfig(BaseConfig):
                 raise ValueError(f"algorithm.branch_revision_grpo.{name} must be a positive integer")
         if self.num_critiques < 2:
             raise ValueError("algorithm.branch_revision_grpo.num_critiques must be at least 2 for GRPO")
+        if self.num_positive_critiques < 2:
+            raise ValueError("algorithm.branch_revision_grpo.num_positive_critiques must be at least 2 for GRPO")
+        if not isinstance(self.enable_positive_compression, bool):
+            raise ValueError("algorithm.branch_revision_grpo.enable_positive_compression must be boolean")
         if self.critique_max_response_length is not None and (
             not isinstance(self.critique_max_response_length, int)
             or isinstance(self.critique_max_response_length, bool)
@@ -97,8 +182,20 @@ class BranchRevisionGRPOConfig(BaseConfig):
             raise ValueError("algorithm.branch_revision_grpo.critique_max_response_length must be positive or null")
         if not math.isfinite(self.reward_tolerance) or self.reward_tolerance <= 0.0:
             raise ValueError("algorithm.branch_revision_grpo.reward_tolerance must be finite and positive")
+        if not math.isfinite(self.positive_compression_target) or not 0.0 < self.positive_compression_target <= 1.0:
+            raise ValueError("algorithm.branch_revision_grpo.positive_compression_target must be in (0, 1]")
+        if not (
+            math.isfinite(self.min_seed_window_percentile)
+            and math.isfinite(self.full_credit_seed_window_percentile)
+            and 0.0 <= self.min_seed_window_percentile < self.full_credit_seed_window_percentile <= 1.0
+        ):
+            raise ValueError("branch-revision seed percentiles must satisfy 0 <= min < full_credit <= 1")
         if self.critique_prompt != BRANCH_REVISION_CRITIQUE_PROMPT:
             raise ValueError("branch_revision_grpo.critique_prompt must exactly match the branch-revision instruction")
+        if self.positive_critique_prompt != BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT:
+            raise ValueError(
+                "branch_revision_grpo.positive_critique_prompt must exactly match the positive-compression instruction"
+            )
 
 
 INTERMEDIATE_MC_CRITIQUE_PROMPT = """You have been given above a question, the thought process, and the resulting

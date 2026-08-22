@@ -15,20 +15,30 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
+
+import torch
 
 BRANCH_OPEN = "<branch>"
 BRANCH_CLOSE = "</branch>"
 NEW_CONTINUATION_OPEN = "<new continuation>"
 NEW_CONTINUATION_CLOSE = "</new continuation>"
 _FOLLOWUP_SENTINEL = "__VERL_BRANCH_REVISION_PREVIOUS_ASSISTANT_7F4E65C1__"
-_CRITIQUE_SECTIONS = (
-    ("1. PRUNING:", "empty_pruning"),
-    ("2. SWITCH:", "empty_switch"),
-    ("3. EDIT:", "empty_edit"),
+_FINAL_ANSWER_PATTERN = re.compile(
+    r"(?:"
+    r"\\(?:boxed|fbox)\s*\{|"
+    r"####|"
+    r"</?answer(?:\s[^>]*)?>|"
+    r"\bfinal\s+(?:answer|result)\b|"
+    r"\banswer\s*(?:is\b|equals\b|=|:)|"
+    r"\b(?:task|problem)\s+(?:is\s+)?(?:complete|completed|solved)\b"
+    r")",
+    flags=re.IGNORECASE,
 )
 
 
@@ -38,11 +48,46 @@ class ParsedBranchRevision:
     reason: str
     solution_text: str
     critique_text: str
+    analysis_text: str = ""
     branch_text: str = ""
     new_continuation_text: str = ""
     branch_start: int = -1
     revised_text: str = ""
+    branch_prefix_ids: tuple[int, ...] = ()
+    new_continuation_ids: tuple[int, ...] = ()
     revised_prefix_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class RolloutLogProbPrefix:
+    rollout_id: str
+    prefix_sums: torch.Tensor
+
+    @property
+    def token_count(self) -> int:
+        return int(self.prefix_sums.numel() - 1)
+
+
+@dataclass(frozen=True)
+class LearnabilityReference:
+    window_size: int
+    window_means: torch.Tensor
+    window_weights: torch.Tensor
+    eligible_rollouts: int
+
+    @property
+    def sampled_windows(self) -> int:
+        return int(self.window_means.numel())
+
+
+@dataclass(frozen=True)
+class LearnabilityScore:
+    seed_mean_log_prob: float
+    percentile: float
+    reward_weight: float
+    accepted: bool
+    eligible_rollouts: int
+    sampled_windows: int
 
 
 def terminal_eos_ids(tokenizer: Any) -> set[int]:
@@ -129,6 +174,123 @@ def encode_followup_user_turn(
     return suffix_ids
 
 
+def build_rollout_logprob_prefixes(
+    rollout_ids: Sequence[str],
+    rollout_log_probs: Sequence[Sequence[float]],
+    *,
+    device: torch.device | str | None = None,
+) -> tuple[RolloutLogProbPrefix, ...]:
+    """Build each rollout's cumulative log-probabilities exactly once per iteration."""
+
+    if len(rollout_ids) != len(rollout_log_probs):
+        raise ValueError("rollout ids and log-probability rows must have equal lengths")
+    result: list[RolloutLogProbPrefix] = []
+    for rollout_id, values in zip(rollout_ids, rollout_log_probs, strict=True):
+        tensor = torch.as_tensor(list(values), dtype=torch.float64, device=device)
+        if not torch.isfinite(tensor).all():
+            raise ValueError(f"rollout {rollout_id!r} contains non-finite log probabilities")
+        prefix = torch.cat([torch.zeros(1, dtype=torch.float64, device=tensor.device), tensor.cumsum(dim=0)])
+        result.append(RolloutLogProbPrefix(str(rollout_id), prefix))
+    return tuple(result)
+
+
+def _stratified_window_starts(
+    candidate_count: int,
+    max_windows: int,
+    *,
+    seed: int,
+    rollout_id: str,
+    window_size: int,
+) -> list[int]:
+    if candidate_count <= max_windows:
+        return list(range(candidate_count))
+    starts: list[int] = []
+    for slot in range(max_windows):
+        lower = slot * candidate_count // max_windows
+        upper = (slot + 1) * candidate_count // max_windows
+        width = upper - lower
+        digest = hashlib.blake2b(
+            f"{seed}:{rollout_id}:{window_size}:{slot}".encode(),
+            digest_size=8,
+        ).digest()
+        starts.append(lower + int.from_bytes(digest, "little") % width)
+    return starts
+
+
+def build_learnability_reference(
+    prefixes: Sequence[RolloutLogProbPrefix],
+    *,
+    window_size: int,
+    windows_per_rollout: int,
+    seed: int,
+) -> LearnabilityReference:
+    """Sample length-matched windows, giving every eligible rollout equal mass."""
+
+    if window_size <= 0 or windows_per_rollout <= 0:
+        raise ValueError("learnability window sizes and counts must be positive")
+    sampled: list[torch.Tensor] = []
+    for rollout in prefixes:
+        candidate_count = rollout.token_count - window_size + 1
+        if candidate_count <= 0:
+            continue
+        starts = _stratified_window_starts(
+            candidate_count,
+            windows_per_rollout,
+            seed=seed,
+            rollout_id=rollout.rollout_id,
+            window_size=window_size,
+        )
+        indices = torch.tensor(starts, dtype=torch.long, device=rollout.prefix_sums.device)
+        means = (rollout.prefix_sums[indices + window_size] - rollout.prefix_sums[indices]) / float(window_size)
+        sampled.append(means)
+    if not sampled:
+        empty = torch.empty(0, dtype=torch.float64)
+        return LearnabilityReference(window_size, empty, empty.clone(), 0)
+    eligible_rollouts = len(sampled)
+    weights = [torch.full_like(values, 1.0 / (eligible_rollouts * values.numel())) for values in sampled]
+    return LearnabilityReference(
+        window_size=window_size,
+        window_means=torch.cat(sampled),
+        window_weights=torch.cat(weights),
+        eligible_rollouts=eligible_rollouts,
+    )
+
+
+def score_seed_learnability(
+    seed_mean_log_prob: float,
+    reference: LearnabilityReference,
+    *,
+    minimum_percentile: float,
+    full_credit_percentile: float,
+) -> LearnabilityScore:
+    """Gate a replacement seed and linearly ramp reward credit by percentile."""
+
+    if not math.isfinite(seed_mean_log_prob):
+        raise ValueError("replacement seed mean log probability must be finite")
+    if not 0.0 <= minimum_percentile < full_credit_percentile <= 1.0:
+        raise ValueError("learnability percentiles must satisfy 0 <= minimum < full credit <= 1")
+    if reference.sampled_windows == 0:
+        percentile = 0.0
+    else:
+        percentile = float(
+            reference.window_weights[reference.window_means <= seed_mean_log_prob].sum().detach().cpu().item()
+        )
+        percentile = min(max(percentile, 0.0), 1.0)
+    accepted = reference.sampled_windows > 0 and percentile >= minimum_percentile
+    reward_weight = min(
+        max((percentile - minimum_percentile) / (full_credit_percentile - minimum_percentile), 0.0),
+        1.0,
+    )
+    return LearnabilityScore(
+        seed_mean_log_prob=float(seed_mean_log_prob),
+        percentile=percentile,
+        reward_weight=reward_weight,
+        accepted=accepted,
+        eligible_rollouts=reference.eligible_rollouts,
+        sampled_windows=reference.sampled_windows,
+    )
+
+
 def _invalid(reason: str, solution_text: str, critique_text: str) -> ParsedBranchRevision:
     return ParsedBranchRevision(False, reason, solution_text, critique_text)
 
@@ -165,27 +327,9 @@ def parse_branch_revision(
     if critique_text[new_close + len(NEW_CONTINUATION_CLOSE) :].strip():
         return _invalid("text_after_tags", solution_text, critique_text)
 
-    marker_counts = [critique_text.count(marker) for marker, _ in _CRITIQUE_SECTIONS]
-    if marker_counts != [1, 1, 1]:
-        return _invalid("critique_section_count", solution_text, critique_text)
-    marker_positions = [critique_text.index(marker) for marker, _ in _CRITIQUE_SECTIONS]
-    if not (marker_positions[0] < marker_positions[1] < marker_positions[2] < branch_open):
-        return _invalid("critique_section_order", solution_text, critique_text)
-    if critique_text[: marker_positions[0]].strip():
-        return _invalid("text_before_critique", solution_text, critique_text)
-    section_ends = [
-        marker_positions[1],
-        marker_positions[2],
-        branch_open,
-    ]
-    for (marker, empty_reason), start, end in zip(
-        _CRITIQUE_SECTIONS,
-        marker_positions,
-        section_ends,
-        strict=True,
-    ):
-        if not critique_text[start + len(marker) : end].strip():
-            return _invalid(empty_reason, solution_text, critique_text)
+    analysis_text = critique_text[:branch_open]
+    if not analysis_text.strip():
+        return _invalid("empty_analysis", solution_text, critique_text)
 
     branch_text = critique_text[branch_content_start:branch_close]
     replacement_text = critique_text[new_content_start:new_close]
@@ -193,35 +337,47 @@ def parse_branch_revision(
         return _invalid("empty_branch", solution_text, critique_text)
     if not replacement_text or not replacement_text.strip():
         return _invalid("empty_new_continuation", solution_text, critique_text)
+    if _FINAL_ANSWER_PATTERN.search(replacement_text):
+        return _invalid("new_continuation_final_answer", solution_text, critique_text)
 
     branch_ids = tokenizer.encode(branch_text, add_special_tokens=False)
-    replacement_ids = tokenizer.encode(replacement_text, add_special_tokens=False)
     if not branch_ids or len(branch_ids) > branch_max_tokens:
         return _invalid("branch_token_cap", solution_text, critique_text)
-    if not replacement_ids or len(replacement_ids) > new_continuation_max_tokens:
-        return _invalid("new_continuation_token_cap", solution_text, critique_text)
-    branch_occurrences = solution_text.count(branch_text)
-    if branch_occurrences == 0:
+    branch_start = solution_text.find(branch_text)
+    if branch_start < 0:
         return _invalid("branch_not_found", solution_text, critique_text)
-    if branch_occurrences != 1:
+    if solution_text.find(branch_text, branch_start + 1) >= 0:
         return _invalid("branch_not_unique", solution_text, critique_text)
 
-    branch_start = solution_text.index(branch_text)
-    revised_text = solution_text[:branch_start] + replacement_text
+    branch_prefix_text = solution_text[:branch_start]
+    branch_prefix_ids = [int(token) for token in tokenizer.encode(branch_prefix_text, add_special_tokens=False)]
+    if decode_exact(branch_prefix_ids, tokenizer) != branch_prefix_text:
+        return _invalid("branch_prefix_not_roundtrip_exact", solution_text, critique_text)
+    if editable_solution_ids[: len(branch_prefix_ids)] != branch_prefix_ids:
+        return _invalid("branch_not_at_token_boundary", solution_text, critique_text)
+    revised_text = branch_prefix_text + replacement_text
     revised_prefix_ids = [int(token) for token in tokenizer.encode(revised_text, add_special_tokens=False)]
     if not revised_prefix_ids:
         return _invalid("empty_revised_prefix", solution_text, critique_text)
     if decode_exact(revised_prefix_ids, tokenizer) != revised_text:
         return _invalid("revision_not_roundtrip_exact", solution_text, critique_text)
+    if revised_prefix_ids[: len(branch_prefix_ids)] != branch_prefix_ids:
+        return _invalid("new_continuation_retokenizes_prefix", solution_text, critique_text)
+    new_continuation_ids = revised_prefix_ids[len(branch_prefix_ids) :]
+    if not new_continuation_ids or len(new_continuation_ids) > new_continuation_max_tokens:
+        return _invalid("new_continuation_token_cap", solution_text, critique_text)
     return ParsedBranchRevision(
         valid=True,
         reason="valid",
         solution_text=solution_text,
         critique_text=critique_text,
+        analysis_text=analysis_text,
         branch_text=branch_text,
         new_continuation_text=replacement_text,
         branch_start=branch_start,
         revised_text=revised_text,
+        branch_prefix_ids=tuple(branch_prefix_ids),
+        new_continuation_ids=tuple(new_continuation_ids),
         revised_prefix_ids=tuple(revised_prefix_ids),
     )
 

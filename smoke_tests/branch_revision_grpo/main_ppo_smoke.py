@@ -66,7 +66,7 @@ def _configure_file_logger(config, path: Path) -> None:
 
 
 def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any]) -> None:
-    required_contract = {"model_path", "n_prompts", "n_samples", "num_critiques"}
+    required_contract = {"model_path", "n_prompts", "n_samples", "num_critiques", "loss_mode"}
     if set(smoke_contract) != required_contract:
         raise ValueError(
             f"branch-revision smoke contract must contain exactly {sorted(required_contract)!r}, "
@@ -77,8 +77,10 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "data.gen_batch_size": smoke_contract["n_prompts"],
         "actor_rollout_ref.rollout.n": smoke_contract["n_samples"],
         "algorithm.branch_revision_grpo.num_critiques": smoke_contract["num_critiques"],
+        "algorithm.branch_revision_grpo.num_positive_critiques": smoke_contract["num_critiques"],
         "actor_rollout_ref.model.path": smoke_contract["model_path"],
         "critic.model.path": smoke_contract["model_path"],
+        "actor_rollout_ref.actor.policy_loss.loss_mode": smoke_contract["loss_mode"],
     }
     for name in ("n_prompts", "n_samples", "num_critiques"):
         value = smoke_contract[name]
@@ -86,6 +88,8 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
             raise ValueError(f"branch-revision smoke {name} must be a positive integer")
     if not isinstance(smoke_contract["model_path"], str) or not smoke_contract["model_path"].startswith("/"):
         raise ValueError("branch-revision smoke model_path must be an absolute string path")
+    if smoke_contract["loss_mode"] not in {"dppo_tv", "vanilla"}:
+        raise ValueError("branch-revision smoke loss_mode must be dppo_tv or vanilla")
     if smoke_contract["n_samples"] < 2:
         raise ValueError("branch-revision smoke n_samples must be at least 2 for a GRPO acceptance group")
     if smoke_contract["num_critiques"] < 2:
@@ -100,16 +104,22 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
             raise ValueError(f"branch-revision smoke requires {key}={expected!r}, got {actual!r}")
     if not bool(OmegaConf.select(config, "algorithm.branch_revision_grpo.enable")):
         raise ValueError("branch-revision smoke requires the feature to be enabled")
+    if not bool(OmegaConf.select(config, "algorithm.branch_revision_grpo.enable_positive_compression")):
+        raise ValueError("branch-revision smoke must exercise positive-rollout compression")
     if bool(OmegaConf.select(config, "algorithm.intermediate_mc_value.enable")):
         raise ValueError("branch-revision smoke must not enable intermediate MC")
     if bool(OmegaConf.select(config, "critic.enable")):
         raise ValueError("branch-revision smoke is actor-only")
     if str(OmegaConf.select(config, "algorithm.adv_estimator")) != "grpo":
         raise ValueError("branch-revision smoke requires GRPO")
-    if str(OmegaConf.select(config, "actor_rollout_ref.actor.policy_loss.loss_mode")) != "dppo_tv":
-        raise ValueError("live smoke must exercise the default dppo_tv policy loss")
     if float(OmegaConf.select(config, "actor_rollout_ref.rollout.temperature")) != 1.0:
         raise ValueError("training generation temperature must be 1.0")
+    if (
+        float(OmegaConf.select(config, "actor_rollout_ref.rollout.top_p")) != 1.0
+        or int(OmegaConf.select(config, "actor_rollout_ref.rollout.top_k")) != -1
+        or float(OmegaConf.select(config, "actor_rollout_ref.rollout.repetition_penalty")) != 1.0
+    ):
+        raise ValueError("training generation must use untruncated learnability-comparable sampling")
     if float(OmegaConf.select(config, "actor_rollout_ref.rollout.val_kwargs.temperature")) != 1.0:
         raise ValueError("validation generation temperature must be 1.0")
     if list(OmegaConf.select(config, "trainer.logger")) != ["file"]:

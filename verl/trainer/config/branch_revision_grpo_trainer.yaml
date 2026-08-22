@@ -20,6 +20,7 @@ algorithm:
   adv_estimator: grpo
   branch_revision_grpo:
     enable: true
+    enable_positive_compression: true
 
 actor_rollout_ref:
   actor:
@@ -28,8 +29,13 @@ actor_rollout_ref:
       loss_mode: dppo_tv
   rollout:
     temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    repetition_penalty: 1.0
     val_kwargs:
       temperature: 1.0
+      top_p: 1.0
+      top_k: -1
 
 critic:
   enable: false

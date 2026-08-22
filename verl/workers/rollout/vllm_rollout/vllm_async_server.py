@@ -42,7 +42,13 @@ from verl.utils.profiler import DistProfiler, build_vllm_profiler_args
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
-from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
+from verl.workers.rollout.replica import (
+    PROMPT_LOGPROBS_SLICE_START,
+    RolloutMode,
+    RolloutReplica,
+    TokenOutput,
+    extract_chosen_prompt_log_probs,
+)
 from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
@@ -591,6 +597,17 @@ class vLLMHttpServer:
     ) -> TokenOutput:
         """Generate sequence with token-in-token-out."""
         prompt_ids = normalize_token_ids(prompt_ids)
+        prompt_log_prob_start = sampling_params.pop(PROMPT_LOGPROBS_SLICE_START, None)
+        if prompt_log_prob_start is not None:
+            if isinstance(prompt_log_prob_start, bool) or not isinstance(prompt_log_prob_start, int):
+                raise ValueError(f"{PROMPT_LOGPROBS_SLICE_START} must be an integer")
+            if not 0 <= prompt_log_prob_start <= len(prompt_ids):
+                raise ValueError(
+                    f"{PROMPT_LOGPROBS_SLICE_START}={prompt_log_prob_start} is outside "
+                    f"prompt length {len(prompt_ids)}"
+                )
+            if "prompt_logprobs" not in sampling_params:
+                raise ValueError(f"{PROMPT_LOGPROBS_SLICE_START} requires prompt_logprobs")
 
         # Calculate the maximum possible new tokens based on available context space
         # This serves as a safety upper bound
@@ -656,14 +673,34 @@ class vLLMHttpServer:
 
         # Get final response
         final_res: Optional[RequestOutput] = None
+        returned_prompt_logprobs = None
+        returned_prompt_token_ids = None
         async for output in generator:
             final_res = output
+            if getattr(output, "prompt_logprobs", None) is not None:
+                returned_prompt_logprobs = output.prompt_logprobs
+                returned_prompt_token_ids = getattr(output, "prompt_token_ids", None)
         assert final_res is not None
 
         token_ids = final_res.outputs[0].token_ids
         log_probs = None
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
+
+        prompt_log_prob_token_ids = None
+        prompt_log_probs = None
+        if sampling_params.prompt_logprobs is not None:
+            if returned_prompt_logprobs is None:
+                raise RuntimeError("vLLM did not return requested prompt log probabilities")
+            result_prompt_ids = returned_prompt_token_ids
+            if result_prompt_ids is None:
+                result_prompt_ids = prompt_ids
+            slice_start = 0 if prompt_log_prob_start is None else prompt_log_prob_start
+            prompt_log_prob_token_ids, prompt_log_probs = extract_chosen_prompt_log_probs(
+                result_prompt_ids,
+                returned_prompt_logprobs,
+                start=slice_start,
+            )
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -686,6 +723,9 @@ class vLLMHttpServer:
         return TokenOutput(
             token_ids=token_ids,
             log_probs=log_probs,
+            prompt_log_prob_token_ids=prompt_log_prob_token_ids,
+            prompt_log_probs=prompt_log_probs,
+            prompt_log_prob_start=prompt_log_prob_start,
             routed_experts=routed_experts,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
@@ -977,7 +1017,7 @@ class vLLMReplica(RolloutReplica):
                             "env_vars": {
                                 "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
                                 "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES": "1",
-                                # To prevent hanging or crash during synchronization of weights between actor and rollout
+                                # Prevent hangs or crashes while synchronizing weights between actor and rollout
                                 # in disaggregated mode. See:
                                 # https://docs.vllm.ai/en/latest/usage/troubleshooting.html?h=nccl_cumem_enable#known-issues
                                 # https://github.com/vllm-project/vllm/blob/c6b0a7d3ba03ca414be1174e9bd86a97191b7090/vllm/worker/worker_base.py#L445

@@ -659,31 +659,179 @@ algorithm:
     _target_: verl.trainer.config.BranchRevisionGRPOConfig
     enable: false
     num_critiques: 4
+    enable_positive_compression: false
+    num_positive_critiques: 4
+    positive_compression_target: 0.25
+    min_seed_window_percentile: 0.2
+    full_credit_seed_window_percentile: 0.5
+    learnability_windows_per_rollout: 8
     critique_max_response_length: 8192
     branch_max_tokens: 128
     new_continuation_max_tokens: 256
     min_continuation_tokens: 128
     reward_tolerance: 1.0e-06
-    critique_prompt: "--- BEGIN CRITIQUE TASK ---\nThe immediately preceding assistant\
-      \ turn is a completed, incorrect attempted\nsolution. Critique that attempt;\
-      \ do not continue it or solve the problem again.\n\nYour entire response must\
-      \ be concise, have no preamble, and begin with these\nexact labels in this order:\n\
-      1. PRUNING: State which steps meaningfully pruned the search space and which\n\
-      \   steps did not.\n2. SWITCH: State the earliest point where the attempt should\
-      \ have changed\n   direction and the better direction it should have taken.\n\
-      3. EDIT: Identify the earliest useful replacement that would move the remaining\n\
-      \   reasoning away from a dead end and improve its chance of success within\
-      \ the\n   remaining token budget.\n\nAfter those three short numbered paragraphs,\
-      \ end with exactly one <branch> tag\npair followed by exactly one <new continuation>\
-      \ tag pair, with at most\nwhitespace between the pairs. The text inside <branch>\
-      \ is not analysis: copy\nand paste it character-for-character from one complete\
-      \ line or a short span of\nthe attempted solution. Include enough adjacent distinctive\
-      \ text that the span\noccurs exactly once. Do not paraphrase, correct, normalize,\
-      \ or reformat anything\ninside <branch>; put every correction only inside <new\
-      \ continuation>. The text inside\n<new continuation> is the replacement reasoning\
-      \ to use at that point. Do not\nopen <branch> before the numbered critique.\
-      \ Do not write anything after the\nclosing </new continuation> tag.\n--- END\
-      \ CRITIQUE TASK ---"
+    critique_prompt: 'The attempted solution above is incorrect. Analyze it with the
+      goal of improving
+
+      its chance of solving the task within the remaining token budget.
+
+
+      Reason about which parts/steps meaningfully narrowed the available
+
+      possibilities or pruned the search space and which parts/steps did not. Explain
+      when the trajectory should have
+
+      changed direction and what direction would have been more productive. Then
+
+      select an appropriate point at which to revise the trajectory.
+
+
+      Treat the point immediately before <branch> as the information boundary for
+
+      the replacement. Choose <branch> so that this boundary falls between coherent
+
+      steps, not in the middle of a thought or action.
+
+
+      The replacement may use an idea that also appears later in the trajectory only
+
+      when the task and the trajectory before the branch already provide a reasonable
+
+      basis for proposing that idea as the next direction.
+
+
+      Consider the trajectory counterfactually with everything after the branch
+
+      hidden. If work performed after the branch materially changed what was known,
+
+      narrowed the available possibilities, or made the idea substantially more
+
+      plausible, do not place that idea directly in the replacement. Instead, propose
+
+      the next local step needed to make that progress. We do not want to
+
+      short-circuit useful exploration with hindsight.
+
+
+      Do not compress a sequence of later developments into one hindsight statement.
+
+      The replacement should express one locally justified next move or direction
+
+      and leave subsequent work for the continuation rollout to perform. In your
+
+      analysis, explain why the information available before the branch supports the
+
+      proposed replacement.
+
+
+      Copy the text inside <branch> character-for-character from one complete line
+      or
+
+      short coherent span of the attempted solution. Include enough distinctive
+
+      adjacent text that the span occurs exactly once. Do not correct, normalize,
+
+      paraphrase, or reformat anything inside <branch>. Put the proposed replacement
+
+      only inside <new continuation>.
+
+
+      The text inside <new continuation> must be nonempty and concise. It must not
+
+      state the final result in any form, declare that the task has been completed,
+
+      or contain a boxed answer, answer delimiter, or final-answer phrase.
+
+
+      After the free-form analysis, end with exactly one <branch> tag pair followed
+
+      by exactly one <new continuation> tag pair. Do not use either tag anywhere
+
+      else. Permit only whitespace between the two tag pairs, and write nothing
+
+      after the closing </new continuation> tag.'
+    positive_critique_prompt: 'The solution above is correct. Analyze it with the
+      goal of improving reasoning
+
+      efficiency: reducing the amount of reasoning needed to reach the correct result
+
+      without sacrificing correctness.
+
+
+      Reason about which parts/steps meaningfully narrowed the available
+
+      possibilities or pruned the search space and which parts/steps did not. Explain
+      when the trajectory should have
+
+      changed direction and what direction would have been more productive. Then
+
+      select an appropriate point at which to revise the trajectory.
+
+
+      Treat the point immediately before <branch> as the information boundary for
+
+      the replacement. Choose <branch> so that this boundary falls between coherent
+
+      steps, not in the middle of a thought or action.
+
+
+      The replacement may use an idea that also appears later in the trajectory only
+
+      when the task and the trajectory before the branch already provide a reasonable
+
+      basis for proposing that idea as the next direction.
+
+
+      Consider the trajectory counterfactually with everything after the branch
+
+      hidden. If work performed after the branch materially changed what was known,
+
+      narrowed the available possibilities, or made the idea substantially more
+
+      plausible, do not place that idea directly in the replacement. Instead, propose
+
+      the next local step needed to make that progress. We do not want to
+
+      short-circuit useful exploration with hindsight.
+
+
+      Do not compress a sequence of later developments into one hindsight statement.
+
+      The replacement should express one locally justified next move or direction
+
+      and leave subsequent work for the continuation rollout to perform. In your
+
+      analysis, explain why the information available before the branch supports the
+
+      proposed replacement.
+
+
+      Copy the text inside <branch> character-for-character from one complete line
+      or
+
+      short coherent span of the solution. Include enough distinctive adjacent text
+
+      that the span occurs exactly once. Do not correct, normalize, paraphrase, or
+
+      reformat anything inside <branch>. Put the proposed replacement only inside
+
+      <new continuation>.
+
+
+      The text inside <new continuation> must be nonempty and concise. It must not
+
+      state the final result in any form, declare that the task has been completed,
+
+      or contain a boxed answer, answer delimiter, or final-answer phrase.
+
+
+      After the free-form analysis, end with exactly one <branch> tag pair followed
+
+      by exactly one <new continuation> tag pair. Do not use either tag anywhere
+
+      else. Permit only whitespace between the two tag pairs, and write nothing
+
+      after the closing </new continuation> tag.'
     audit_output_dir: null
 trainer:
   balance_batch: true
