@@ -38,7 +38,7 @@ EXPECTED = {
     "data.max_response_length": 2048,
     "actor_rollout_ref.actor.ppo_mini_batch_size": 8,
     "actor_rollout_ref.actor.ppo_epochs": 1,
-    "actor_rollout_ref.rollout.max_model_len": 6144,
+    "actor_rollout_ref.rollout.max_model_len": 8192,
     "algorithm.branch_revision_grpo.critique_max_response_length": 2560,
     "algorithm.branch_revision_grpo.min_continuation_tokens": 128,
     "trainer.nnodes": 1,
