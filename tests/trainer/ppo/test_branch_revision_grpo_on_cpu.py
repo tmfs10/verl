@@ -15,6 +15,7 @@
 import asyncio
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -131,6 +132,8 @@ def test_objective_prompts_share_the_causal_and_exact_edit_contract() -> None:
     assert "solution above is correct" in BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT
     for prompt in (BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT, BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT):
         assert "point immediately before <branch> as the information boundary" in prompt
+        assert "between an opening $$ and its matching closing $$" in prompt
+        assert "inside a fenced code block" in prompt
         assert "trajectory counterfactually with everything after the branch" in prompt
         assert "hidden. If work performed after the branch" in prompt
         assert "Do not compress a sequence of later developments" in prompt
@@ -322,19 +325,70 @@ def test_parser_rejects_a_replacement_that_retokenizes_the_preserved_prefix() ->
     assert parsed.reason == "new_continuation_retokenizes_prefix"
 
 
-def test_length_matched_learnability_windows_are_deterministic_and_rollout_balanced() -> None:
+@pytest.mark.parametrize(
+    ("solution", "branch", "reason"),
+    [
+        ("before\n$$\nx + 1\n$$\nafter", "x + 1", "branch_inside_display_math"),
+        ("before\n\\[\nx + 1\n\\]\nafter", "x + 1", "branch_inside_display_math"),
+        (
+            "before\n\\begin{align}\nx + 1\n\\end{align}\nafter",
+            "x + 1",
+            "branch_inside_latex_environment",
+        ),
+        (
+            "before\n\\begin{align}\n\\begin{split}\nx + 1\n\\end{split}\n\\end{align}\nafter",
+            "x + 1",
+            "branch_inside_latex_environment",
+        ),
+        ("before\n```python\nx + 1\n```\nafter", "x + 1", "branch_inside_code_fence"),
+        ("before\n~~~~\n$$ x + 1 $$\n~~~~\nafter", "$$ x + 1 $$", "branch_inside_code_fence"),
+    ],
+)
+def test_parser_rejects_branch_points_inside_open_blocks(solution: str, branch: str, reason: str) -> None:
+    parsed = parse_branch_revision(
+        _ids(solution),
+        _ids(_structured(branch, "take another local step")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert not parsed.valid
+    assert parsed.reason == reason
+
+
+@pytest.mark.parametrize(
+    ("solution", "branch"),
+    [
+        ("before\n$$\nx + 1\n$$\nafter", "$$\nx + 1\n$$"),
+        ("before\n$$\nx + 1\n$$\nafter", "after"),
+        ("before \\$$ is literal\nafter", "after"),
+        ("before\n```\ncode\n```\nafter", "after"),
+    ],
+)
+def test_parser_allows_branch_points_at_balanced_block_boundaries(solution: str, branch: str) -> None:
+    parsed = parse_branch_revision(
+        _ids(solution),
+        _ids(_structured(branch, "take another local step")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.valid
+
+
+def test_length_matched_learnability_enumerates_every_window_with_uniform_mass() -> None:
     prefixes = build_rollout_logprob_prefixes(
         ["short", "long"],
         [[-1.0, -1.0, -1.0], [-3.0] * 20],
     )
-    first = build_learnability_reference(prefixes, window_size=2, windows_per_rollout=4, seed=9)
-    second = build_learnability_reference(prefixes, window_size=2, windows_per_rollout=4, seed=9)
+    first = build_learnability_reference(prefixes, window_size=2)
+    second = build_learnability_reference(prefixes, window_size=2)
     torch.testing.assert_close(first.window_scores, second.window_scores)
-    torch.testing.assert_close(first.window_weights, second.window_weights)
     assert first.eligible_rollouts == 2
-    assert first.sampled_windows == 6
-    assert first.window_weights[first.window_scores == -1.0].sum().item() == pytest.approx(0.5)
-    assert first.window_weights[first.window_scores == -3.0].sum().item() == pytest.approx(0.5)
+    assert first.rollout_window_counts == (("short", 2), ("long", 19))
+    assert first.total_windows == 21
+    score = score_seed_learnability(-2.0, first, minimum_percentile=0.0, full_credit_percentile=0.5)
+    assert score.percentile == pytest.approx(19 / 21)
 
 
 def test_mean_and_min_learnability_use_the_same_length_matched_windows() -> None:
@@ -345,38 +399,75 @@ def test_mean_and_min_learnability_use_the_same_length_matched_windows() -> None
     mean_reference = build_learnability_reference(
         prefixes,
         window_size=2,
-        windows_per_rollout=8,
-        seed=0,
         logprob_statistic="mean",
     )
     min_reference = build_learnability_reference(
         prefixes,
         window_size=2,
-        windows_per_rollout=8,
-        seed=0,
         logprob_statistic="min",
     )
-    assert mean_reference.window_starts.tolist() == min_reference.window_starts.tolist() == [0, 1, 2]
     assert mean_reference.window_scores.tolist() == pytest.approx([-5.0, -6.5, -4.0])
     assert min_reference.window_scores.tolist() == pytest.approx([-9.0, -9.0, -4.0])
     assert aggregate_log_probs([-1.0, -9.0], statistic="mean") == pytest.approx(-5.0)
     assert aggregate_log_probs([-1.0, -9.0], statistic="min") == pytest.approx(-9.0)
 
 
+@pytest.mark.parametrize("statistic", ["mean", "min"])
+def test_exhaustive_reference_matches_brute_force_for_every_length(statistic: str) -> None:
+    rows = [
+        [-1.25, -7.0, -2.5, -9.0, -3.0],
+        [-4.0, -0.5, -6.0],
+    ]
+    prefixes = build_rollout_logprob_prefixes(["a", "b"], rows)
+    for window_size in range(1, 6):
+        reference = build_learnability_reference(
+            prefixes,
+            window_size=window_size,
+            logprob_statistic=statistic,
+        )
+        expected = []
+        expected_counts = []
+        for rollout_id, row in zip(("a", "b"), rows, strict=True):
+            normalized = torch.tensor(row, dtype=torch.float32).tolist()
+            windows = [normalized[start : start + window_size] for start in range(len(row) - window_size + 1)]
+            if windows:
+                expected_counts.append((rollout_id, len(windows)))
+            expected.extend(
+                math.fsum(window) / len(window) if statistic == "mean" else min(window) for window in windows
+            )
+        assert reference.rollout_window_counts == tuple(expected_counts)
+        assert reference.total_windows == len(expected)
+        assert reference.window_scores.tolist() == pytest.approx(expected)
+
+
 def test_mean_and_min_learnability_are_identical_for_one_token() -> None:
     prefixes = build_rollout_logprob_prefixes(["r"], [[-4.0, -2.0]])
-    mean_reference = build_learnability_reference(
-        prefixes, window_size=1, windows_per_rollout=8, seed=0, logprob_statistic="mean"
-    )
-    min_reference = build_learnability_reference(
-        prefixes, window_size=1, windows_per_rollout=8, seed=0, logprob_statistic="min"
-    )
+    mean_reference = build_learnability_reference(prefixes, window_size=1, logprob_statistic="mean")
+    min_reference = build_learnability_reference(prefixes, window_size=1, logprob_statistic="min")
     torch.testing.assert_close(mean_reference.window_scores, min_reference.window_scores)
+
+
+@pytest.mark.parametrize("statistic", ["mean", "min"])
+def test_learnability_rejects_when_no_original_has_a_full_window(statistic: str) -> None:
+    prefixes = build_rollout_logprob_prefixes(["a", "b"], [[-1.0], [-2.0, -3.0]])
+    reference = build_learnability_reference(prefixes, window_size=3, logprob_statistic=statistic)
+    score = score_seed_learnability(
+        -1.0,
+        reference,
+        minimum_percentile=0.2,
+        full_credit_percentile=0.5,
+    )
+    assert reference.rollout_window_counts == ()
+    assert reference.total_windows == 0
+    assert reference.window_scores_sha256 == hashlib.sha256(b"").hexdigest()
+    assert score.percentile == 0.0
+    assert score.reward_weight == 0.0
+    assert not score.accepted
 
 
 def test_learnability_percentile_gates_and_ramps_reward_credit() -> None:
     prefixes = build_rollout_logprob_prefixes(["r"], [[-4.0, -3.0, -2.0, -1.0]])
-    reference = build_learnability_reference(prefixes, window_size=1, windows_per_rollout=8, seed=0)
+    reference = build_learnability_reference(prefixes, window_size=1)
     rejected = score_seed_learnability(
         -4.1,
         reference,
@@ -410,8 +501,6 @@ def test_learnability_quantizes_both_sides_to_float32_before_comparison(statisti
     reference = build_learnability_reference(
         prefixes,
         window_size=1,
-        windows_per_rollout=1,
-        seed=0,
         logprob_statistic=statistic,
     )
     score = score_seed_learnability(
@@ -449,7 +538,6 @@ def _runtime_config(loss_mode="dppo_tv"):
                     "learnability_logprob_statistic": "mean",
                     "min_seed_window_percentile": 0.20,
                     "full_credit_seed_window_percentile": 0.50,
-                    "learnability_windows_per_rollout": 8,
                     "critique_max_response_length": 16,
                     "branch_max_tokens": 8,
                     "new_continuation_max_tokens": 8,
@@ -723,6 +811,41 @@ def test_agent_loop_generates_all_critiques_then_one_continuation_per_valid_edit
     assert record.critiques[0].new_continuation_log_probs == pytest.approx([-0.25] * len(_ids("better")))
     assert record.critiques[1].continuation_ids == ()
     assert [call[0] for call in calls] == ["critique[0]", "critique[1]", "continuation[0]"]
+
+
+def test_agent_loop_gives_block_breaking_edits_no_continuation_path() -> None:
+    loop = _loop()
+    calls: list[str] = []
+
+    async def fake_generate(_route, _prompt, _params, *, max_tokens, kind, prompt_logprob_start=None):
+        del max_tokens
+        assert prompt_logprob_start is None
+        calls.append(kind)
+        assert kind.startswith("critique")
+        text = _structured("x + 1", "take another local step")
+        return TokenOutput(token_ids=_ids(text), log_probs=[-0.2] * len(_ids(text)))
+
+    loop._generate = fake_generate
+    solution_ids = _ids("before\n$$\nx + 1\n$$\nafter")
+    output = asyncio.run(
+        loop.run(
+            {},
+            branch_revision_rollout_id="p:0",
+            branch_revision_parent_objective="recovery",
+            branch_revision_num_critiques=2,
+            branch_revision_parent_prompt_ids=_ids("q"),
+            branch_revision_parent_solution_ids=solution_ids,
+            branch_revision_parent_solution_log_probs=[-0.1] * len(solution_ids),
+            raw_prompt=[{"role": "user", "content": "q"}],
+        )
+    )
+    record = output.extra_fields[BRANCH_REVISION_CHILD_FIELD]
+    assert [critique.parse_reason for critique in record.critiques] == [
+        "branch_inside_display_math",
+        "branch_inside_display_math",
+    ]
+    assert all(not critique.continuation_ids for critique in record.critiques)
+    assert calls == ["critique[0]", "critique[1]"]
 
 
 def test_agent_loop_rejects_edits_without_the_configured_continuation_budget() -> None:
@@ -1006,7 +1129,7 @@ def _learnability(*, percentile: float = 1.0, weight: float = 1.0, accepted: boo
         reward_weight=weight,
         accepted=accepted,
         eligible_rollouts=2,
-        sampled_windows=4,
+        total_windows=4,
     )
 
 

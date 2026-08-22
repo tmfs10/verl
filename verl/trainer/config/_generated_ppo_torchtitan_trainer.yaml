@@ -688,7 +688,6 @@ algorithm:
     learnability_logprob_statistic: mean
     min_seed_window_percentile: 0.2
     full_credit_seed_window_percentile: 0.5
-    learnability_windows_per_rollout: 8
     critique_max_response_length: 8192
     branch_max_tokens: 128
     new_continuation_max_tokens: 256
@@ -714,7 +713,19 @@ algorithm:
 
       the replacement. Choose <branch> so that this boundary falls between coherent
 
-      steps, not in the middle of a thought or action.
+      steps, not in the middle of a thought or action. Do not place the branch point
+
+      inside an open mathematical or delimited block. In particular, do not place
+      it
+
+      between an opening $$ and its matching closing $$, between \[ and \], inside
+      a
+
+      \begin{...}...\end{...} environment, or inside a fenced code block. If the
+
+      material to revise lies inside such a block, choose a coherent boundary before
+
+      its opening delimiter or after its closing delimiter.
 
 
       The replacement may use an idea that also appears later in the trajectory only
@@ -796,7 +807,19 @@ algorithm:
 
       the replacement. Choose <branch> so that this boundary falls between coherent
 
-      steps, not in the middle of a thought or action.
+      steps, not in the middle of a thought or action. Do not place the branch point
+
+      inside an open mathematical or delimited block. In particular, do not place
+      it
+
+      between an opening $$ and its matching closing $$, between \[ and \], inside
+      a
+
+      \begin{...}...\end{...} environment, or inside a fenced code block. If the
+
+      material to revise lies inside such a block, choose a coherent boundary before
+
+      its opening delimiter or after its closing delimiter.
 
 
       The replacement may use an idea that also appears later in the trajectory only

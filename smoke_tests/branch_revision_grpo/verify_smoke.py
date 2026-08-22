@@ -27,7 +27,8 @@ from typing import Any
 
 import numpy as np
 
-_AUDIT_SCHEMA_VERSION = 2
+_AUDIT_SCHEMA_VERSION = 3
+_SUPPORTED_AUDIT_SCHEMA_VERSIONS = {2, _AUDIT_SCHEMA_VERSION}
 
 
 def _read_json(path: Path) -> Any:
@@ -83,6 +84,39 @@ def _aggregate(values: Any, statistic: str) -> float:
     if statistic == "min":
         return min(normalized)
     raise ValueError(f"unsupported learnability log-probability statistic: {statistic!r}")
+
+
+def _exhaustive_reference(
+    originals: list[dict[str, Any]],
+    *,
+    window_size: int,
+    statistic: str,
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    counts: list[dict[str, Any]] = []
+    rows: list[np.ndarray] = []
+    for original in originals:
+        editable_length = int(original["editable_solution_length"])
+        values = np.asarray(
+            _float32_values(original["solution_log_probs"][:editable_length]),
+            dtype=np.float32,
+        )
+        candidate_count = int(values.size) - window_size + 1
+        if candidate_count <= 0:
+            continue
+        if statistic == "mean":
+            prefix = np.concatenate([np.zeros(1, dtype=np.float64), np.cumsum(values, dtype=np.float64)])
+            scores = (prefix[window_size:] - prefix[:-window_size]) / float(window_size)
+        elif statistic == "min":
+            scores = np.lib.stride_tricks.sliding_window_view(values, window_size).min(axis=1).astype(np.float64)
+        else:
+            raise ValueError(f"unsupported learnability log-probability statistic: {statistic!r}")
+        if scores.size != candidate_count:
+            raise ValueError("exhaustive audit reconstruction produced an incorrect window count")
+        counts.append({"rollout_id": str(original["rollout_id"]), "windows": candidate_count})
+        rows.append(np.asarray(scores, dtype=np.float64))
+    if not rows:
+        return counts, np.empty(0, dtype=np.float64)
+    return counts, np.concatenate(rows)
 
 
 def _expected_runtime_config(saved_config: dict[str, Any]) -> dict[str, Any]:
@@ -142,7 +176,11 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError("completed smoke evidence omitted its audit attempt ID")
     attempt_dir = root / "audit" / f"attempt_{attempt_id}"
     attempt = _read_json(attempt_dir / "attempt.json")
-    if int(attempt.get("schema_version", -1)) != _AUDIT_SCHEMA_VERSION or attempt.get("attempt_id") != attempt_id:
+    audit_schema_version = int(attempt.get("schema_version", -1))
+    if (
+        audit_schema_version not in _SUPPORTED_AUDIT_SCHEMA_VERSIONS
+        or attempt.get("attempt_id") != attempt_id
+    ):
         raise ValueError("audit attempt metadata has the wrong schema or attempt ID")
     runtime_config = attempt.get("resolved_config")
     if not isinstance(runtime_config, dict):
@@ -157,7 +195,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError(f"expected exactly one step-scoped audit file, got {audit_files!r}")
     events = _read_jsonl(audit_files[0])
     if any(
-        int(event.get("schema_version", -1)) != _AUDIT_SCHEMA_VERSION or event.get("attempt_id") != attempt_id
+        int(event.get("schema_version", -1)) != audit_schema_version or event.get("attempt_id") != attempt_id
         for event in events
     ):
         raise ValueError("step audit mixes schema versions or attempt IDs")
@@ -334,40 +372,62 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     references = {str(event.get("reference_key")): event for event in reference_events}
     if len(references) != len(reference_events):
         raise ValueError("duplicate learnability-reference evidence")
+    exhaustive_scores_by_reference: dict[str, np.ndarray] = {}
     for reference_key, reference in references.items():
         if reference.get("logprob_statistic") != statistic:
             raise ValueError(f"learnability reference {reference_key!r} used the wrong statistic")
         seed_tokens = int(reference.get("seed_tokens", 0))
-        windows = reference.get("windows")
-        if reference_key != f"{statistic}:{seed_tokens}" or seed_tokens <= 0 or not isinstance(windows, list):
-            raise ValueError(f"learnability reference {reference_key!r} has invalid identity or windows")
+        if reference_key != f"{statistic}:{seed_tokens}" or seed_tokens <= 0:
+            raise ValueError(f"learnability reference {reference_key!r} has an invalid identity")
         eligible_rollouts = int(reference.get("eligible_rollouts", 0))
-        sampled_windows = int(reference.get("sampled_windows", -1))
-        if sampled_windows != len(windows) or eligible_rollouts <= 0:
-            raise ValueError(f"learnability reference {reference_key!r} has inconsistent counts")
-        mass_by_rollout: defaultdict[str, float] = defaultdict(float)
-        for window in windows:
-            rollout_id = str(window.get("rollout_id"))
-            original = original_by_rollout.get(rollout_id)
-            if original is None:
-                raise ValueError(f"learnability reference {reference_key!r} names an unknown rollout")
-            start = int(window.get("start", -1))
-            editable_length = int(original["editable_solution_length"])
-            if start < 0 or start + seed_tokens > editable_length:
-                raise ValueError(f"learnability reference {reference_key!r} has an invalid window boundary")
-            source_values = original["solution_log_probs"][start : start + seed_tokens]
-            expected_score = _aggregate(source_values, statistic)
-            if not math.isclose(float(window.get("score")), expected_score, rel_tol=0.0, abs_tol=1e-12):
-                raise ValueError(f"learnability reference {reference_key!r} has a corrupted window score")
-            weight = float(window.get("weight"))
-            if not math.isfinite(weight) or weight <= 0.0:
-                raise ValueError(f"learnability reference {reference_key!r} has an invalid window weight")
-            mass_by_rollout[rollout_id] += weight
-        if len(mass_by_rollout) != eligible_rollouts or any(
-            not math.isclose(mass, 1.0 / eligible_rollouts, rel_tol=0.0, abs_tol=1e-12)
-            for mass in mass_by_rollout.values()
+        if audit_schema_version == 2:
+            windows = reference.get("windows")
+            sampled_windows = int(reference.get("sampled_windows", -1))
+            if not isinstance(windows, list) or sampled_windows != len(windows) or eligible_rollouts <= 0:
+                raise ValueError(f"learnability reference {reference_key!r} has inconsistent legacy counts")
+            mass_by_rollout: defaultdict[str, float] = defaultdict(float)
+            for window in windows:
+                rollout_id = str(window.get("rollout_id"))
+                original = original_by_rollout.get(rollout_id)
+                if original is None:
+                    raise ValueError(f"learnability reference {reference_key!r} names an unknown rollout")
+                start = int(window.get("start", -1))
+                editable_length = int(original["editable_solution_length"])
+                if start < 0 or start + seed_tokens > editable_length:
+                    raise ValueError(f"learnability reference {reference_key!r} has an invalid window boundary")
+                source_values = original["solution_log_probs"][start : start + seed_tokens]
+                expected_score = _aggregate(source_values, statistic)
+                if not math.isclose(float(window.get("score")), expected_score, rel_tol=0.0, abs_tol=1e-12):
+                    raise ValueError(f"learnability reference {reference_key!r} has a corrupted window score")
+                weight = float(window.get("weight"))
+                if not math.isfinite(weight) or weight <= 0.0:
+                    raise ValueError(f"learnability reference {reference_key!r} has an invalid window weight")
+                mass_by_rollout[rollout_id] += weight
+            if len(mass_by_rollout) != eligible_rollouts or any(
+                not math.isclose(mass, 1.0 / eligible_rollouts, rel_tol=0.0, abs_tol=1e-12)
+                for mass in mass_by_rollout.values()
+            ):
+                raise ValueError(f"learnability reference {reference_key!r} does not give equal mass per rollout")
+            continue
+
+        if reference.get("window_weighting") != "uniform_per_window":
+            raise ValueError(f"learnability reference {reference_key!r} does not use uniform per-window mass")
+        expected_counts, exhaustive_scores = _exhaustive_reference(
+            originals,
+            window_size=seed_tokens,
+            statistic=statistic,
+        )
+        total_windows = int(reference.get("total_windows", -1))
+        if (
+            reference.get("rollout_window_counts") != expected_counts
+            or eligible_rollouts != len(expected_counts)
+            or total_windows != int(exhaustive_scores.size)
+            or total_windows != sum(int(row["windows"]) for row in expected_counts)
         ):
-            raise ValueError(f"learnability reference {reference_key!r} does not give equal mass per rollout")
+            raise ValueError(f"learnability reference {reference_key!r} is not exhaustive")
+        if reference.get("window_scores_sha256") != _canonical_sha256(exhaustive_scores, dtype="<f8"):
+            raise ValueError(f"learnability reference {reference_key!r} has a corrupted exhaustive score hash")
+        exhaustive_scores_by_reference[reference_key] = exhaustive_scores
 
     learnability_by_key = {
         (str(event["rollout_id"]), int(event["critique_index"])): event for event in learnability_events
@@ -390,9 +450,10 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         reference = references.get(str(event.get("reference_key")))
         if reference is None or int(reference["seed_tokens"]) != seed_tokens:
             raise ValueError(f"learnability event {key!r} lacks its exact length-matched reference")
+        reference_window_field = "sampled_windows" if audit_schema_version == 2 else "total_windows"
         if int(event["eligible_rollouts"]) != int(reference["eligible_rollouts"]) or int(
-            event["sampled_windows"]
-        ) != int(reference["sampled_windows"]):
+            event[reference_window_field]
+        ) != int(reference[reference_window_field]):
             raise ValueError(f"learnability event {key!r} reference counts disagree")
         scored_ids = [int(token) for token in event.get("scored_token_ids", ())]
         scored_log_probs = _float32_values(event.get("scored_token_log_probs", ()))
@@ -417,9 +478,19 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         expected_seed_score = _aggregate(scored_log_probs, statistic)
         if not math.isclose(float(event["seed_score"]), expected_seed_score, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError(f"learnability event {key!r} has a corrupted replacement score")
-        expected_percentile = sum(
-            float(window["weight"]) for window in reference["windows"] if float(window["score"]) <= expected_seed_score
-        )
+        if audit_schema_version == 2:
+            expected_percentile = sum(
+                float(window["weight"])
+                for window in reference["windows"]
+                if float(window["score"]) <= expected_seed_score
+            )
+        else:
+            exhaustive_scores = exhaustive_scores_by_reference[str(event["reference_key"])]
+            expected_percentile = (
+                float(np.count_nonzero(exhaustive_scores <= expected_seed_score)) / float(exhaustive_scores.size)
+                if exhaustive_scores.size
+                else 0.0
+            )
         expected_percentile = min(max(expected_percentile, 0.0), 1.0)
         minimum = float(branch_config["min_seed_window_percentile"])
         full_credit = float(branch_config["full_credit_seed_window_percentile"])
@@ -707,6 +778,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     return {
         "status": "verified" if require_algorithm_signal else "integrity-verified",
         "algorithm_signal_required": require_algorithm_signal,
+        "audit_schema_version": audit_schema_version,
         "audit_attempt_id": attempt_id,
         "audit_file": str(audit_files[0]),
         "event_counts": dict(sorted(event_counts.items())),
@@ -731,7 +803,7 @@ def main() -> None:
     parser.add_argument(
         "--integrity-only",
         action="store_true",
-        help="verify complete schema-v2 evidence without requiring nonzero revision learning signal",
+        help="verify complete schema-v2/v3 evidence without requiring nonzero revision learning signal",
     )
     args = parser.parse_args()
     result = verify(args.root, require_algorithm_signal=not args.integrity_only)

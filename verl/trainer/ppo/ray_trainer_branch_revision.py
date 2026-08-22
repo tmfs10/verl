@@ -56,7 +56,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import marked_timer
 
-_AUDIT_SCHEMA_VERSION = 2
+_AUDIT_SCHEMA_VERSION = 3
 
 
 def _add_exception_note(error: BaseException, note: str) -> None:
@@ -617,7 +617,10 @@ class BranchRevisionGRPOController:
             editable_log_probs,
         )
         statistic = self.feature.learnability_logprob_statistic
-        references: dict[tuple[str, int], Any] = {}
+        proposals_by_length: defaultdict[
+            int,
+            list[tuple[_Bundle, int, BranchRevisionCritiqueGeneration, list[float]]],
+        ] = defaultdict(list)
         for bundle in bundles:
             if bundle.record is None:
                 continue
@@ -639,43 +642,29 @@ class BranchRevisionGRPOController:
                     )
                 if not all(math.isfinite(value) for value in seed_values):
                     raise RuntimeError("vLLM returned non-finite replacement-seed prompt log probabilities")
-                reference_key = (statistic, seed_length)
-                reference = references.get(reference_key)
-                if reference is None:
-                    reference = build_learnability_reference(
-                        prefixes,
-                        window_size=seed_length,
-                        windows_per_rollout=self.feature.learnability_windows_per_rollout,
-                        seed=int(self.trainer.global_steps),
-                        logprob_statistic=statistic,
-                    )
-                    references[reference_key] = reference
-                    starts = reference.window_starts.detach().cpu().tolist()
-                    scores = reference.window_scores.detach().cpu().tolist()
-                    weights = reference.window_weights.detach().cpu().tolist()
-                    self._audit(
-                        "learnability_reference",
-                        reference_key=f"{statistic}:{seed_length}",
-                        logprob_statistic=statistic,
-                        seed_tokens=seed_length,
-                        eligible_rollouts=reference.eligible_rollouts,
-                        sampled_windows=reference.sampled_windows,
-                        windows=[
-                            {
-                                "rollout_id": rollout_id,
-                                "start": int(start),
-                                "score": float(score_value),
-                                "weight": float(weight),
-                            }
-                            for rollout_id, start, score_value, weight in zip(
-                                reference.window_rollout_ids,
-                                starts,
-                                scores,
-                                weights,
-                                strict=True,
-                            )
-                        ],
-                    )
+                proposals_by_length[seed_length].append((bundle, critique_index, critique, seed_values))
+
+        for seed_length in sorted(proposals_by_length):
+            reference = build_learnability_reference(
+                prefixes,
+                window_size=seed_length,
+                logprob_statistic=statistic,
+            )
+            self._audit(
+                "learnability_reference",
+                reference_key=f"{statistic}:{seed_length}",
+                logprob_statistic=statistic,
+                seed_tokens=seed_length,
+                window_weighting="uniform_per_window",
+                eligible_rollouts=reference.eligible_rollouts,
+                total_windows=reference.total_windows,
+                rollout_window_counts=[
+                    {"rollout_id": rollout_id, "windows": count}
+                    for rollout_id, count in reference.rollout_window_counts
+                ],
+                window_scores_sha256=reference.window_scores_sha256,
+            )
+            for bundle, critique_index, critique, seed_values in proposals_by_length[seed_length]:
                 seed_score = aggregate_log_probs(seed_values, statistic=statistic)
                 score = score_seed_learnability(
                     seed_score,
@@ -706,7 +695,7 @@ class BranchRevisionGRPOController:
                     reward_weight=score.reward_weight,
                     accepted=score.accepted,
                     eligible_rollouts=score.eligible_rollouts,
-                    sampled_windows=score.sampled_windows,
+                    total_windows=score.total_windows,
                 )
 
     def _make_reward_batch(

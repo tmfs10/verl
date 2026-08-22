@@ -22,6 +22,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+import numpy as np
 import torch
 
 BRANCH_OPEN = "<branch>"
@@ -40,6 +41,8 @@ _FINAL_ANSWER_PATTERN = re.compile(
     r")",
     flags=re.IGNORECASE,
 )
+_LATEX_ENVIRONMENT_PATTERN = re.compile(r"\\(begin|end)\{([^{}\r\n]+)\}")
+_FENCE_PATTERN = re.compile(r"^[ ]{0,3}(`{3,}|~{3,})(.*)$")
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,7 @@ class RolloutLogProbPrefix:
     rollout_id: str
     log_probs: torch.Tensor
     prefix_sums: torch.Tensor
+    min_sparse_table: tuple[torch.Tensor, ...]
 
     @property
     def token_count(self) -> int:
@@ -74,14 +78,19 @@ class LearnabilityReference:
     window_size: int
     logprob_statistic: str
     window_scores: torch.Tensor
-    window_weights: torch.Tensor
-    window_rollout_ids: tuple[str, ...]
-    window_starts: torch.Tensor
+    sorted_window_scores: torch.Tensor
+    rollout_window_counts: tuple[tuple[str, int], ...]
     eligible_rollouts: int
 
     @property
-    def sampled_windows(self) -> int:
+    def total_windows(self) -> int:
         return int(self.window_scores.numel())
+
+    @property
+    def window_scores_sha256(self) -> str:
+        values = self.window_scores.detach().to(device="cpu", dtype=torch.float64).contiguous().numpy()
+        canonical = np.asarray(values, dtype=np.dtype("<f8"))
+        return hashlib.sha256(canonical.tobytes(order="C")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -92,7 +101,7 @@ class LearnabilityScore:
     reward_weight: float
     accepted: bool
     eligible_rollouts: int
-    sampled_windows: int
+    total_windows: int
 
 
 def terminal_eos_ids(tokenizer: Any) -> set[int]:
@@ -185,7 +194,7 @@ def build_rollout_logprob_prefixes(
     *,
     device: torch.device | str | None = None,
 ) -> tuple[RolloutLogProbPrefix, ...]:
-    """Normalize rollout log-probabilities and build cumulative sums once per iteration."""
+    """Build exact mean and range-minimum indexes once per rollout and iteration."""
 
     if len(rollout_ids) != len(rollout_log_probs):
         raise ValueError("rollout ids and log-probability rows must have equal lengths")
@@ -196,7 +205,14 @@ def build_rollout_logprob_prefixes(
             raise ValueError(f"rollout {rollout_id!r} contains non-finite log probabilities")
         prefix_values = tensor.to(dtype=torch.float64)
         prefix = torch.cat([torch.zeros(1, dtype=torch.float64, device=tensor.device), prefix_values.cumsum(dim=0)])
-        result.append(RolloutLogProbPrefix(str(rollout_id), tensor, prefix))
+        sparse_levels = [tensor]
+        span = 1
+        while span * 2 <= tensor.numel():
+            previous = sparse_levels[-1]
+            output_count = tensor.numel() - span * 2 + 1
+            sparse_levels.append(torch.minimum(previous[:output_count], previous[span : span + output_count]))
+            span *= 2
+        result.append(RolloutLogProbPrefix(str(rollout_id), tensor, prefix, tuple(sparse_levels)))
     return tuple(result)
 
 
@@ -228,88 +244,143 @@ def aggregate_log_probs(values: Iterable[float], *, statistic: str) -> float:
     raise ValueError("learnability log-probability statistic must be mean or min")
 
 
-def _stratified_window_starts(
-    candidate_count: int,
-    max_windows: int,
-    *,
-    seed: int,
-    rollout_id: str,
-    window_size: int,
-) -> list[int]:
-    if candidate_count <= max_windows:
-        return list(range(candidate_count))
-    starts: list[int] = []
-    for slot in range(max_windows):
-        lower = slot * candidate_count // max_windows
-        upper = (slot + 1) * candidate_count // max_windows
-        width = upper - lower
-        digest = hashlib.blake2b(
-            f"{seed}:{rollout_id}:{window_size}:{slot}".encode(),
-            digest_size=8,
-        ).digest()
-        starts.append(lower + int.from_bytes(digest, "little") % width)
-    return starts
+def _is_escaped(text: str, index: int) -> bool:
+    backslashes = 0
+    cursor = index - 1
+    while cursor >= 0 and text[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    return backslashes % 2 == 1
+
+
+def branch_prefix_open_block_reason(prefix_text: str) -> str | None:
+    """Return the structural block left open at a proposed branch boundary."""
+
+    math_mode: str | None = None
+    environment_stack: list[str] = []
+    fence: tuple[str, int] | None = None
+    for raw_line in prefix_text.splitlines(keepends=True):
+        line = raw_line.rstrip("\r\n")
+        fence_match = _FENCE_PATTERN.match(line)
+        if fence is not None:
+            if fence_match is not None:
+                run = fence_match.group(1)
+                suffix = fence_match.group(2)
+                if run[0] == fence[0] and len(run) >= fence[1] and not suffix.strip():
+                    fence = None
+            continue
+        if math_mode is None and not environment_stack and fence_match is not None:
+            run = fence_match.group(1)
+            fence = (run[0], len(run))
+            continue
+
+        cursor = 0
+        while cursor < len(line):
+            if math_mode == "dollar":
+                if line.startswith("$$", cursor) and not _is_escaped(line, cursor):
+                    math_mode = None
+                    cursor += 2
+                else:
+                    cursor += 1
+                continue
+            if math_mode == "bracket":
+                if line.startswith(r"\]", cursor) and not _is_escaped(line, cursor):
+                    math_mode = None
+                    cursor += 2
+                else:
+                    cursor += 1
+                continue
+            if environment_stack:
+                match = _LATEX_ENVIRONMENT_PATTERN.match(line, cursor)
+                if match is None or _is_escaped(line, cursor):
+                    cursor += 1
+                    continue
+                action, name = match.groups()
+                if action == "begin":
+                    environment_stack.append(name)
+                elif environment_stack[-1] == name:
+                    environment_stack.pop()
+                cursor = match.end()
+                continue
+
+            if line.startswith("$$", cursor) and not _is_escaped(line, cursor):
+                math_mode = "dollar"
+                cursor += 2
+                continue
+            if line.startswith(r"\[", cursor) and not _is_escaped(line, cursor):
+                math_mode = "bracket"
+                cursor += 2
+                continue
+            match = _LATEX_ENVIRONMENT_PATTERN.match(line, cursor)
+            if match is not None and not _is_escaped(line, cursor):
+                action, name = match.groups()
+                if action == "begin":
+                    environment_stack.append(name)
+                cursor = match.end()
+                continue
+            cursor += 1
+
+    if fence is not None:
+        return "branch_inside_code_fence"
+    if math_mode is not None:
+        return "branch_inside_display_math"
+    if environment_stack:
+        return "branch_inside_latex_environment"
+    return None
 
 
 def build_learnability_reference(
     prefixes: Sequence[RolloutLogProbPrefix],
     *,
     window_size: int,
-    windows_per_rollout: int,
-    seed: int,
     logprob_statistic: str = "mean",
 ) -> LearnabilityReference:
-    """Sample length-matched windows, giving every eligible rollout equal mass."""
+    """Enumerate every length-matched window with uniform per-window mass."""
 
-    if window_size <= 0 or windows_per_rollout <= 0:
-        raise ValueError("learnability window sizes and counts must be positive")
+    if window_size <= 0:
+        raise ValueError("learnability window size must be positive")
     if logprob_statistic not in {"mean", "min"}:
         raise ValueError("learnability log-probability statistic must be mean or min")
-    sampled: list[torch.Tensor] = []
-    sampled_rollout_ids: list[str] = []
-    sampled_starts: list[torch.Tensor] = []
+    exhaustive_scores: list[torch.Tensor] = []
+    rollout_window_counts: list[tuple[str, int]] = []
     for rollout in prefixes:
         candidate_count = rollout.token_count - window_size + 1
         if candidate_count <= 0:
             continue
-        starts = _stratified_window_starts(
-            candidate_count,
-            windows_per_rollout,
-            seed=seed,
-            rollout_id=rollout.rollout_id,
-            window_size=window_size,
-        )
-        indices = torch.tensor(starts, dtype=torch.long, device=rollout.prefix_sums.device)
         if logprob_statistic == "mean":
-            scores = (rollout.prefix_sums[indices + window_size] - rollout.prefix_sums[indices]) / float(window_size)
+            scores = (rollout.prefix_sums[window_size:] - rollout.prefix_sums[:-window_size]) / float(window_size)
         else:
-            offsets = torch.arange(window_size, dtype=torch.long, device=rollout.log_probs.device)
-            scores = rollout.log_probs[indices[:, None] + offsets[None, :]].amin(dim=1).to(dtype=torch.float64)
-        sampled.append(scores)
-        sampled_rollout_ids.extend([rollout.rollout_id] * len(starts))
-        sampled_starts.append(indices)
-    if not sampled:
+            level_index = window_size.bit_length() - 1
+            span = 1 << level_index
+            level = rollout.min_sparse_table[level_index]
+            right_offset = window_size - span
+            scores = torch.minimum(
+                level[:candidate_count],
+                level[right_offset : right_offset + candidate_count],
+            ).to(dtype=torch.float64)
+        if scores.numel() != candidate_count:
+            raise RuntimeError("exhaustive learnability reference produced an incorrect window count")
+        exhaustive_scores.append(scores)
+        rollout_window_counts.append((rollout.rollout_id, candidate_count))
+    if not exhaustive_scores:
         device = prefixes[0].prefix_sums.device if prefixes else None
         empty = torch.empty(0, dtype=torch.float64, device=device)
         return LearnabilityReference(
             window_size=window_size,
             logprob_statistic=logprob_statistic,
             window_scores=empty,
-            window_weights=empty.clone(),
-            window_rollout_ids=(),
-            window_starts=torch.empty(0, dtype=torch.long, device=device),
+            sorted_window_scores=empty.clone(),
+            rollout_window_counts=(),
             eligible_rollouts=0,
         )
-    eligible_rollouts = len(sampled)
-    weights = [torch.full_like(values, 1.0 / (eligible_rollouts * values.numel())) for values in sampled]
+    window_scores = torch.cat(exhaustive_scores)
     return LearnabilityReference(
         window_size=window_size,
         logprob_statistic=logprob_statistic,
-        window_scores=torch.cat(sampled),
-        window_weights=torch.cat(weights),
-        window_rollout_ids=tuple(sampled_rollout_ids),
-        window_starts=torch.cat(sampled_starts),
-        eligible_rollouts=eligible_rollouts,
+        window_scores=window_scores,
+        sorted_window_scores=torch.sort(window_scores).values,
+        rollout_window_counts=tuple(rollout_window_counts),
+        eligible_rollouts=len(rollout_window_counts),
     )
 
 
@@ -326,12 +397,17 @@ def score_seed_learnability(
         raise ValueError("replacement seed log-probability score must be finite")
     if not 0.0 <= minimum_percentile < full_credit_percentile <= 1.0:
         raise ValueError("learnability percentiles must satisfy 0 <= minimum < full credit <= 1")
-    if reference.sampled_windows == 0:
+    if reference.total_windows == 0:
         percentile = 0.0
     else:
-        percentile = float(reference.window_weights[reference.window_scores <= seed_score].sum().detach().cpu().item())
+        boundary = torch.searchsorted(
+            reference.sorted_window_scores,
+            torch.tensor(seed_score, dtype=torch.float64, device=reference.sorted_window_scores.device),
+            right=True,
+        )
+        percentile = float(boundary.detach().cpu().item()) / reference.total_windows
         percentile = min(max(percentile, 0.0), 1.0)
-    accepted = reference.sampled_windows > 0 and percentile >= minimum_percentile
+    accepted = reference.total_windows > 0 and percentile >= minimum_percentile
     reward_weight = min(
         max((percentile - minimum_percentile) / (full_credit_percentile - minimum_percentile), 0.0),
         1.0,
@@ -343,7 +419,7 @@ def score_seed_learnability(
         reward_weight=reward_weight,
         accepted=accepted,
         eligible_rollouts=reference.eligible_rollouts,
-        sampled_windows=reference.sampled_windows,
+        total_windows=reference.total_windows,
     )
 
 
@@ -406,6 +482,9 @@ def parse_branch_revision(
         return _invalid("branch_not_unique", solution_text, critique_text)
 
     branch_prefix_text = solution_text[:branch_start]
+    open_block_reason = branch_prefix_open_block_reason(branch_prefix_text)
+    if open_block_reason is not None:
+        return _invalid(open_block_reason, solution_text, critique_text)
     branch_prefix_ids = [int(token) for token in tokenizer.encode(branch_prefix_text, add_special_tokens=False)]
     if decode_exact(branch_prefix_ids, tokenizer) != branch_prefix_text:
         return _invalid("branch_prefix_not_roundtrip_exact", solution_text, critique_text)

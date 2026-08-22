@@ -19,6 +19,7 @@ import hashlib
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 from omegaconf import OmegaConf
 
@@ -296,7 +297,13 @@ def _refresh_attempt_config_hash(root: Path, attempt_id: str = "fixture") -> Non
     _write_json(path, attempt)
 
 
-def _fixture(root: Path, *, include_continuation: bool = True, statistic: str = "mean") -> None:
+def _fixture(
+    root: Path,
+    *,
+    include_continuation: bool = True,
+    statistic: str = "mean",
+    schema_version: int = 3,
+) -> None:
     attempt_id = "fixture"
     invocation_id = "invocation"
     completion = {
@@ -335,7 +342,7 @@ def _fixture(root: Path, *, include_continuation: bool = True, statistic: str = 
     _write_json(
         attempt_dir / "attempt.json",
         {
-            "schema_version": 2,
+            "schema_version": schema_version,
             "attempt_id": attempt_id,
             "starting_global_step": 1,
             "resolved_config_sha256": hashlib.sha256(resolved_config_json.encode("utf-8")).hexdigest(),
@@ -386,15 +393,33 @@ def _fixture(root: Path, *, include_continuation: bool = True, statistic: str = 
         )
 
     if include_continuation:
-        reference_windows = [
-            {
-                "rollout_id": rollout_id,
-                "start": 0,
-                "score": _aggregate(original["solution_log_probs"], statistic),
-                "weight": 1.0 / len(originals),
+        reference_scores = np.asarray(
+            [_aggregate(original["solution_log_probs"], statistic) for original in originals.values()],
+            dtype=np.float64,
+        )
+        if schema_version == 2:
+            reference_windows = [
+                {
+                    "rollout_id": rollout_id,
+                    "start": 0,
+                    "score": float(score),
+                    "weight": 1.0 / len(originals),
+                }
+                for (rollout_id, _), score in zip(originals.items(), reference_scores, strict=True)
+            ]
+            reference_payload = {
+                "sampled_windows": len(reference_windows),
+                "windows": reference_windows,
             }
-            for rollout_id, original in originals.items()
-        ]
+        else:
+            reference_payload = {
+                "window_weighting": "uniform_per_window",
+                "total_windows": len(originals),
+                "rollout_window_counts": [
+                    {"rollout_id": rollout_id, "windows": 1} for rollout_id in originals
+                ],
+                "window_scores_sha256": _canonical_sha256(reference_scores, dtype="<f8"),
+            }
         events.append(
             {
                 "event": "learnability_reference",
@@ -402,8 +427,7 @@ def _fixture(root: Path, *, include_continuation: bool = True, statistic: str = 
                 "logprob_statistic": statistic,
                 "seed_tokens": 2,
                 "eligible_rollouts": len(originals),
-                "sampled_windows": len(reference_windows),
-                "windows": reference_windows,
+                **reference_payload,
             }
         )
 
@@ -464,7 +488,7 @@ def _fixture(root: Path, *, include_continuation: bool = True, statistic: str = 
                         "reward_weight": reward_weight,
                         "accepted": accepted,
                         "eligible_rollouts": len(originals),
-                        "sampled_windows": len(originals),
+                        ("sampled_windows" if schema_version == 2 else "total_windows"): len(originals),
                     }
                 )
             compression_fraction = 0.25 if accepted and objective == "compression" else None
@@ -592,7 +616,10 @@ def _fixture(root: Path, *, include_continuation: bool = True, statistic: str = 
             {"event": "step_complete"},
         ]
     )
-    events = [{"schema_version": 2, "attempt_id": attempt_id, "global_step": 1, **event} for event in events]
+    events = [
+        {"schema_version": schema_version, "attempt_id": attempt_id, "global_step": 1, **event}
+        for event in events
+    ]
     _write_jsonl(_audit_path(root, attempt_id), events)
     _write_jsonl(
         root / "metrics.jsonl",
@@ -630,6 +657,11 @@ def test_verifier_accepts_complete_live_contract(tmp_path: Path) -> None:
     assert result["status"] == "verified"
     assert result["valid_edits"] == 3
     assert result["successful_compression_credit"] == 1.0
+
+
+def test_verifier_retains_legacy_schema_v2_support(tmp_path: Path) -> None:
+    _fixture(tmp_path, schema_version=2)
+    assert verify(tmp_path)["status"] == "verified"
 
 
 def test_verifier_accepts_minimum_logprob_evidence_and_post_balance_reordering(tmp_path: Path) -> None:
@@ -745,14 +777,38 @@ def test_verifier_requires_vllm_prompt_logprobs_for_learnability(tmp_path: Path)
         verify(tmp_path)
 
 
-def test_verifier_rejects_corrupted_reference_window_score(tmp_path: Path) -> None:
+def test_verifier_rejects_corrupted_exhaustive_reference_hash(tmp_path: Path) -> None:
     _fixture(tmp_path)
     path = _audit_path(tmp_path)
     events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     reference = next(event for event in events if event["event"] == "learnability_reference")
-    reference["windows"][0]["score"] -= 0.25
+    reference["window_scores_sha256"] = "0" * 64
     _write_jsonl(path, events)
-    with pytest.raises(ValueError, match="corrupted window score"):
+    with pytest.raises(ValueError, match="corrupted exhaustive score hash"):
+        verify(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("window_weighting", "uniform_per_rollout", "uniform per-window mass"),
+        ("total_windows", 15, "not exhaustive"),
+        ("rollout_window_counts", [], "not exhaustive"),
+    ],
+)
+def test_verifier_rejects_non_exhaustive_reference_contract(
+    field: str,
+    value: object,
+    message: str,
+    tmp_path: Path,
+) -> None:
+    _fixture(tmp_path)
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    reference = next(event for event in events if event["event"] == "learnability_reference")
+    reference[field] = value
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match=message):
         verify(tmp_path)
 
 
@@ -818,5 +874,6 @@ def test_extra_args_contains_no_async_or_critic_training() -> None:
     assert "actor_rollout_ref.rollout.repetition_penalty=1.0" in rendered
     assert "enable_positive_compression=true" in rendered
     assert "learnability_logprob_statistic=mean" in rendered
+    assert "learnability_windows_per_rollout" not in rendered
     assert "critique_max_response_length=2560" in rendered
     assert "min_continuation_tokens=128" in rendered

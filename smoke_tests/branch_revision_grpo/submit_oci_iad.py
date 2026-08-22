@@ -74,7 +74,6 @@ def _extra_args(
         f"algorithm.branch_revision_grpo.learnability_logprob_statistic={learnability_logprob_statistic}",
         "algorithm.branch_revision_grpo.min_seed_window_percentile=0.20",
         "algorithm.branch_revision_grpo.full_credit_seed_window_percentile=0.50",
-        "algorithm.branch_revision_grpo.learnability_windows_per_rollout=8",
         "algorithm.branch_revision_grpo.critique_max_response_length=2560",
         "algorithm.branch_revision_grpo.branch_max_tokens=128",
         "algorithm.branch_revision_grpo.new_continuation_max_tokens=256",

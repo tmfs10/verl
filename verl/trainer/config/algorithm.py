@@ -49,7 +49,12 @@ select an appropriate point at which to revise the trajectory.
 
 Treat the point immediately before <branch> as the information boundary for
 the replacement. Choose <branch> so that this boundary falls between coherent
-steps, not in the middle of a thought or action.
+steps, not in the middle of a thought or action. Do not place the branch point
+inside an open mathematical or delimited block. In particular, do not place it
+between an opening $$ and its matching closing $$, between \\[ and \\], inside a
+\\begin{...}...\\end{...} environment, or inside a fenced code block. If the
+material to revise lies inside such a block, choose a coherent boundary before
+its opening delimiter or after its closing delimiter.
 
 The replacement may use an idea that also appears later in the trajectory only
 when the task and the trajectory before the branch already provide a reasonable
@@ -96,7 +101,12 @@ select an appropriate point at which to revise the trajectory.
 
 Treat the point immediately before <branch> as the information boundary for
 the replacement. Choose <branch> so that this boundary falls between coherent
-steps, not in the middle of a thought or action.
+steps, not in the middle of a thought or action. Do not place the branch point
+inside an open mathematical or delimited block. In particular, do not place it
+between an opening $$ and its matching closing $$, between \\[ and \\], inside a
+\\begin{...}...\\end{...} environment, or inside a fenced code block. If the
+material to revise lies inside such a block, choose a coherent boundary before
+its opening delimiter or after its closing delimiter.
 
 The replacement may use an idea that also appears later in the trajectory only
 when the task and the trajectory before the branch already provide a reasonable
@@ -147,7 +157,6 @@ class BranchRevisionGRPOConfig(BaseConfig):
     learnability_logprob_statistic: str = "mean"
     min_seed_window_percentile: float = 0.20
     full_credit_seed_window_percentile: float = 0.50
-    learnability_windows_per_rollout: int = 8
     critique_max_response_length: Optional[int] = 8192
     branch_max_tokens: int = 128
     new_continuation_max_tokens: int = 256
@@ -161,7 +170,6 @@ class BranchRevisionGRPOConfig(BaseConfig):
         positive_ints = {
             "num_critiques": self.num_critiques,
             "num_positive_critiques": self.num_positive_critiques,
-            "learnability_windows_per_rollout": self.learnability_windows_per_rollout,
             "branch_max_tokens": self.branch_max_tokens,
             "new_continuation_max_tokens": self.new_continuation_max_tokens,
             "min_continuation_tokens": self.min_continuation_tokens,
