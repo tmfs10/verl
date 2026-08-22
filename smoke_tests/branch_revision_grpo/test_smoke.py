@@ -303,7 +303,7 @@ def _fixture(
     *,
     include_continuation: bool = True,
     statistic: str = "mean",
-    schema_version: int = 3,
+    schema_version: int = 4,
 ) -> None:
     attempt_id = "fixture"
     invocation_id = "invocation"
@@ -454,13 +454,20 @@ def _fixture(
             reward = outcome - baseline if objective == "recovery" else objective_credit
             critique_ids = [700 + original_index, 800 + critique_index]
             branch_prefix_ids = [original["solution_ids"][0]] if valid else []
+            if valid and schema_version >= 4 and original_index == 0:
+                branch_prefix_ids = []
+            prefix_ids = [600 + original_index * 2 + critique_index] if valid and schema_version >= 4 else []
+            continuation_prefix_ids = (
+                [*branch_prefix_ids, *prefix_ids] if valid and schema_version >= 4 else []
+            )
             replacement_ids = [
                 500 + original_index * 4 + critique_index * 2,
                 501 + original_index * 4 + critique_index * 2,
             ]
             replacement_ids = replacement_ids if valid else []
             replacement_log_probs = ([-0.1, -0.1] if accepted else [-1.0, -1.0]) if valid else []
-            revised_prefix_ids = [*branch_prefix_ids, *replacement_ids] if valid else []
+            revision_context_ids = continuation_prefix_ids if schema_version >= 4 else branch_prefix_ids
+            revised_prefix_ids = [*revision_context_ids, *replacement_ids] if valid else []
             generated_ids = [900 + original_index * 2 + critique_index] if valid else []
             generated_log_probs = [-0.2] if valid else []
             if valid:
@@ -481,8 +488,8 @@ def _fixture(
                         "seed_tokens": 2,
                         "logprob_statistic": statistic,
                         "seed_score": seed_score,
-                        "scoring_prompt_ids": [*original["prompt_ids"], *branch_prefix_ids, *replacement_ids],
-                        "prompt_logprob_start": len(original["prompt_ids"]) + len(branch_prefix_ids),
+                        "scoring_prompt_ids": [*original["prompt_ids"], *revision_context_ids, *replacement_ids],
+                        "prompt_logprob_start": len(original["prompt_ids"]) + len(revision_context_ids),
                         "scored_token_ids": replacement_ids,
                         "scored_token_log_probs": replacement_log_probs,
                         "percentile": percentile,
@@ -494,6 +501,20 @@ def _fixture(
                 )
             compression_fraction = 0.25 if accepted and objective == "compression" else None
             compression_credit = 1.0 if accepted and objective == "compression" else None
+            edit_strings = (
+                {
+                    "prefix": "source prefix" if valid else "",
+                    "prefix_plus_new_continuation": "source prefixgood" if valid else "",
+                    "new_continuation": "good" if valid else "",
+                    "prefix_ids": prefix_ids,
+                    "continuation_prefix_ids": continuation_prefix_ids,
+                }
+                if schema_version >= 4
+                else {
+                    "branch": "bad" if valid else "",
+                    "new_continuation": "good" if valid else "",
+                }
+            )
             critique = {
                 "event": "critique",
                 "actor_row_id": f"critique:{rollout_id}:{critique_index}",
@@ -515,8 +536,7 @@ def _fixture(
                 "continuation_reward_evaluated": accepted,
                 "continuation_wasted_by_learnability": valid and not accepted,
                 "parse_reason": "valid" if valid else "tag_count",
-                "branch": "bad" if valid else "",
-                "new_continuation": "good" if valid else "",
+                **edit_strings,
                 "branch_prefix_ids": branch_prefix_ids,
                 "new_continuation_ids": replacement_ids,
                 "new_continuation_log_probs": replacement_log_probs,
@@ -663,6 +683,33 @@ def test_verifier_accepts_complete_live_contract(tmp_path: Path) -> None:
 def test_verifier_retains_legacy_schema_v2_support(tmp_path: Path) -> None:
     _fixture(tmp_path, schema_version=2)
     assert verify(tmp_path)["status"] == "verified"
+
+
+def test_verifier_retains_legacy_schema_v3_support(tmp_path: Path) -> None:
+    _fixture(tmp_path, schema_version=3)
+    assert verify(tmp_path)["status"] == "verified"
+
+
+def test_verifier_rejects_schema_v4_joint_text_that_does_not_extend_prefix(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    critique = next(event for event in events if event["event"] == "critique" and event["parse_reason"] == "valid")
+    critique["prefix_plus_new_continuation"] = "different"
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="inconsistent prefix/joint boundaries"):
+        verify(tmp_path)
+
+
+def test_verifier_rejects_schema_v4_corrupted_continuation_prefix_boundary(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    critique = next(event for event in events if event["event"] == "critique" and event["parse_reason"] == "valid")
+    critique["continuation_prefix_ids"] = [999]
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="inconsistent prefix/joint boundaries"):
+        verify(tmp_path)
 
 
 def test_verifier_accepts_minimum_logprob_evidence_and_post_balance_reordering(tmp_path: Path) -> None:

@@ -25,10 +25,10 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 import torch
 
-BRANCH_OPEN = "<branch>"
-BRANCH_CLOSE = "</branch>"
-NEW_CONTINUATION_OPEN = "<new continuation>"
-NEW_CONTINUATION_CLOSE = "</new continuation>"
+PREFIX_OPEN = "<prefix>"
+PREFIX_CLOSE = "</prefix>"
+PREFIX_PLUS_CONTINUATION_OPEN = "<prefix + new continuation>"
+PREFIX_PLUS_CONTINUATION_CLOSE = "</prefix + new continuation>"
 _FOLLOWUP_SENTINEL = "__VERL_BRANCH_REVISION_PREVIOUS_ASSISTANT_7F4E65C1__"
 _FINAL_ANSWER_PATTERN = re.compile(
     r"(?:"
@@ -52,11 +52,14 @@ class ParsedBranchRevision:
     solution_text: str
     critique_text: str
     analysis_text: str = ""
-    branch_text: str = ""
+    prefix_text: str = ""
+    prefix_plus_new_continuation_text: str = ""
     new_continuation_text: str = ""
     branch_start: int = -1
     revised_text: str = ""
     branch_prefix_ids: tuple[int, ...] = ()
+    prefix_ids: tuple[int, ...] = ()
+    continuation_prefix_ids: tuple[int, ...] = ()
     new_continuation_ids: tuple[int, ...] = ()
     revised_prefix_ids: tuple[int, ...] = ()
 
@@ -430,8 +433,9 @@ def _revision_at_branch_start(
     solution_text: str,
     critique_text: str,
     analysis_text: str,
-    branch_text: str,
-    replacement_text: str,
+    prefix_text: str,
+    prefix_plus_new_continuation_text: str,
+    new_continuation_text: str,
     branch_start: int,
     tokenizer: Any,
     new_continuation_max_tokens: int,
@@ -445,15 +449,30 @@ def _revision_at_branch_start(
         return _invalid("branch_prefix_not_roundtrip_exact", solution_text, critique_text)
     if editable_solution_ids[: len(branch_prefix_ids)] != branch_prefix_ids:
         return _invalid("branch_not_at_token_boundary", solution_text, critique_text)
-    revised_text = branch_prefix_text + replacement_text
+    continuation_prefix_text = branch_prefix_text + prefix_text
+    continuation_prefix_ids = [
+        int(token) for token in tokenizer.encode(continuation_prefix_text, add_special_tokens=False)
+    ]
+    if decode_exact(continuation_prefix_ids, tokenizer) != continuation_prefix_text:
+        return _invalid("continuation_prefix_not_roundtrip_exact", solution_text, critique_text)
+    if continuation_prefix_ids[: len(branch_prefix_ids)] != branch_prefix_ids:
+        return _invalid("prefix_retokenizes_branch_prefix", solution_text, critique_text)
+    prefix_ids = continuation_prefix_ids[len(branch_prefix_ids) :]
+    if not prefix_ids:
+        return _invalid("empty_prefix_tokens", solution_text, critique_text)
+    open_continuation_reason = branch_prefix_open_block_reason(continuation_prefix_text)
+    if open_continuation_reason is not None:
+        return _invalid(open_continuation_reason, solution_text, critique_text)
+
+    revised_text = branch_prefix_text + prefix_plus_new_continuation_text
     revised_prefix_ids = [int(token) for token in tokenizer.encode(revised_text, add_special_tokens=False)]
     if not revised_prefix_ids:
         return _invalid("empty_revised_prefix", solution_text, critique_text)
     if decode_exact(revised_prefix_ids, tokenizer) != revised_text:
         return _invalid("revision_not_roundtrip_exact", solution_text, critique_text)
-    if revised_prefix_ids[: len(branch_prefix_ids)] != branch_prefix_ids:
+    if revised_prefix_ids[: len(continuation_prefix_ids)] != continuation_prefix_ids:
         return _invalid("new_continuation_retokenizes_prefix", solution_text, critique_text)
-    new_continuation_ids = revised_prefix_ids[len(branch_prefix_ids) :]
+    new_continuation_ids = revised_prefix_ids[len(continuation_prefix_ids) :]
     if not new_continuation_ids or len(new_continuation_ids) > new_continuation_max_tokens:
         return _invalid("new_continuation_token_cap", solution_text, critique_text)
     return ParsedBranchRevision(
@@ -462,11 +481,14 @@ def _revision_at_branch_start(
         solution_text=solution_text,
         critique_text=critique_text,
         analysis_text=analysis_text,
-        branch_text=branch_text,
-        new_continuation_text=replacement_text,
+        prefix_text=prefix_text,
+        prefix_plus_new_continuation_text=prefix_plus_new_continuation_text,
+        new_continuation_text=new_continuation_text,
         branch_start=branch_start,
         revised_text=revised_text,
         branch_prefix_ids=tuple(branch_prefix_ids),
+        prefix_ids=tuple(prefix_ids),
+        continuation_prefix_ids=tuple(continuation_prefix_ids),
         new_continuation_ids=tuple(new_continuation_ids),
         revised_prefix_ids=tuple(revised_prefix_ids),
     )
@@ -578,74 +600,80 @@ def parse_branch_revision(
     branch_max_tokens: int,
     new_continuation_max_tokens: int,
 ) -> ParsedBranchRevision:
-    """Parse a structured edit using exact matching with a unique-prefix fallback."""
+    """Parse a prefix-anchored joint edit with the existing tolerant locator."""
 
     editable_solution_ids = strip_terminal_eos(solution_ids, tokenizer)
     canonical_critique_ids = strip_terminal_eos(critique_ids, tokenizer)
     solution_text = decode_exact(editable_solution_ids, tokenizer)
     critique_text = decode_exact(canonical_critique_ids, tokenizer)
 
-    tags = (BRANCH_OPEN, BRANCH_CLOSE, NEW_CONTINUATION_OPEN, NEW_CONTINUATION_CLOSE)
+    tags = (PREFIX_OPEN, PREFIX_CLOSE, PREFIX_PLUS_CONTINUATION_OPEN, PREFIX_PLUS_CONTINUATION_CLOSE)
     if any(critique_text.count(tag) != 1 for tag in tags):
         return _invalid("tag_count", solution_text, critique_text)
 
-    branch_open = critique_text.index(BRANCH_OPEN)
-    branch_content_start = branch_open + len(BRANCH_OPEN)
-    branch_close = critique_text.index(BRANCH_CLOSE)
-    new_open = critique_text.index(NEW_CONTINUATION_OPEN)
-    new_content_start = new_open + len(NEW_CONTINUATION_OPEN)
-    new_close = critique_text.index(NEW_CONTINUATION_CLOSE)
-    if not (branch_content_start <= branch_close < new_open and new_content_start <= new_close):
+    prefix_open = critique_text.index(PREFIX_OPEN)
+    prefix_content_start = prefix_open + len(PREFIX_OPEN)
+    prefix_close = critique_text.index(PREFIX_CLOSE)
+    joint_open = critique_text.index(PREFIX_PLUS_CONTINUATION_OPEN)
+    joint_content_start = joint_open + len(PREFIX_PLUS_CONTINUATION_OPEN)
+    joint_close = critique_text.index(PREFIX_PLUS_CONTINUATION_CLOSE)
+    if not (prefix_content_start <= prefix_close < joint_open and joint_content_start <= joint_close):
         return _invalid("tag_order", solution_text, critique_text)
-    if critique_text[branch_close + len(BRANCH_CLOSE) : new_open].strip():
+    if critique_text[prefix_close + len(PREFIX_CLOSE) : joint_open].strip():
         return _invalid("text_between_tags", solution_text, critique_text)
-    if critique_text[new_close + len(NEW_CONTINUATION_CLOSE) :].strip():
+    if critique_text[joint_close + len(PREFIX_PLUS_CONTINUATION_CLOSE) :].strip():
         return _invalid("text_after_tags", solution_text, critique_text)
 
-    analysis_text = critique_text[:branch_open]
+    analysis_text = critique_text[:prefix_open]
     if not analysis_text.strip():
         return _invalid("empty_analysis", solution_text, critique_text)
 
-    branch_text = critique_text[branch_content_start:branch_close]
-    replacement_text = critique_text[new_content_start:new_close]
-    if not branch_text or not branch_text.strip():
-        return _invalid("empty_branch", solution_text, critique_text)
-    if not replacement_text or not replacement_text.strip():
+    prefix_text = critique_text[prefix_content_start:prefix_close]
+    joint_text = critique_text[joint_content_start:joint_close]
+    if not prefix_text or not prefix_text.strip():
+        return _invalid("empty_prefix", solution_text, critique_text)
+    if not joint_text or not joint_text.strip():
+        return _invalid("empty_prefix_plus_new_continuation", solution_text, critique_text)
+    if not joint_text.startswith(prefix_text):
+        return _invalid("prefix_not_prefix_of_joint", solution_text, critique_text)
+    new_continuation_text = joint_text[len(prefix_text) :]
+    if not new_continuation_text or not new_continuation_text.strip():
         return _invalid("empty_new_continuation", solution_text, critique_text)
-    if _FINAL_ANSWER_PATTERN.search(replacement_text):
+    if _FINAL_ANSWER_PATTERN.search(new_continuation_text):
         return _invalid("new_continuation_final_answer", solution_text, critique_text)
 
-    branch_ids = tokenizer.encode(branch_text, add_special_tokens=False)
-    if not branch_ids or len(branch_ids) > branch_max_tokens:
-        return _invalid("branch_token_cap", solution_text, critique_text)
-    branch_start = solution_text.find(branch_text)
+    prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
+    if not prefix_ids or len(prefix_ids) > branch_max_tokens:
+        return _invalid("prefix_token_cap", solution_text, critique_text)
+    branch_start = solution_text.find(prefix_text)
     if branch_start >= 0:
-        if solution_text.find(branch_text, branch_start + 1) >= 0:
-            return _invalid("branch_not_unique", solution_text, critique_text)
+        if solution_text.find(prefix_text, branch_start + 1) >= 0:
+            return _invalid("prefix_not_unique", solution_text, critique_text)
         return _revision_at_branch_start(
             editable_solution_ids=editable_solution_ids,
             solution_text=solution_text,
             critique_text=critique_text,
             analysis_text=analysis_text,
-            branch_text=branch_text,
-            replacement_text=replacement_text,
+            prefix_text=prefix_text,
+            prefix_plus_new_continuation_text=joint_text,
+            new_continuation_text=new_continuation_text,
             branch_start=branch_start,
             tokenizer=tokenizer,
             new_continuation_max_tokens=new_continuation_max_tokens,
         )
 
-    normalized_location = _normalized_unique_prefix_location(branch_text, solution_text)
+    normalized_location = _normalized_unique_prefix_location(prefix_text, solution_text)
     if normalized_location is None:
-        return _invalid("branch_not_found", solution_text, critique_text)
+        return _invalid("prefix_not_found", solution_text, critique_text)
     semantic_start, formatting_gap_start = normalized_location
     if semantic_start < 0:
-        return _invalid("branch_not_unique", solution_text, critique_text)
+        return _invalid("prefix_not_unique", solution_text, critique_text)
 
     semantic_open_reason = branch_prefix_open_block_reason(solution_text[:semantic_start])
     latest_boundary = semantic_start
     if semantic_open_reason is not None:
         explicit_opener = _matching_explicit_block_opener(
-            branch_text,
+            prefix_text,
             solution_text,
             formatting_gap_start=formatting_gap_start,
             semantic_start=semantic_start,
@@ -664,8 +692,9 @@ def parse_branch_revision(
             solution_text=solution_text,
             critique_text=critique_text,
             analysis_text=analysis_text,
-            branch_text=branch_text,
-            replacement_text=replacement_text,
+            prefix_text=prefix_text,
+            prefix_plus_new_continuation_text=joint_text,
+            new_continuation_text=new_continuation_text,
             branch_start=candidate_start,
             tokenizer=tokenizer,
             new_continuation_max_tokens=new_continuation_max_tokens,
@@ -678,6 +707,8 @@ def parse_branch_revision(
 
     failure_priority = (
         "new_continuation_retokenizes_prefix",
+        "prefix_retokenizes_branch_prefix",
+        "continuation_prefix_not_roundtrip_exact",
         "revision_not_roundtrip_exact",
         "branch_not_at_token_boundary",
         "branch_prefix_not_roundtrip_exact",

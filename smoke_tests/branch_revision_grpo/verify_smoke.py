@@ -27,8 +27,8 @@ from typing import Any
 
 import numpy as np
 
-_AUDIT_SCHEMA_VERSION = 3
-_SUPPORTED_AUDIT_SCHEMA_VERSIONS = {2, _AUDIT_SCHEMA_VERSION}
+_AUDIT_SCHEMA_VERSION = 4
+_SUPPORTED_AUDIT_SCHEMA_VERSIONS = {2, 3, _AUDIT_SCHEMA_VERSION}
 
 
 def _read_json(path: Path) -> Any:
@@ -329,8 +329,6 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             raise ValueError(f"compression critique {key!r} objective credit differs from its length credit")
         if critique["parse_reason"] == "valid":
             structurally_valid_keys.add(key)
-            if not str(critique["branch"]).strip() or not str(critique["new_continuation"]).strip():
-                raise ValueError(f"valid critique {key!r} omitted an edit boundary")
             if accepted:
                 accepted_keys.add(key)
             branch_prefix_ids = [int(token) for token in critique.get("branch_prefix_ids", ())]
@@ -339,24 +337,59 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             revised_prefix_ids = [int(token) for token in critique.get("revised_prefix_ids", ())]
             generated_ids = [int(token) for token in critique.get("generated_continuation_ids", ())]
             generated_log_probs = _float32_values(critique.get("generated_continuation_log_probs", ()))
-            if (
-                not branch_prefix_ids
-                or not replacement_ids
-                or revised_prefix_ids
-                != [
-                    *branch_prefix_ids,
-                    *replacement_ids,
+            if audit_schema_version >= 4:
+                prefix = str(critique.get("prefix", ""))
+                joint = str(critique.get("prefix_plus_new_continuation", ""))
+                new_continuation = str(critique.get("new_continuation", ""))
+                prefix_ids = [int(token) for token in critique.get("prefix_ids", ())]
+                continuation_prefix_ids = [
+                    int(token) for token in critique.get("continuation_prefix_ids", ())
                 ]
-            ):
-                raise ValueError(f"valid critique {key!r} has inconsistent replacement boundaries")
+                if (
+                    not prefix.strip()
+                    or not new_continuation.strip()
+                    or joint != prefix + new_continuation
+                    or not prefix_ids
+                    or continuation_prefix_ids != [*branch_prefix_ids, *prefix_ids]
+                    or revised_prefix_ids != [*continuation_prefix_ids, *replacement_ids]
+                ):
+                    raise ValueError(f"valid critique {key!r} has inconsistent prefix/joint boundaries")
+            else:
+                if not str(critique.get("branch", "")).strip() or not str(
+                    critique.get("new_continuation", "")
+                ).strip():
+                    raise ValueError(f"valid critique {key!r} omitted an edit boundary")
+                if (
+                    not branch_prefix_ids
+                    or not replacement_ids
+                    or revised_prefix_ids != [*branch_prefix_ids, *replacement_ids]
+                ):
+                    raise ValueError(f"valid critique {key!r} has inconsistent replacement boundaries")
             if len(replacement_ids) != len(replacement_log_probs):
                 raise ValueError(f"valid critique {key!r} replacement token/log-probability lengths differ")
             if not generated_ids or len(generated_ids) != len(generated_log_probs):
                 raise ValueError(f"valid critique {key!r} generated continuation evidence is incomplete")
             if bool(critique.get("continuation_reward_evaluated")) != accepted:
                 raise ValueError(f"critique {key!r} reward-evaluation flag differs from learnability acceptance")
-        elif accepted or learnability_weight != 0.0:
-            raise ValueError(f"structurally invalid critique {key!r} received learnability credit")
+        else:
+            invalid_boundary_fields = (
+                "branch_prefix_ids",
+                "new_continuation_ids",
+                "new_continuation_log_probs",
+                "revised_prefix_ids",
+                "generated_continuation_ids",
+                "generated_continuation_log_probs",
+            )
+            if audit_schema_version >= 4:
+                invalid_boundary_fields = (
+                    *invalid_boundary_fields,
+                    "prefix_ids",
+                    "continuation_prefix_ids",
+                )
+            if any(critique.get(field) for field in invalid_boundary_fields):
+                raise ValueError(f"structurally invalid critique {key!r} retained edit token boundaries")
+            if accepted or learnability_weight != 0.0:
+                raise ValueError(f"structurally invalid critique {key!r} received learnability credit")
     for rollout_id, indices in per_rollout.items():
         count = num_critiques if rollout_objectives[rollout_id] == "recovery" else num_positive_critiques
         expected_indices = set(range(count))
@@ -460,12 +493,16 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         scoring_prompt_ids = [int(token) for token in event.get("scoring_prompt_ids", ())]
         prompt_logprob_start = int(event.get("prompt_logprob_start", -1))
         original = original_by_rollout[key[0]]
+        if audit_schema_version >= 4:
+            scoring_prefix_ids = [int(token) for token in critique["continuation_prefix_ids"]]
+        else:
+            scoring_prefix_ids = [int(token) for token in critique["branch_prefix_ids"]]
         expected_prompt = [
             *[int(token) for token in original["prompt_ids"]],
-            *[int(token) for token in critique["branch_prefix_ids"]],
+            *scoring_prefix_ids,
             *[int(token) for token in critique["new_continuation_ids"]],
         ]
-        expected_start = len(original["prompt_ids"]) + len(critique["branch_prefix_ids"])
+        expected_start = len(original["prompt_ids"]) + len(scoring_prefix_ids)
         if (
             scoring_prompt_ids != expected_prompt
             or prompt_logprob_start != expected_start
@@ -803,7 +840,7 @@ def main() -> None:
     parser.add_argument(
         "--integrity-only",
         action="store_true",
-        help="verify complete schema-v2/v3 evidence without requiring nonzero revision learning signal",
+        help="verify complete schema-v2/v3/v4 evidence without requiring nonzero revision learning signal",
     )
     args = parser.parse_args()
     result = verify(args.root, require_algorithm_signal=not args.integrity_only)

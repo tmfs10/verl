@@ -122,8 +122,12 @@ def test_agent_loop_package_registers_branch_revision_in_a_fresh_worker_process(
 VALID_ANALYSIS = "The setup narrowed the choices. A local alternative is justified here.\n"
 
 
-def _structured(branch: str, replacement: str, prefix: str = VALID_ANALYSIS) -> str:
-    return f"{prefix}<branch>{branch}</branch>\n<new continuation>{replacement}</new continuation>"
+def _structured(locator_prefix: str, new_continuation: str, analysis: str = VALID_ANALYSIS) -> str:
+    joint = f"{locator_prefix}{new_continuation}"
+    return (
+        f"{analysis}<prefix>{locator_prefix}</prefix>\n"
+        f"<prefix + new continuation>{joint}</prefix + new continuation>"
+    )
 
 
 def test_objective_prompts_share_the_causal_and_exact_edit_contract() -> None:
@@ -131,14 +135,16 @@ def test_objective_prompts_share_the_causal_and_exact_edit_contract() -> None:
     assert "attempted solution above is incorrect" in BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT
     assert "solution above is correct" in BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT
     for prompt in (BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT, BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT):
-        assert "point immediately before <branch> as the information boundary" in prompt
-        assert "between an opening $$ and its matching closing $$" in prompt
+        assert "point immediately after <prefix> as the information boundary" in prompt
+        assert "opening $$ and its matching closing $$" in prompt
         assert "inside a fenced code block" in prompt
-        assert "trajectory counterfactually with everything after the branch" in prompt
-        assert "hidden. If work performed after the branch" in prompt
+        assert "trajectory counterfactually with everything after the prefix" in prompt
+        assert "hidden. If work performed after the prefix" in prompt
+        assert "genuine character prefix" in prompt
+        assert "<prefix + new continuation>" in prompt
         assert "Do not compress a sequence of later developments" in prompt
         assert "After the free-form analysis" in prompt
-        assert "write nothing" in prompt
+        assert "nothing after the closing" in prompt
         assert "1. PRUNING:" not in prompt
 
 
@@ -185,7 +191,7 @@ def test_followup_boundary_uses_the_actual_conversation_context() -> None:
     assert default_suffix != contextual_suffix
 
 
-def test_exact_parser_preserves_whitespace_unicode_and_truncates_at_unique_branch() -> None:
+def test_exact_parser_preserves_whitespace_unicode_and_substitutes_joint_text() -> None:
     solution = "use α\n  dead end\nthen waste"
     critique = _structured("  dead end\n", "  try β instead\n")
     parsed = parse_branch_revision(
@@ -196,12 +202,29 @@ def test_exact_parser_preserves_whitespace_unicode_and_truncates_at_unique_branc
         new_continuation_max_tokens=256,
     )
     assert parsed.valid
-    assert parsed.branch_text == "  dead end\n"
+    assert parsed.prefix_text == "  dead end\n"
+    assert parsed.prefix_plus_new_continuation_text == "  dead end\n  try β instead\n"
     assert parsed.new_continuation_text == "  try β instead\n"
-    assert parsed.revised_text == "use α\n  try β instead\n"
+    assert parsed.revised_text == "use α\n  dead end\n  try β instead\n"
     assert decode_exact(parsed.branch_prefix_ids, TOKENIZER) == "use α\n"
+    assert decode_exact(parsed.prefix_ids, TOKENIZER) == "  dead end\n"
+    assert decode_exact(parsed.continuation_prefix_ids, TOKENIZER) == "use α\n  dead end\n"
     assert decode_exact(parsed.new_continuation_ids, TOKENIZER) == "  try β instead\n"
     assert decode_exact(parsed.revised_prefix_ids, TOKENIZER) == parsed.revised_text
+
+
+def test_parser_allows_the_generated_prefix_to_start_at_the_solution_boundary() -> None:
+    parsed = parse_branch_revision(
+        _ids("start here then waste"),
+        _ids(_structured("start here", " and take a better local step")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.valid
+    assert parsed.branch_prefix_ids == ()
+    assert decode_exact(parsed.continuation_prefix_ids, TOKENIZER) == "start here"
+    assert parsed.revised_text == "start here and take a better local step"
 
 
 def test_terminal_eos_stripping_preserves_interior_special_token() -> None:
@@ -214,18 +237,29 @@ def test_terminal_eos_stripping_preserves_interior_special_token() -> None:
 @pytest.mark.parametrize(
     ("critique", "reason"),
     [
-        ("<branch>x</branch>", "tag_count"),
-        ("<branch>x</branch>\n<new continuation>new</new continuation>", "empty_analysis"),
-        (_structured("", "new"), "empty_branch"),
+        ("<prefix>x</prefix>", "tag_count"),
+        (
+            "<prefix>x</prefix>\n<prefix + new continuation>xnew</prefix + new continuation>",
+            "empty_analysis",
+        ),
+        (_structured("", "new"), "empty_prefix"),
+        (
+            VALID_ANALYSIS
+            + "<prefix>x</prefix>\n"
+            + "<prefix + new continuation>different</prefix + new continuation>",
+            "prefix_not_prefix_of_joint",
+        ),
         (_structured("x", "   "), "empty_new_continuation"),
         (_structured("x", "The final answer is 7"), "new_continuation_final_answer"),
         (_structured("x", "\\boxed{7}"), "new_continuation_final_answer"),
         (_structured("x", "#### 7"), "new_continuation_final_answer"),
-        (_structured("same", "new"), "branch_not_unique"),
-        (_structured("zzz", "new"), "branch_not_found"),
+        (_structured("same", "new"), "prefix_not_unique"),
+        (_structured("zzz", "new"), "prefix_not_found"),
         (_structured("x", "new") + " trailing", "text_after_tags"),
         (
-            VALID_ANALYSIS + "<branch>x</branch> not whitespace <new continuation>new</new continuation>",
+            VALID_ANALYSIS
+            + "<prefix>x</prefix> not whitespace "
+            + "<prefix + new continuation>xnew</prefix + new continuation>",
             "text_between_tags",
         ),
     ],
@@ -251,7 +285,28 @@ def test_parser_enforces_token_caps_without_trimming_contents() -> None:
         branch_max_tokens=3,
         new_continuation_max_tokens=256,
     )
-    assert parsed.reason == "branch_token_cap"
+    assert parsed.reason == "prefix_token_cap"
+
+    parsed = parse_branch_revision(
+        _ids("a rest"),
+        _ids(_structured("a", "long")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=3,
+    )
+    assert parsed.reason == "new_continuation_token_cap"
+
+
+def test_parser_checks_final_answer_markers_only_in_the_appended_continuation() -> None:
+    parsed = parse_branch_revision(
+        _ids("The phrase final answer appears in this source span. Then waste."),
+        _ids(_structured("The phrase final answer appears in this source span.", " Try a local check.")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.valid
+    assert parsed.new_continuation_text == " Try a local check."
 
 
 def test_parser_treats_overlapping_branch_occurrences_as_nonunique() -> None:
@@ -262,7 +317,7 @@ def test_parser_treats_overlapping_branch_occurrences_as_nonunique() -> None:
         branch_max_tokens=128,
         new_continuation_max_tokens=256,
     )
-    assert parsed.reason == "branch_not_unique"
+    assert parsed.reason == "prefix_not_unique"
 
 
 def test_parser_recovers_a_unique_case_and_formatting_insensitive_branch() -> None:
@@ -276,7 +331,7 @@ def test_parser_recovers_a_unique_case_and_formatting_insensitive_branch() -> No
     )
     assert parsed.valid
     assert parsed.branch_start == len("prefix\n")
-    assert parsed.revised_text == "prefix\nCheck the next locally justified factor."
+    assert parsed.revised_text == "prefix\nSo, n * k = 9 143Check the next locally justified factor."
 
 
 def test_parser_accepts_a_unique_partial_prefix_without_a_length_threshold() -> None:
@@ -290,7 +345,7 @@ def test_parser_accepts_a_unique_partial_prefix_without_a_length_threshold() -> 
     )
     assert parsed.valid
     assert parsed.branch_start == 3
-    assert parsed.revised_text == "abcx"
+    assert parsed.revised_text == "abcQ completely different hindsightx"
 
 
 def test_parser_rejects_a_tied_normalized_maximum() -> None:
@@ -301,7 +356,7 @@ def test_parser_rejects_a_tied_normalized_maximum() -> None:
         branch_max_tokens=128,
         new_continuation_max_tokens=256,
     )
-    assert parsed.reason == "branch_not_unique"
+    assert parsed.reason == "prefix_not_unique"
 
 
 def test_parser_rejects_a_branch_with_no_normalized_overlap() -> None:
@@ -312,7 +367,7 @@ def test_parser_rejects_a_branch_with_no_normalized_overlap() -> None:
         branch_max_tokens=128,
         new_continuation_max_tokens=256,
     )
-    assert parsed.reason == "branch_not_found"
+    assert parsed.reason == "prefix_not_found"
 
 
 def test_normalized_match_searches_only_the_adjacent_formatting_gap_for_a_stable_boundary() -> None:
@@ -355,7 +410,7 @@ def test_normalized_match_searches_only_the_adjacent_formatting_gap_for_a_stable
     )
     assert parsed.valid
     assert parsed.branch_start == 2
-    assert parsed.revised_text == "a,x"
+    assert parsed.revised_text == "a,B changedx"
 
 
 def test_parser_rejects_a_branch_inside_an_existing_token_boundary() -> None:
@@ -409,8 +464,8 @@ def test_parser_rejects_a_replacement_that_retokenizes_the_preserved_prefix() ->
 
     tokenizer = MergeTokenizer()
     parsed = parse_branch_revision(
-        tokenizer.encode("ab"),
-        tokenizer.encode(_structured("b", "x")),
+        tokenizer.encode("ba"),
+        tokenizer.encode(_structured("a", "x")),
         tokenizer,
         branch_max_tokens=128,
         new_continuation_max_tokens=256,
@@ -447,6 +502,46 @@ def test_parser_rejects_branch_points_inside_open_blocks(solution: str, branch: 
     )
     assert not parsed.valid
     assert parsed.reason == reason
+
+
+@pytest.mark.parametrize(
+    ("solution", "prefix", "reason"),
+    [
+        ("before\n$$\nx + 1\n$$\nafter", "before\n$$\nx + 1", "branch_inside_display_math"),
+        ("before\n```python\nx + 1\n```\nafter", "before\n```python\nx + 1", "branch_inside_code_fence"),
+        (
+            "before\n\\begin{align}\nx + 1\n\\end{align}\nafter",
+            "before\n\\begin{align}\nx + 1",
+            "branch_inside_latex_environment",
+        ),
+    ],
+)
+def test_parser_rejects_prefixes_that_end_inside_open_blocks(
+    solution: str,
+    prefix: str,
+    reason: str,
+) -> None:
+    parsed = parse_branch_revision(
+        _ids(solution),
+        _ids(_structured(prefix, "\nTake the next local step.")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.reason == reason
+
+
+def test_parser_accepts_a_prefix_containing_a_complete_display_block() -> None:
+    prefix = "before\n$$\nx + 1\n$$"
+    parsed = parse_branch_revision(
+        _ids(f"{prefix}\nafter"),
+        _ids(_structured(prefix, "\nTake the next local step.")),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.valid
+    assert parsed.revised_text == f"{prefix}\nTake the next local step."
 
 
 @pytest.mark.parametrize(
@@ -919,7 +1014,7 @@ def test_agent_loop_generates_all_critiques_then_one_continuation_per_valid_edit
             text = "invalid structure"
             return TokenOutput(token_ids=_ids(text), log_probs=[-0.3] * len(_ids(text)))
         assert kind == "continuation[0]"
-        assert decode_exact(prompt[-len(_ids("start better")) :], TOKENIZER) == "start better"
+        assert decode_exact(prompt[-len(_ids("start deadbetter")) :], TOKENIZER) == "start deadbetter"
         seed_ids = _ids("better")
         assert prompt_logprob_start == len(prompt) - len(seed_ids)
         return TokenOutput(
@@ -1241,12 +1336,15 @@ def _critique(text: str, *, valid: bool, continuation: str = "") -> BranchRevisi
             log_probs=tuple([-0.2] * len(critique_ids)),
             finish_reason="stop",
             parse_reason="valid",
-            branch_text="dead",
+            prefix_text="dead",
+            prefix_plus_new_continuation_text="deadbetter",
             new_continuation_text="better",
             branch_prefix_ids=tuple(_ids("start ")),
+            prefix_ids=tuple(_ids("dead")),
+            continuation_prefix_ids=tuple(_ids("start dead")),
             new_continuation_ids=tuple(_ids("better")),
             new_continuation_log_probs=tuple([-0.05] * len(_ids("better"))),
-            revised_prefix_ids=tuple(_ids("start better")),
+            revised_prefix_ids=tuple(_ids("start deadbetter")),
             continuation_ids=tuple(_ids(continuation)),
             continuation_log_probs=tuple([-0.3] * len(_ids(continuation))),
             continuation_finish_reason="stop",
@@ -1257,9 +1355,12 @@ def _critique(text: str, *, valid: bool, continuation: str = "") -> BranchRevisi
         log_probs=tuple([-0.2] * len(critique_ids)),
         finish_reason="stop",
         parse_reason="tag_count",
-        branch_text="",
+        prefix_text="",
+        prefix_plus_new_continuation_text="",
         new_continuation_text="",
         branch_prefix_ids=(),
+        prefix_ids=(),
+        continuation_prefix_ids=(),
         new_continuation_ids=(),
         new_continuation_log_probs=(),
         revised_prefix_ids=(),
@@ -1486,7 +1587,7 @@ def test_positive_continuation_credit_uses_completed_editable_length(monkeypatch
     monkeypatch.setattr(branch_controller_module, "compute_reward", fake_compute_reward)
     controller._evaluate_continuations(source, [bundle])
     original_length = len(_ids("start dead and a very long waste"))
-    revised_length = len(_ids("start better solved"))
+    revised_length = len(_ids("start deadbetter solved"))
     expected_fraction = (original_length - revised_length) / original_length
     assert bundle.compression_fractions[0] == pytest.approx(expected_fraction)
     assert bundle.compression_credits[0] == pytest.approx(min(expected_fraction / 0.5, 1.0))

@@ -56,7 +56,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import marked_timer
 
-_AUDIT_SCHEMA_VERSION = 3
+_AUDIT_SCHEMA_VERSION = 4
 
 
 def _add_exception_note(error: BaseException, note: str) -> None:
@@ -522,9 +522,12 @@ class BranchRevisionGRPOController:
             log_probs=tuple(float(item) for item in value["log_probs"]),
             finish_reason=value.get("finish_reason"),
             parse_reason=str(value["parse_reason"]),
-            branch_text=str(value.get("branch_text", "")),
+            prefix_text=str(value.get("prefix_text", "")),
+            prefix_plus_new_continuation_text=str(value.get("prefix_plus_new_continuation_text", "")),
             new_continuation_text=str(value.get("new_continuation_text", "")),
             branch_prefix_ids=tuple(int(token) for token in value.get("branch_prefix_ids", ())),
+            prefix_ids=tuple(int(token) for token in value.get("prefix_ids", ())),
+            continuation_prefix_ids=tuple(int(token) for token in value.get("continuation_prefix_ids", ())),
             new_continuation_ids=tuple(int(token) for token in value.get("new_continuation_ids", ())),
             new_continuation_log_probs=tuple(_float32_list(seed_log_probs)) if seed_log_probs else (),
             revised_prefix_ids=tuple(int(token) for token in value.get("revised_prefix_ids", ())),
@@ -630,10 +633,13 @@ class BranchRevisionGRPOController:
                 if (
                     not critique.new_continuation_ids
                     or not critique.revised_prefix_ids
-                    or [*critique.branch_prefix_ids, *critique.new_continuation_ids]
+                    or not critique.prefix_ids
+                    or [*critique.branch_prefix_ids, *critique.prefix_ids]
+                    != list(critique.continuation_prefix_ids)
+                    or [*critique.continuation_prefix_ids, *critique.new_continuation_ids]
                     != list(critique.revised_prefix_ids)
                 ):
-                    raise RuntimeError("valid branch revision has inconsistent branch/replacement token boundaries")
+                    raise RuntimeError("valid branch revision has inconsistent prefix/joint token boundaries")
                 seed_length = len(critique.new_continuation_ids)
                 seed_values = _float32_list(critique.new_continuation_log_probs)
                 if len(seed_values) != seed_length:
@@ -685,10 +691,10 @@ class BranchRevisionGRPOController:
                     seed_score=score.seed_score,
                     scoring_prompt_ids=[
                         *bundle.prompt_ids,
-                        *critique.branch_prefix_ids,
+                        *critique.continuation_prefix_ids,
                         *critique.new_continuation_ids,
                     ],
-                    prompt_logprob_start=len(bundle.prompt_ids) + len(critique.branch_prefix_ids),
+                    prompt_logprob_start=len(bundle.prompt_ids) + len(critique.continuation_prefix_ids),
                     scored_token_ids=list(critique.new_continuation_ids),
                     scored_token_log_probs=seed_values,
                     percentile=score.percentile,
@@ -775,6 +781,8 @@ class BranchRevisionGRPOController:
                         mapping.append((bundle_index, critique_index))
                 elif (
                     critique.branch_prefix_ids
+                    or critique.prefix_ids
+                    or critique.continuation_prefix_ids
                     or critique.new_continuation_ids
                     or critique.revised_prefix_ids
                     or critique.continuation_ids
@@ -912,9 +920,12 @@ class BranchRevisionGRPOController:
                     continuation_reward_evaluated=critique_index in bundle.continuation_rewards,
                     continuation_wasted_by_learnability=bool(critique.valid and not accepted),
                     parse_reason=critique.parse_reason,
-                    branch=critique.branch_text,
+                    prefix=critique.prefix_text,
+                    prefix_plus_new_continuation=critique.prefix_plus_new_continuation_text,
                     new_continuation=critique.new_continuation_text,
                     branch_prefix_ids=list(critique.branch_prefix_ids),
+                    prefix_ids=list(critique.prefix_ids),
+                    continuation_prefix_ids=list(critique.continuation_prefix_ids),
                     new_continuation_ids=list(critique.new_continuation_ids),
                     new_continuation_log_probs=_float32_list(critique.new_continuation_log_probs)
                     if critique.new_continuation_log_probs

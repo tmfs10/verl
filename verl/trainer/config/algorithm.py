@@ -47,46 +47,62 @@ possibilities or pruned the search space and which parts/steps did not. Explain 
 changed direction and what direction would have been more productive. Then
 select an appropriate point at which to revise the trajectory.
 
-Treat the point immediately before <branch> as the information boundary for
-the replacement. Choose <branch> so that this boundary falls between coherent
-steps, not in the middle of a thought or action. Do not place the branch point
-inside an open mathematical or delimited block. In particular, do not place it
-between an opening $$ and its matching closing $$, between \\[ and \\], inside a
+Select a short coherent span of the attempted solution that immediately
+precedes the new continuation you want to propose. Put this span inside
+<prefix>. The text inside <prefix> will be used to locate the revision in the
+attempted solution. At the matching location, the original trajectory from the
+start of that prefix onward will be replaced by the text inside
+<prefix + new continuation>.
+
+Choose <prefix> so that both the point immediately before it and the point
+immediately after it fall between coherent steps, not in the middle of a
+thought or action. Neither boundary may be inside an open mathematical or
+delimited block. In particular, do not place either boundary between an
+opening $$ and its matching closing $$, between \\[ and \\], inside a
 \\begin{...}...\\end{...} environment, or inside a fenced code block. If the
-material to revise lies inside such a block, choose a coherent boundary before
-its opening delimiter or after its closing delimiter.
+prefix includes such a block, include the complete block with both its opening
+and closing delimiters.
 
-The replacement may use an idea that also appears later in the trajectory only
-when the task and the trajectory before the branch already provide a reasonable
-basis for proposing that idea as the next direction.
+Treat the point immediately after <prefix> as the information boundary for the
+new continuation.
 
-Consider the trajectory counterfactually with everything after the branch
-hidden. If work performed after the branch materially changed what was known,
+The new continuation may use an idea that also appears later in the trajectory
+only when the task and the trajectory through the end of the prefix already
+provide a reasonable basis for proposing that idea as the next direction.
+
+Consider the trajectory counterfactually with everything after the prefix
+hidden. If work performed after the prefix materially changed what was known,
 narrowed the available possibilities, or made the idea substantially more
-plausible, do not place that idea directly in the replacement. Instead, propose
-the next local step needed to make that progress. We do not want to
+plausible, do not place that idea directly in the new continuation. Instead,
+propose the next local step needed to make that progress. We do not want to
 short-circuit useful exploration with hindsight.
 
 Do not compress a sequence of later developments into one hindsight statement.
-The replacement should express one locally justified next move or direction
-and leave subsequent work for the continuation rollout to perform. In your
-analysis, explain why the information available before the branch supports the
-proposed replacement.
+The new continuation should express one locally justified next move or
+direction and leave subsequent work for the continuation rollout to perform.
+In your analysis, explain why the information available through the end of the
+prefix supports the proposed continuation.
 
-Copy the text inside <branch> character-for-character from one complete line or
+Copy the text inside <prefix> character-for-character from one complete line or
 short coherent span of the attempted solution. Include enough distinctive
-adjacent text that the span occurs exactly once. Do not correct, normalize,
-paraphrase, or reformat anything inside <branch>. Put the proposed replacement
-only inside <new continuation>.
+adjacent text that the intended location is unique. Do not intentionally
+correct, normalize, paraphrase, or reformat anything inside <prefix>.
 
-The text inside <new continuation> must be nonempty and concise. It must not
-state the final result in any form, declare that the task has been completed,
-or contain a boxed answer, answer delimiter, or final-answer phrase.
+Inside <prefix + new continuation>, first copy the entire text from <prefix>
+character-for-character. It must be a genuine character prefix of
+<prefix + new continuation>. Immediately after that copied prefix, append the
+proposed new continuation, including whatever spacing or transition is needed
+for it to flow naturally from the prefix. The appended text must be nonempty
+and concise.
 
-After the free-form analysis, end with exactly one <branch> tag pair followed
-by exactly one <new continuation> tag pair. Do not use either tag anywhere
-else. Permit only whitespace between the two tag pairs, and write nothing
-after the closing </new continuation> tag."""
+The appended new continuation must not state the final result in any form,
+declare that the task has been completed, or contain a boxed answer, answer
+delimiter, or final-answer phrase.
+
+After the free-form analysis, end with exactly one <prefix> tag pair followed
+by exactly one <prefix + new continuation> tag pair. Do not use either tag
+anywhere else. Permit only whitespace between the two tag pairs, and write
+nothing after the closing </prefix + new continuation> tag."""
 
 
 BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT = """\
@@ -99,46 +115,61 @@ possibilities or pruned the search space and which parts/steps did not. Explain 
 changed direction and what direction would have been more productive. Then
 select an appropriate point at which to revise the trajectory.
 
-Treat the point immediately before <branch> as the information boundary for
-the replacement. Choose <branch> so that this boundary falls between coherent
-steps, not in the middle of a thought or action. Do not place the branch point
-inside an open mathematical or delimited block. In particular, do not place it
-between an opening $$ and its matching closing $$, between \\[ and \\], inside a
+Select a short coherent span of the solution that immediately precedes the new
+continuation you want to propose. Put this span inside <prefix>. The text inside
+<prefix> will be used to locate the revision in the solution. At the matching
+location, the original trajectory from the start of that prefix onward will be
+replaced by the text inside <prefix + new continuation>.
+
+Choose <prefix> so that both the point immediately before it and the point
+immediately after it fall between coherent steps, not in the middle of a
+thought or action. Neither boundary may be inside an open mathematical or
+delimited block. In particular, do not place either boundary between an
+opening $$ and its matching closing $$, between \\[ and \\], inside a
 \\begin{...}...\\end{...} environment, or inside a fenced code block. If the
-material to revise lies inside such a block, choose a coherent boundary before
-its opening delimiter or after its closing delimiter.
+prefix includes such a block, include the complete block with both its opening
+and closing delimiters.
 
-The replacement may use an idea that also appears later in the trajectory only
-when the task and the trajectory before the branch already provide a reasonable
-basis for proposing that idea as the next direction.
+Treat the point immediately after <prefix> as the information boundary for the
+new continuation.
 
-Consider the trajectory counterfactually with everything after the branch
-hidden. If work performed after the branch materially changed what was known,
+The new continuation may use an idea that also appears later in the trajectory
+only when the task and the trajectory through the end of the prefix already
+provide a reasonable basis for proposing that idea as the next direction.
+
+Consider the trajectory counterfactually with everything after the prefix
+hidden. If work performed after the prefix materially changed what was known,
 narrowed the available possibilities, or made the idea substantially more
-plausible, do not place that idea directly in the replacement. Instead, propose
-the next local step needed to make that progress. We do not want to
+plausible, do not place that idea directly in the new continuation. Instead,
+propose the next local step needed to make that progress. We do not want to
 short-circuit useful exploration with hindsight.
 
 Do not compress a sequence of later developments into one hindsight statement.
-The replacement should express one locally justified next move or direction
-and leave subsequent work for the continuation rollout to perform. In your
-analysis, explain why the information available before the branch supports the
-proposed replacement.
+The new continuation should express one locally justified next move or
+direction and leave subsequent work for the continuation rollout to perform.
+In your analysis, explain why the information available through the end of the
+prefix supports the proposed continuation.
 
-Copy the text inside <branch> character-for-character from one complete line or
+Copy the text inside <prefix> character-for-character from one complete line or
 short coherent span of the solution. Include enough distinctive adjacent text
-that the span occurs exactly once. Do not correct, normalize, paraphrase, or
-reformat anything inside <branch>. Put the proposed replacement only inside
-<new continuation>.
+that the intended location is unique. Do not intentionally correct, normalize,
+paraphrase, or reformat anything inside <prefix>.
 
-The text inside <new continuation> must be nonempty and concise. It must not
-state the final result in any form, declare that the task has been completed,
-or contain a boxed answer, answer delimiter, or final-answer phrase.
+Inside <prefix + new continuation>, first copy the entire text from <prefix>
+character-for-character. It must be a genuine character prefix of
+<prefix + new continuation>. Immediately after that copied prefix, append the
+proposed new continuation, including whatever spacing or transition is needed
+for it to flow naturally from the prefix. The appended text must be nonempty
+and concise.
 
-After the free-form analysis, end with exactly one <branch> tag pair followed
-by exactly one <new continuation> tag pair. Do not use either tag anywhere
-else. Permit only whitespace between the two tag pairs, and write nothing
-after the closing </new continuation> tag."""
+The appended new continuation must not state the final result in any form,
+declare that the task has been completed, or contain a boxed answer, answer
+delimiter, or final-answer phrase.
+
+After the free-form analysis, end with exactly one <prefix> tag pair followed
+by exactly one <prefix + new continuation> tag pair. Do not use either tag
+anywhere else. Permit only whitespace between the two tag pairs, and write
+nothing after the closing </prefix + new continuation> tag."""
 
 
 # Backwards-compatible name for the incorrect-rollout instruction.

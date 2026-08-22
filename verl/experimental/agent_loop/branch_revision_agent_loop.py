@@ -43,9 +43,12 @@ class BranchRevisionCritiqueGeneration:
     log_probs: tuple[float, ...]
     finish_reason: str | None
     parse_reason: str
-    branch_text: str
+    prefix_text: str
+    prefix_plus_new_continuation_text: str
     new_continuation_text: str
     branch_prefix_ids: tuple[int, ...]
+    prefix_ids: tuple[int, ...]
+    continuation_prefix_ids: tuple[int, ...]
     new_continuation_ids: tuple[int, ...]
     new_continuation_log_probs: tuple[float, ...]
     revised_prefix_ids: tuple[int, ...]
@@ -292,6 +295,8 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 )
                 parse_reason = parsed.reason
                 branch_prefix_ids = list(parsed.branch_prefix_ids)
+                prefix_ids = list(parsed.prefix_ids)
+                continuation_prefix_ids = list(parsed.continuation_prefix_ids)
                 new_continuation_ids = list(parsed.new_continuation_ids)
                 revised_prefix_ids = list(parsed.revised_prefix_ids)
                 continuation_max_tokens = 0
@@ -303,6 +308,8 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                     if continuation_max_tokens < self.feature.min_continuation_tokens:
                         parse_reason = "insufficient_continuation_budget"
                         branch_prefix_ids = []
+                        prefix_ids = []
+                        continuation_prefix_ids = []
                         new_continuation_ids = []
                         revised_prefix_ids = []
                         continuation_max_tokens = 0
@@ -311,9 +318,12 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                     "log_probs": critique_log_probs,
                     "finish_reason": self._finish_reason(raw_output),
                     "parse_reason": parse_reason,
-                    "branch_text": parsed.branch_text,
+                    "prefix_text": parsed.prefix_text,
+                    "prefix_plus_new_continuation_text": parsed.prefix_plus_new_continuation_text,
                     "new_continuation_text": parsed.new_continuation_text,
                     "branch_prefix_ids": branch_prefix_ids,
+                    "prefix_ids": prefix_ids,
+                    "continuation_prefix_ids": continuation_prefix_ids,
                     "new_continuation_ids": new_continuation_ids,
                     "revised_prefix_ids": revised_prefix_ids,
                     "continuation_max_tokens": continuation_max_tokens,
@@ -341,7 +351,8 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                     sampling_params,
                     max_tokens=max_tokens,
                     kind=f"continuation[{index}]",
-                    prompt_logprob_start=len(prompt_ids) + len(complete_records[index]["branch_prefix_ids"]),
+                    prompt_logprob_start=len(prompt_ids)
+                    + len(complete_records[index]["continuation_prefix_ids"]),
                 )
             )
             for index, max_tokens in continuation_specs
@@ -365,7 +376,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
             expected_seed_ids = [int(token) for token in complete_records[index]["new_continuation_ids"]]
             prompt_seed_ids = raw_output.prompt_log_prob_token_ids
             prompt_seed_log_probs = raw_output.prompt_log_probs
-            expected_start = len(prompt_ids) + len(complete_records[index]["branch_prefix_ids"])
+            expected_start = len(prompt_ids) + len(complete_records[index]["continuation_prefix_ids"])
             if raw_output.prompt_log_prob_start != expected_start:
                 raise RuntimeError(
                     f"continuation[{index}] prompt log-probability slice starts at "
@@ -399,9 +410,12 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 log_probs=tuple(record["log_probs"]),
                 finish_reason=record["finish_reason"],
                 parse_reason=record["parse_reason"],
-                branch_text=record["branch_text"],
+                prefix_text=record["prefix_text"],
+                prefix_plus_new_continuation_text=record["prefix_plus_new_continuation_text"],
                 new_continuation_text=record["new_continuation_text"],
                 branch_prefix_ids=tuple(record["branch_prefix_ids"]),
+                prefix_ids=tuple(record["prefix_ids"]),
+                continuation_prefix_ids=tuple(record["continuation_prefix_ids"]),
                 new_continuation_ids=tuple(record["new_continuation_ids"]),
                 new_continuation_log_probs=tuple(record.get("new_continuation_log_probs", ())),
                 revised_prefix_ids=tuple(record["revised_prefix_ids"]),
