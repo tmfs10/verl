@@ -240,8 +240,12 @@ def _validation_metric_section(var_name: str, core_var: str, metric_name: str, n
     """Return the validation metric section for exported metrics.
 
     Validation logging is intentionally restricted to the aggregated selection
-    metrics only. Plain mean/std summaries and aux counters are not exported.
+    metrics, except that a single validation rollout has no selection metric and
+    therefore exports its core mean. Plain mean/std summaries for multi-rollout
+    validation and aux counters are not exported.
     """
+    if n_max == 1 and var_name == core_var and metric_name == "mean@1":
+        return "val-core"
     if metric_name.startswith(("best@", "maj@", "worst@")):
         return "val-agg"
     if metric_name in {"max", "min"} and var_name.endswith("trade_pnl_percent"):

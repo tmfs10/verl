@@ -12,9 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import numpy as np
 import torch
 
-from verl.trainer.ppo.ray_trainer import _extract_response_tokens_and_logprobs, _validation_metric_section
+from verl.trainer.ppo.ray_trainer import (
+    RayPPOTrainer,
+    _extract_response_tokens_and_logprobs,
+    _validation_metric_section,
+)
 
 
 class _FakeTokenizer:
@@ -54,8 +59,24 @@ def test_extract_response_tokens_and_logprobs_handles_missing_logprobs():
 
 
 def test_validation_metric_section_only_exports_selection_metrics():
+    assert _validation_metric_section("acc", "acc", "mean@1", 1) == "val-core"
+    assert _validation_metric_section("reward", "reward", "mean@1", 1) == "val-core"
+    assert _validation_metric_section("aux", "acc", "mean@1", 1) is None
     assert _validation_metric_section("acc", "acc", "mean@8", 8) is None
     assert _validation_metric_section("acc", "acc", "std@8", 8) is None
     assert _validation_metric_section("acc", "acc", "best@8/mean", 8) == "val-agg"
     assert _validation_metric_section("acc", "acc", "maj@8/mean", 8) == "val-agg"
     assert _validation_metric_section("acc", "acc", "worst@8/mean", 8) == "val-agg"
+
+
+def test_single_sample_validation_produces_a_core_metric():
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+
+    metrics = trainer._val_metrics_update(
+        data_sources=np.array(["comp_math"]),
+        sample_uids=["prompt-0"],
+        reward_extra_infos_dict={"reward": [1.0], "acc": [1.0]},
+        sample_turns=[],
+    )
+
+    assert metrics == {"val-core/comp_math/acc/mean@1": 1.0}
