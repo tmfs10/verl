@@ -944,6 +944,13 @@ def test_runtime_config_accepts_both_native_policy_losses_and_forces_behavior_lo
     assert config.actor_rollout_ref.actor.policy_loss.loss_mode == loss_mode
 
 
+def test_runtime_config_allows_prompt_logprob_admission_to_be_disabled() -> None:
+    config = _runtime_config()
+    config.actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens = None
+    validate_branch_revision_runtime_config(config)
+    assert config.actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens is None
+
+
 @pytest.mark.parametrize("statistic", ["mean", "min"])
 def test_branch_revision_config_accepts_both_learnability_statistics(statistic) -> None:
     feature = BranchRevisionGRPOConfig(learnability_logprob_statistic=statistic)
@@ -989,6 +996,11 @@ def test_branch_revision_config_rejects_invalid_learnability_thresholds(kwargs, 
         ("actor_rollout_ref.actor.policy_loss.loss_mode", "gpg", "dppo_tv and vanilla"),
         ("actor_rollout_ref.rollout.temperature", 0.9, "temperature=1.0"),
         ("actor_rollout_ref.rollout.top_p", 0.9, "top_p=1"),
+        (
+            "actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens",
+            0,
+            "null or a positive integer",
+        ),
         ("actor_rollout_ref.actor.use_kl_loss", True, "does not support"),
         ("reward.reward_model.launch_reward_fn_async", True, "blocking iteration barrier"),
         ("algorithm.branch_revision_grpo.min_continuation_tokens", 33, "smaller than"),
@@ -1066,6 +1078,7 @@ def _loop() -> BranchRevisionAgentLoop:
     )
     loop.response_length = 256
     loop.max_model_len = 10000
+    loop.rollout_config = SimpleNamespace(prompt_logprob_max_inflight_tokens=8192)
     loop.tokenizer = TOKENIZER
     return loop
 
@@ -1287,6 +1300,52 @@ def test_agent_loop_scores_only_the_replacement_slice_then_generates_suffix_with
     assert continuation.token_ids == tuple(_ids(" solved"))
     assert continuation.log_probs == pytest.approx([-0.4] * len(_ids(" solved")))
     assert [call[0] for call in calls] == ["score[0]", "continuation[0]"]
+
+
+def test_agent_loop_scores_without_admission_evidence_when_budget_is_disabled() -> None:
+    loop = _loop()
+    loop.rollout_config.prompt_logprob_max_inflight_tokens = None
+
+    async def fake_generate(
+        _route,
+        prompt,
+        _params,
+        *,
+        max_tokens,
+        kind,
+        prompt_logprob_start=None,
+        response_logprobs=True,
+    ):
+        seed_ids = _ids("better")
+        assert kind == "score[0]"
+        assert prompt == _ids("qstart deadbetter")
+        assert max_tokens == 1
+        assert prompt_logprob_start == len(_ids("qstart dead"))
+        assert response_logprobs is False
+        return TokenOutput(
+            token_ids=_ids("x"),
+            prompt_log_prob_token_ids=seed_ids,
+            prompt_log_probs=[-0.25] * len(seed_ids),
+            prompt_log_prob_start=prompt_logprob_start,
+            extra_fields={"prompt_logprob_admission": None},
+        )
+
+    loop._generate = fake_generate
+    output = asyncio.run(
+        loop.run(
+            {},
+            branch_revision_phase="score",
+            branch_revision_rollout_id="p:0",
+            branch_revision_critique_index=0,
+            branch_revision_route_key="p:0:revision:0",
+            branch_revision_parent_prompt_ids=_ids("q"),
+            branch_revision_continuation_prefix_ids=_ids("start dead"),
+            branch_revision_new_continuation_ids=_ids("better"),
+        )
+    )
+    score = output.extra_fields[BRANCH_REVISION_SCORE_FIELD]
+    assert score.scored_token_ids == tuple(_ids("better"))
+    assert score.admission is None
 
 
 def test_agent_loop_gives_block_breaking_edits_no_continuation_path() -> None:
@@ -1693,6 +1752,34 @@ def test_controller_uses_configured_minimum_logprob_statistic() -> None:
     controller._score_seed_learnability([bundle])
     assert bundle.learnability[0].logprob_statistic == "min"
     assert bundle.learnability[0].seed_score == pytest.approx(-0.75)
+
+
+def test_controller_scores_learnability_without_admission_evidence_when_disabled() -> None:
+    controller = _controller()
+    controller.config.actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens = None
+    valid = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    valid = replace(
+        valid,
+        new_continuation_log_probs=tuple([-0.05] * len(valid.new_continuation_ids)),
+    )
+    bundle = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord(
+            "p:0",
+            "recovery",
+            (valid, _critique("invalid", valid=False)),
+            tuple(_ids("prompt")),
+        ),
+    )
+    bundle.score_admissions[0] = None
+    controller._score_seed_learnability([bundle])
+    assert 0 in bundle.learnability
 
 
 def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revision_seed() -> None:

@@ -79,7 +79,7 @@ class BranchRevisionScoreGeneration:
     prompt_logprob_start: int
     scored_token_ids: tuple[int, ...]
     scored_token_log_probs: tuple[float, ...]
-    admission: dict[str, Any]
+    admission: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -285,7 +285,11 @@ class BranchRevisionAgentLoop(AgentLoopBase):
             raise RuntimeError("branch-revision replacement token unexpectedly lacks a prompt log probability")
         normalized = normalize_log_probs_float32(value for value in output.prompt_log_probs if value is not None)
         admission = output.extra_fields.get("prompt_logprob_admission")
-        if not isinstance(admission, dict):
+        admission_capacity = self.rollout_config.prompt_logprob_max_inflight_tokens
+        if admission_capacity is None:
+            if admission is not None:
+                raise RuntimeError("unbounded branch-revision score unexpectedly returned admission evidence")
+        elif not isinstance(admission, dict):
             raise RuntimeError("branch-revision score is missing prompt-logprob admission evidence")
         record = BranchRevisionScoreGeneration(
             rollout_id=rollout_id,
@@ -293,7 +297,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
             prompt_logprob_start=prompt_logprob_start,
             scored_token_ids=tuple(new_continuation_ids),
             scored_token_log_probs=tuple(float(value) for value in normalized.tolist()),
-            admission=dict(admission),
+            admission=None if admission is None else dict(admission),
         )
         response_ids = self._score_only_response(output)
         return AgentLoopOutput(

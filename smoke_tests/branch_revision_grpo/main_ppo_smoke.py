@@ -126,12 +126,18 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "max_model_len",
         "critique_max_response_length",
         "max_tokens_per_gpu",
-        "prompt_logprob_max_inflight_tokens",
         "training_steps",
     ):
         value = smoke_contract[name]
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"branch-revision smoke {name} must be a positive integer")
+    prompt_logprob_capacity = smoke_contract["prompt_logprob_max_inflight_tokens"]
+    if prompt_logprob_capacity is not None and (
+        isinstance(prompt_logprob_capacity, bool)
+        or not isinstance(prompt_logprob_capacity, int)
+        or prompt_logprob_capacity <= 0
+    ):
+        raise ValueError("branch-revision smoke prompt_logprob_max_inflight_tokens must be null or a positive integer")
     if not isinstance(smoke_contract["model_path"], str) or not smoke_contract["model_path"].startswith("/"):
         raise ValueError("branch-revision smoke model_path must be an absolute string path")
     if smoke_contract["loss_mode"] not in {"dppo_tv", "vanilla"}:

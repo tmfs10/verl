@@ -161,8 +161,10 @@ def _verify_prompt_logprob_admission_step(
     learnability_events = [event for event in events if event.get("event") == "learnability"]
     summaries = [event for event in events if event.get("event") == "prompt_logprob_admission_summary"]
     if capacity is None:
-        declared_tokens = sum(int(event.get("prompt_tokens", 0)) for event in summaries)
-        return declared_tokens, 0, len(learnability_events)
+        if summaries or any(event.get("prompt_logprob_admission") is not None for event in learnability_events):
+            raise ValueError("unbounded prompt-logprob scoring unexpectedly retained admission evidence")
+        prompt_tokens = sum(len(event.get("scoring_prompt_ids", ())) for event in learnability_events)
+        return prompt_tokens, 0, len(learnability_events)
 
     admissions: list[dict[str, Any]] = []
     request_keys: set[tuple[str, int]] = set()
@@ -753,6 +755,8 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             ):
                 raise ValueError(f"oversized learnability request {key!r} did not run alone")
             prompt_logprob_admissions.append(admission)
+        elif event.get("prompt_logprob_admission") is not None:
+            raise ValueError(f"unbounded learnability event {key!r} unexpectedly retained admission evidence")
         expected_seed_score = _aggregate(scored_log_probs, statistic)
         if not math.isclose(float(event["seed_score"]), expected_seed_score, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError(f"learnability event {key!r} has a corrupted replacement score")

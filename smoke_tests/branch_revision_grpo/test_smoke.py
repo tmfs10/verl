@@ -136,6 +136,40 @@ def test_rendered_smoke_supports_two_node_32k_context_and_8k_answers(tmp_path: P
     assert "--partition interactive" in rendered
 
 
+def test_rendered_smoke_can_disable_prompt_logprob_admission_without_changing_other_oom_controls(
+    tmp_path: Path,
+) -> None:
+    command, _ = build_command(
+        run_tag="two-node-no-admission",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        n_prompts=64,
+        n_samples=8,
+        num_critiques=2,
+        nodes=2,
+        max_prompt_length=2048,
+        max_response_length=8192,
+        max_model_len=32768,
+        critique_max_response_length=8192,
+        max_tokens_per_gpu=32768,
+        prompt_logprob_max_inflight_tokens=None,
+        gpu_memory_utilization=0.6,
+        training_steps=5,
+        partition="interactive",
+    )
+    rendered = " ".join(command)
+    assert "actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens=null" in rendered
+    assert "+branch_revision_smoke.prompt_logprob_max_inflight_tokens=null" in rendered
+    assert "actor_rollout_ref.rollout.gpu_memory_utilization=0.6" in rendered
+    assert "actor_rollout_ref.rollout.max_num_batched_tokens=32768" in rendered
+    assert "actor_rollout_ref.rollout.max_num_seqs=32" in rendered
+    assert "algorithm.branch_revision_grpo.enable=true" in rendered
+
+
 def test_rendered_smoke_allows_four_nodes_only_on_normal_partitions(tmp_path: Path) -> None:
     common = {
         "run_tag": "four-node-reproduction",
@@ -850,11 +884,14 @@ def _add_prompt_logprob_admission_evidence(root: Path, *, capacity: int = 8192) 
 def _duplicate_fixture_step(root: Path) -> None:
     config_path = root / "resolved_config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    prompt_logprob_capacity = config["actor_rollout_ref"]["rollout"].get("prompt_logprob_max_inflight_tokens")
     config["trainer"]["total_training_steps"] = 2
     _write_json(config_path, config)
     first_events = [json.loads(line) for line in _audit_path(root).read_text(encoding="utf-8").splitlines()]
     second_events = [{**event, "global_step": 2} for event in first_events]
-    if not any(event["event"] == "prompt_logprob_admission_summary" for event in second_events):
+    if prompt_logprob_capacity is not None and not any(
+        event["event"] == "prompt_logprob_admission_summary" for event in second_events
+    ):
         second_events.insert(
             -2,
             {
@@ -892,11 +929,22 @@ def test_verifier_validates_prompt_logprob_admission_evidence(tmp_path: Path) ->
         verify(tmp_path)
 
 
-def test_verifier_requires_and_selects_a_completed_high_pressure_step(tmp_path: Path) -> None:
+def test_verifier_rejects_admission_evidence_when_budget_is_disabled(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    learnability = next(event for event in events if event["event"] == "learnability")
+    learnability["prompt_logprob_admission"] = {"capacity": 8192}
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="unbounded prompt-logprob scoring unexpectedly retained"):
+        verify(tmp_path)
+
+
+def test_verifier_requires_completed_step_range_and_tie_breaks_on_first_step(tmp_path: Path) -> None:
     _fixture(tmp_path)
     _duplicate_fixture_step(tmp_path)
     result = verify(tmp_path)
-    assert result["selected_global_step"] == 2
+    assert result["selected_global_step"] == 1
     assert len(result["audit_files"]) == 2
 
     (tmp_path / "audit" / "attempt_fixture" / "step_00000002.jsonl").unlink()

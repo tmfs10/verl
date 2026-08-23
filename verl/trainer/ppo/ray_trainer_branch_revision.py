@@ -112,8 +112,10 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
     if config.actor_rollout_ref.rollout.name != "vllm":
         raise ValueError("branch-revision GRPO currently supports only the dense vLLM rollout engine")
     admission_capacity = config.actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens
-    if isinstance(admission_capacity, bool) or not isinstance(admission_capacity, int) or admission_capacity <= 0:
-        raise ValueError("branch-revision GRPO requires a positive prompt-logprob per-server token budget")
+    if admission_capacity is not None and (
+        isinstance(admission_capacity, bool) or not isinstance(admission_capacity, int) or admission_capacity <= 0
+    ):
+        raise ValueError("branch-revision GRPO prompt-logprob token budget must be null or a positive integer")
     if config.critic.get("enable", None) is not False:
         raise ValueError("branch-revision GRPO is actor-only and requires critic.enable=false")
     if str(config.algorithm.adv_estimator).lower() != "grpo":
@@ -259,7 +261,7 @@ class _Bundle:
     original_reward: float
     record: BranchRevisionGenerationRecord | None = None
     learnability: dict[int, LearnabilityScore] = field(default_factory=dict)
-    score_admissions: dict[int, dict[str, Any]] = field(default_factory=dict)
+    score_admissions: dict[int, dict[str, Any] | None] = field(default_factory=dict)
     continuation_rewards: dict[int, float] = field(default_factory=dict)
     compression_fractions: dict[int, float] = field(default_factory=dict)
     compression_credits: dict[int, float] = field(default_factory=dict)
@@ -678,15 +680,15 @@ class BranchRevisionGRPOController:
         if not isinstance(value, dict):
             raise TypeError(f"invalid branch-revision score record {type(value)!r}")
         admission = value.get("admission")
-        if not isinstance(admission, dict):
-            raise TypeError("branch-revision score admission evidence must be a mapping")
+        if admission is not None and not isinstance(admission, dict):
+            raise TypeError("branch-revision score admission evidence must be null or a mapping")
         return BranchRevisionScoreGeneration(
             rollout_id=str(value["rollout_id"]),
             critique_index=int(value["critique_index"]),
             prompt_logprob_start=int(value["prompt_logprob_start"]),
             scored_token_ids=tuple(int(token) for token in value["scored_token_ids"]),
             scored_token_log_probs=tuple(_float32_list(value["scored_token_log_probs"])),
-            admission=dict(admission),
+            admission=None if admission is None else dict(admission),
         )
 
     def _extract_scores(self, output: DataProto) -> dict[tuple[str, int], BranchRevisionScoreGeneration]:
@@ -735,7 +737,7 @@ class BranchRevisionGRPOController:
                     critique,
                     new_continuation_log_probs=score.scored_token_log_probs,
                 )
-                bundle.score_admissions[critique_index] = dict(score.admission)
+                bundle.score_admissions[critique_index] = None if score.admission is None else dict(score.admission)
             bundle.record = replace(bundle.record, critiques=tuple(critiques))
 
     def _make_continuation_request(self, source: DataProto, bundles: list[_Bundle]) -> DataProto | None:
@@ -914,62 +916,69 @@ class BranchRevisionGRPOController:
                 population_stddev=reference.population_stddev,
             )
             for bundle, critique_index, critique, seed_values in proposals_by_length[seed_length]:
-                admission = bundle.score_admissions.get(critique_index)
-                if not isinstance(admission, dict):
-                    raise RuntimeError("valid branch revision is missing prompt-logprob admission evidence")
-                capacity = int(self.config.actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens)
+                if critique_index not in bundle.score_admissions:
+                    raise RuntimeError("valid branch revision is missing its prompt-logprob admission result")
+                admission = bundle.score_admissions[critique_index]
+                configured_capacity = self.config.actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens
                 expected_prompt_tokens = (
                     len(bundle.prompt_ids) + len(critique.continuation_prefix_ids) + len(critique.new_continuation_ids)
                 )
-                required_admission = {
-                    "server_id",
-                    "capacity",
-                    "request_sequence",
-                    "prompt_tokens",
-                    "charged_tokens",
-                    "wait_seconds",
-                    "inflight_prompt_tokens_at_grant",
-                    "inflight_charged_tokens_at_grant",
-                    "high_water_prompt_tokens",
-                    "high_water_charged_tokens",
-                    "oversized",
-                }
-                if not required_admission.issubset(admission):
-                    raise RuntimeError("prompt-logprob admission evidence is incomplete")
-                try:
-                    admitted_capacity = int(admission["capacity"])
-                    request_sequence = int(admission["request_sequence"])
-                    prompt_tokens = int(admission["prompt_tokens"])
-                    charged_tokens = int(admission["charged_tokens"])
-                    wait_seconds = float(admission["wait_seconds"])
-                    inflight_prompt_tokens = int(admission["inflight_prompt_tokens_at_grant"])
-                    inflight_charged_tokens = int(admission["inflight_charged_tokens_at_grant"])
-                    high_water_prompt_tokens = int(admission["high_water_prompt_tokens"])
-                    high_water_charged_tokens = int(admission["high_water_charged_tokens"])
-                except (TypeError, ValueError) as error:
-                    raise RuntimeError("prompt-logprob admission evidence has invalid numeric fields") from error
-                oversized = expected_prompt_tokens > capacity
-                if (
-                    not isinstance(admission["server_id"], str)
-                    or not admission["server_id"]
-                    or admitted_capacity != capacity
-                    or request_sequence <= 0
-                    or prompt_tokens != expected_prompt_tokens
-                    or charged_tokens != min(expected_prompt_tokens, capacity)
-                    or not math.isfinite(wait_seconds)
-                    or wait_seconds < 0.0
-                    or inflight_prompt_tokens < prompt_tokens
-                    or inflight_charged_tokens < charged_tokens
-                    or inflight_charged_tokens > capacity
-                    or high_water_prompt_tokens < inflight_prompt_tokens
-                    or high_water_charged_tokens < inflight_charged_tokens
-                    or high_water_charged_tokens > capacity
-                    or bool(admission["oversized"]) != oversized
-                ):
-                    raise RuntimeError("prompt-logprob admission evidence violates its configured token budget")
-                if oversized and (inflight_prompt_tokens != prompt_tokens or inflight_charged_tokens != capacity):
-                    raise RuntimeError("oversized prompt-logprob request did not run alone")
-                admission_records.append(dict(admission))
+                if configured_capacity is None:
+                    if admission is not None:
+                        raise RuntimeError("unbounded prompt-logprob scoring unexpectedly returned admission evidence")
+                else:
+                    if not isinstance(admission, dict):
+                        raise RuntimeError("valid branch revision is missing prompt-logprob admission evidence")
+                    capacity = int(configured_capacity)
+                    required_admission = {
+                        "server_id",
+                        "capacity",
+                        "request_sequence",
+                        "prompt_tokens",
+                        "charged_tokens",
+                        "wait_seconds",
+                        "inflight_prompt_tokens_at_grant",
+                        "inflight_charged_tokens_at_grant",
+                        "high_water_prompt_tokens",
+                        "high_water_charged_tokens",
+                        "oversized",
+                    }
+                    if not required_admission.issubset(admission):
+                        raise RuntimeError("prompt-logprob admission evidence is incomplete")
+                    try:
+                        admitted_capacity = int(admission["capacity"])
+                        request_sequence = int(admission["request_sequence"])
+                        prompt_tokens = int(admission["prompt_tokens"])
+                        charged_tokens = int(admission["charged_tokens"])
+                        wait_seconds = float(admission["wait_seconds"])
+                        inflight_prompt_tokens = int(admission["inflight_prompt_tokens_at_grant"])
+                        inflight_charged_tokens = int(admission["inflight_charged_tokens_at_grant"])
+                        high_water_prompt_tokens = int(admission["high_water_prompt_tokens"])
+                        high_water_charged_tokens = int(admission["high_water_charged_tokens"])
+                    except (TypeError, ValueError) as error:
+                        raise RuntimeError("prompt-logprob admission evidence has invalid numeric fields") from error
+                    oversized = expected_prompt_tokens > capacity
+                    if (
+                        not isinstance(admission["server_id"], str)
+                        or not admission["server_id"]
+                        or admitted_capacity != capacity
+                        or request_sequence <= 0
+                        or prompt_tokens != expected_prompt_tokens
+                        or charged_tokens != min(expected_prompt_tokens, capacity)
+                        or not math.isfinite(wait_seconds)
+                        or wait_seconds < 0.0
+                        or inflight_prompt_tokens < prompt_tokens
+                        or inflight_charged_tokens < charged_tokens
+                        or inflight_charged_tokens > capacity
+                        or high_water_prompt_tokens < inflight_prompt_tokens
+                        or high_water_charged_tokens < inflight_charged_tokens
+                        or high_water_charged_tokens > capacity
+                        or bool(admission["oversized"]) != oversized
+                    ):
+                        raise RuntimeError("prompt-logprob admission evidence violates its configured token budget")
+                    if oversized and (inflight_prompt_tokens != prompt_tokens or inflight_charged_tokens != capacity):
+                        raise RuntimeError("oversized prompt-logprob request did not run alone")
+                    admission_records.append(dict(admission))
                 seed_score = aggregate_log_probs(seed_values, statistic=statistic)
                 score = score_seed_learnability(
                     seed_score,
