@@ -198,6 +198,7 @@ def build_command(
     critique_max_response_length: int = 2560,
     max_tokens_per_gpu: int = 8192,
     training_steps: int = 1,
+    partition: str | None = None,
 ) -> tuple[list[str], str]:
     positive = {
         "n_prompts": n_prompts,
@@ -232,6 +233,8 @@ def build_command(
         raise ValueError("max_seed_window_stddevs must be finite and nonnegative")
     if nodes > 2:
         raise ValueError("this interactive-capable smoke launcher supports at most two nodes")
+    if partition not in {None, "interactive"}:
+        raise ValueError("branch-revision smoke partition must be interactive when explicitly selected")
     if max_prompt_length + max_response_length >= max_model_len:
         raise ValueError("max_prompt_length + max_response_length must be smaller than max_model_len")
     if critique_max_response_length >= max_model_len:
@@ -343,6 +346,8 @@ def build_command(
             training_steps=training_steps,
         ),
     ]
+    if partition is not None:
+        command.extend(["--partition", partition])
     if dry_run:
         command.append("--dry_run")
     return command, remote_output
@@ -383,6 +388,7 @@ def main() -> None:
     parser.add_argument("--critique-max-response-length", type=int, default=2560)
     parser.add_argument("--max-tokens-per-gpu", type=int, default=8192)
     parser.add_argument("--training-steps", type=int, default=1)
+    parser.add_argument("--partition", choices=("interactive",))
     args = parser.parse_args()
 
     local_run_dir = args.local_run_dir.expanduser().resolve()
@@ -450,6 +456,7 @@ def main() -> None:
         critique_max_response_length=args.critique_max_response_length,
         max_tokens_per_gpu=args.max_tokens_per_gpu,
         training_steps=args.training_steps,
+        partition=args.partition,
     )
     git = _git_provenance(repo_root)
     provenance = {
@@ -488,6 +495,7 @@ def main() -> None:
             critique_max_response_length=args.critique_max_response_length,
             max_tokens_per_gpu=args.max_tokens_per_gpu,
             training_steps=args.training_steps,
+            partition=args.partition,
         )
         result = _run(dry_command, local_run_dir / "dry_run.log")
         if result.returncode:

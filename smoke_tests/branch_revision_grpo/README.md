@@ -67,6 +67,7 @@ python3 -m smoke_tests.branch_revision_grpo.submit_oci_iad dry-run \
   --critique-max-response-length 8192 --max-model-len 32768 \
   --max-tokens-per-gpu 32768 \
   --training-steps 5 \
+  --partition interactive \
   --loss-mode dppo_tv --learnability-logprob-statistic mean \
   --learnability-threshold-mode stddev --max-seed-window-stddevs 15
 

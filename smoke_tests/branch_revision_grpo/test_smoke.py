@@ -113,6 +113,7 @@ def test_rendered_smoke_supports_two_node_32k_context_and_8k_answers(tmp_path: P
         critique_max_response_length=8192,
         max_tokens_per_gpu=32768,
         training_steps=5,
+        partition="interactive",
     )
     rendered = " ".join(command)
     assert "--nodes 2" in rendered
@@ -128,6 +129,7 @@ def test_rendered_smoke_supports_two_node_32k_context_and_8k_answers(tmp_path: P
     assert "algorithm.branch_revision_grpo.num_positive_critiques=2" in rendered
     assert "trainer.total_training_steps=5" in rendered
     assert "+branch_revision_smoke.training_steps=5" in rendered
+    assert "--partition interactive" in rendered
 
 
 def test_rendered_smoke_can_select_native_clipped_ppo(tmp_path: Path) -> None:
@@ -193,6 +195,7 @@ def test_rendered_smoke_can_select_percentile_learnability(tmp_path: Path) -> No
         ({"learnability_threshold_mode": "rank"}, "learnability_threshold_mode"),
         ({"max_seed_window_stddevs": -1.0}, "max_seed_window_stddevs"),
         ({"training_steps": 0}, "training_steps"),
+        ({"partition": "batch_block1"}, "partition must be interactive"),
         ({"nodes": 3}, "at most two nodes"),
         ({"max_model_len": 3072}, "must be smaller than max_model_len"),
         ({"max_tokens_per_gpu": 2048}, "must fit one maximum-length original"),
