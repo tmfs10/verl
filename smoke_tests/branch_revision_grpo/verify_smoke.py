@@ -652,7 +652,11 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             raise ValueError(f"actor batch {key} mismatch: {actor_batch.get(key)!r} != {expected!r}")
     actor_rows = actor_batch.get("actor_rows")
     padding = int(actor_batch["padding"])
-    if not 0 <= padding < 8 or (expected_actor_rows + padding) % 8:
+    trainer_config = resolved_config.get("trainer", {})
+    data_parallel_size = int(trainer_config.get("nnodes", 0)) * int(trainer_config.get("n_gpus_per_node", 0))
+    if data_parallel_size <= 0:
+        raise ValueError(f"invalid actor data-parallel size: {data_parallel_size}")
+    if not 0 <= padding < data_parallel_size or (expected_actor_rows + padding) % data_parallel_size:
         raise ValueError(f"invalid data-parallel padding count: {padding}")
     if not isinstance(actor_rows, list) or len(actor_rows) != expected_actor_rows + padding:
         raise ValueError("actor-batch audit must retain every balanced row")
@@ -767,12 +771,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     continuation_audit_rewards = sorted(float(event["reward"]) for event in continuations)
     if continuation_actor_rewards != continuation_audit_rewards:
         raise ValueError("revised solution actor rows must use their binary continuation outcomes")
-    critique_actor_rewards = sorted(float(row["reward"]) for row in critique_actor_rows)
-    critique_audit_rewards = sorted(float(event["reward"]) for event in critiques)
-    if len(critique_actor_rewards) != len(critique_audit_rewards) or any(
-        not math.isclose(actual, expected, abs_tol=1e-9)
-        for actual, expected in zip(critique_actor_rewards, critique_audit_rewards, strict=True)
-    ):
+    critique_actor_rewards = sorted(_float32_values(row["reward"] for row in critique_actor_rows))
+    critique_audit_rewards = sorted(_float32_values(event["reward"] for event in critiques))
+    if critique_actor_rewards != critique_audit_rewards:
         raise ValueError("critique actor rows do not use their audited objective rewards")
     original_solution_groups = Counter(str(row["group_id"]) for row in original_actor_rows)
     rollout_n = int(resolved_config["actor_rollout_ref"]["rollout"]["n"])

@@ -332,7 +332,7 @@ def _actor_audit_row(source: dict, *, row_index: int, response_width: int) -> di
         "actor_row_id": source["actor_row_id"],
         "kind": source["kind"],
         "group_id": source["group_id"],
-        "reward": source["reward"],
+        "reward": float(np.float32(source["reward"])),
         "sequence_length": len(full_ids),
         "response_width": response_width,
         "train_start": train_start,
@@ -365,6 +365,7 @@ def _fixture(
     statistic: str = "mean",
     threshold_mode: str = "stddev",
     max_seed_window_stddevs: float = 15.0,
+    nodes: int = 1,
     schema_version: int = 5,
 ) -> None:
     attempt_id = "fixture"
@@ -401,6 +402,7 @@ def _fixture(
                 "rollout": {"n": 2},
                 "actor": {"policy_loss": {"loss_mode": "dppo_tv"}},
             },
+            "trainer": {"nnodes": nodes, "n_gpus_per_node": 8},
         },
     )
     resolved_config = json.loads((root / "resolved_config.json").read_text(encoding="utf-8"))
@@ -519,7 +521,7 @@ def _fixture(
             )
             accepted = valid and critique_index == 0
             outcome = 1.0 if accepted else 0.0
-            objective_credit = outcome
+            objective_credit = 0.4026955278742087 if accepted and objective == "compression" else outcome
             reward = outcome - baseline if objective == "recovery" else objective_credit
             critique_ids = [700 + original_index, 800 + critique_index]
             branch_prefix_ids = [original["solution_ids"][0]] if valid else []
@@ -574,8 +576,8 @@ def _fixture(
                         max_seed_window_stddevs=max_seed_window_stddevs,
                     )
                 events.append(learnability_event)
-            compression_fraction = 0.25 if accepted and objective == "compression" else None
-            compression_credit = 1.0 if accepted and objective == "compression" else None
+            compression_fraction = objective_credit * 0.25 if accepted and objective == "compression" else None
+            compression_credit = objective_credit if accepted and objective == "compression" else None
             edit_strings = (
                 {
                     "prefix": "source prefix" if valid else "",
@@ -668,7 +670,7 @@ def _fixture(
 
     critique_count = 16 * 2
     rows = 16 + critique_count + continuation_count
-    padding = (-rows) % 8
+    padding = (-rows) % (nodes * 8)
     actor_sources.extend(
         {
             "actor_row_id": f"padding:{index}",
@@ -759,9 +761,16 @@ def test_verifier_accepts_complete_live_contract(tmp_path: Path) -> None:
     result = verify(tmp_path)
     assert result["status"] == "verified"
     assert result["valid_edits"] == 3
-    assert result["successful_compression_credit"] == 1.0
+    assert result["successful_compression_credit"] == pytest.approx(0.4026955278742087)
     assert result["learnability_threshold_mode"] == "stddev"
     assert result["max_seed_window_stddevs"] == 15.0
+
+
+def test_verifier_accepts_padding_for_the_full_two_node_data_parallel_world(tmp_path: Path) -> None:
+    _fixture(tmp_path, nodes=2)
+    result = verify(tmp_path)
+    assert result["status"] == "verified"
+    assert result["padding_rows"] == 14
 
 
 def test_verifier_retains_legacy_schema_v2_support(tmp_path: Path) -> None:
