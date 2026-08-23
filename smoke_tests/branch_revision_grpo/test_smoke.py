@@ -574,8 +574,8 @@ def _fixture(
             replacement_log_probs = ([-0.1, -0.1] if accepted else [-1.0, -1.0]) if valid else []
             revision_context_ids = continuation_prefix_ids if schema_version >= 4 else branch_prefix_ids
             revised_prefix_ids = [*revision_context_ids, *replacement_ids] if valid else []
-            generated_ids = [900 + original_index * 2 + critique_index] if valid else []
-            generated_log_probs = [-0.2] if valid else []
+            generated_ids = [900 + original_index * 2 + critique_index] if accepted else []
+            generated_log_probs = [-0.2] if accepted else []
             if valid:
                 structurally_valid_count += 1
                 if objective == "recovery":
@@ -1196,6 +1196,22 @@ def test_verifier_rejects_corrupted_prompt_scoring_slice(tmp_path: Path) -> None
     learnability["prompt_logprob_start"] -= 1
     _write_jsonl(path, events)
     with pytest.raises(ValueError, match="corrupted prompt-scoring slice"):
+        verify(tmp_path)
+
+
+def test_verifier_rejects_generated_suffix_for_learnability_rejected_edit(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    critique = next(
+        event
+        for event in events
+        if event["event"] == "critique" and event["parse_reason"] == "valid" and not event["learnability_accepted"]
+    )
+    critique["generated_continuation_ids"] = [42]
+    critique["generated_continuation_log_probs"] = [-0.5]
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="unexpectedly generated a continuation"):
         verify(tmp_path)
 
 

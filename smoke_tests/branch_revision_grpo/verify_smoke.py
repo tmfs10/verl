@@ -549,8 +549,11 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
                     raise ValueError(f"valid critique {key!r} has inconsistent replacement boundaries")
             if len(replacement_ids) != len(replacement_log_probs):
                 raise ValueError(f"valid critique {key!r} replacement token/log-probability lengths differ")
-            if not generated_ids or len(generated_ids) != len(generated_log_probs):
-                raise ValueError(f"valid critique {key!r} generated continuation evidence is incomplete")
+            if accepted:
+                if not generated_ids or len(generated_ids) != len(generated_log_probs):
+                    raise ValueError(f"accepted critique {key!r} generated continuation evidence is incomplete")
+            elif generated_ids or generated_log_probs:
+                raise ValueError(f"learnability-rejected critique {key!r} unexpectedly generated a continuation")
             if bool(critique.get("continuation_reward_evaluated")) != accepted:
                 raise ValueError(f"critique {key!r} reward-evaluation flag differs from learnability acceptance")
         else:
