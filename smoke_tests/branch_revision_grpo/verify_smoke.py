@@ -27,8 +27,8 @@ from typing import Any
 
 import numpy as np
 
-_AUDIT_SCHEMA_VERSION = 4
-_SUPPORTED_AUDIT_SCHEMA_VERSIONS = {2, 3, _AUDIT_SCHEMA_VERSION}
+_AUDIT_SCHEMA_VERSION = 5
+_SUPPORTED_AUDIT_SCHEMA_VERSIONS = {2, 3, 4, _AUDIT_SCHEMA_VERSION}
 
 
 def _read_json(path: Path) -> Any:
@@ -66,6 +66,16 @@ def _require_binary(value: object, label: str) -> float:
 def _canonical_sha256(values: Any, *, dtype: str) -> str:
     array = np.asarray(values, dtype=np.dtype(dtype))
     return hashlib.sha256(array.tobytes(order="C")).hexdigest()
+
+
+def _optional_float_matches(actual: object, expected: float | None, *, abs_tol: float = 1e-12) -> bool:
+    if expected is None:
+        return actual is None
+    try:
+        value = float(actual)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and math.isclose(value, expected, rel_tol=0.0, abs_tol=abs_tol)
 
 
 def _float32_values(values: Any) -> list[float]:
@@ -177,11 +187,18 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     attempt_dir = root / "audit" / f"attempt_{attempt_id}"
     attempt = _read_json(attempt_dir / "attempt.json")
     audit_schema_version = int(attempt.get("schema_version", -1))
-    if (
-        audit_schema_version not in _SUPPORTED_AUDIT_SCHEMA_VERSIONS
-        or attempt.get("attempt_id") != attempt_id
-    ):
+    if audit_schema_version not in _SUPPORTED_AUDIT_SCHEMA_VERSIONS or attempt.get("attempt_id") != attempt_id:
         raise ValueError("audit attempt metadata has the wrong schema or attempt ID")
+    threshold_mode = (
+        str(branch_config.get("learnability_threshold_mode", "percentile"))
+        if audit_schema_version >= 5
+        else "percentile"
+    )
+    if threshold_mode not in {"stddev", "percentile"}:
+        raise ValueError(f"unsupported learnability threshold mode in smoke evidence: {threshold_mode!r}")
+    max_seed_window_stddevs = float(branch_config.get("max_seed_window_stddevs", 15.0))
+    if not math.isfinite(max_seed_window_stddevs) or max_seed_window_stddevs < 0.0:
+        raise ValueError("smoke evidence has an invalid standard-deviation cutoff")
     runtime_config = attempt.get("resolved_config")
     if not isinstance(runtime_config, dict):
         raise ValueError("audit attempt metadata omitted its exact runtime configuration")
@@ -214,6 +231,16 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError(f"iteration audit must retain all {expected_originals} original binary rewards")
     if iteration.get("learnability_logprob_statistic") != statistic:
         raise ValueError("iteration audit used a different learnability statistic than the resolved config")
+    if audit_schema_version >= 5 and (
+        iteration.get("learnability_threshold_mode") != threshold_mode
+        or not math.isclose(
+            float(iteration.get("max_seed_window_stddevs", float("nan"))),
+            max_seed_window_stddevs,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        raise ValueError("iteration audit used a different learnability threshold than the resolved config")
     incorrect = int(iteration["incorrect"])
     if incorrect != original_rewards.count(0.0) or incorrect <= 0:
         raise ValueError("smoke must contain and exactly count at least one incorrect original rollout")
@@ -342,9 +369,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
                 joint = str(critique.get("prefix_plus_new_continuation", ""))
                 new_continuation = str(critique.get("new_continuation", ""))
                 prefix_ids = [int(token) for token in critique.get("prefix_ids", ())]
-                continuation_prefix_ids = [
-                    int(token) for token in critique.get("continuation_prefix_ids", ())
-                ]
+                continuation_prefix_ids = [int(token) for token in critique.get("continuation_prefix_ids", ())]
                 if (
                     not prefix.strip()
                     or not new_continuation.strip()
@@ -355,9 +380,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
                 ):
                     raise ValueError(f"valid critique {key!r} has inconsistent prefix/joint boundaries")
             else:
-                if not str(critique.get("branch", "")).strip() or not str(
-                    critique.get("new_continuation", "")
-                ).strip():
+                if not str(critique.get("branch", "")).strip() or not str(critique.get("new_continuation", "")).strip():
                     raise ValueError(f"valid critique {key!r} omitted an edit boundary")
                 if (
                     not branch_prefix_ids
@@ -460,6 +483,15 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             raise ValueError(f"learnability reference {reference_key!r} is not exhaustive")
         if reference.get("window_scores_sha256") != _canonical_sha256(exhaustive_scores, dtype="<f8"):
             raise ValueError(f"learnability reference {reference_key!r} has a corrupted exhaustive score hash")
+        if audit_schema_version >= 5:
+            expected_mean = float(np.mean(exhaustive_scores, dtype=np.float64)) if exhaustive_scores.size else None
+            expected_stddev = (
+                float(np.std(exhaustive_scores, dtype=np.float64, ddof=0)) if exhaustive_scores.size else None
+            )
+            if not _optional_float_matches(reference.get("population_mean"), expected_mean) or not (
+                _optional_float_matches(reference.get("population_stddev"), expected_stddev)
+            ):
+                raise ValueError(f"learnability reference {reference_key!r} has corrupted population statistics")
         exhaustive_scores_by_reference[reference_key] = exhaustive_scores
 
     learnability_by_key = {
@@ -531,8 +563,46 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         expected_percentile = min(max(expected_percentile, 0.0), 1.0)
         minimum = float(branch_config["min_seed_window_percentile"])
         full_credit = float(branch_config["full_credit_seed_window_percentile"])
-        expected_accepted = expected_percentile >= minimum
-        expected_weight = min(max((expected_percentile - minimum) / (full_credit - minimum), 0.0), 1.0)
+        if audit_schema_version >= 5:
+            exhaustive_scores = exhaustive_scores_by_reference[str(event["reference_key"])]
+            reference_mean = float(np.mean(exhaustive_scores, dtype=np.float64)) if exhaustive_scores.size else None
+            reference_stddev = (
+                float(np.std(exhaustive_scores, dtype=np.float64, ddof=0)) if exhaustive_scores.size else None
+            )
+            expected_stddevs = (
+                (reference_mean - expected_seed_score) / reference_stddev
+                if reference_mean is not None and reference_stddev is not None and reference_stddev > 0.0
+                else None
+            )
+            if threshold_mode == "stddev":
+                expected_floor = (
+                    reference_mean - max_seed_window_stddevs * reference_stddev
+                    if reference_mean is not None and reference_stddev is not None
+                    else None
+                )
+                expected_accepted = expected_floor is not None and expected_seed_score >= expected_floor
+                expected_weight = float(expected_accepted)
+            else:
+                expected_floor = None
+                expected_accepted = exhaustive_scores.size > 0 and expected_percentile >= minimum
+                expected_weight = min(max((expected_percentile - minimum) / (full_credit - minimum), 0.0), 1.0)
+            if (
+                event.get("threshold_mode") != threshold_mode
+                or not _optional_float_matches(event.get("reference_mean"), reference_mean)
+                or not _optional_float_matches(event.get("reference_stddev"), reference_stddev)
+                or not _optional_float_matches(event.get("stddevs_below_mean"), expected_stddevs)
+                or not _optional_float_matches(event.get("acceptance_floor"), expected_floor)
+                or not math.isclose(
+                    float(event.get("max_seed_window_stddevs", float("nan"))),
+                    max_seed_window_stddevs,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise ValueError(f"learnability event {key!r} has corrupted standard-deviation evidence")
+        else:
+            expected_accepted = expected_percentile >= minimum
+            expected_weight = min(max((expected_percentile - minimum) / (full_credit - minimum), 0.0), 1.0)
         if (
             not math.isclose(float(event["percentile"]), expected_percentile, rel_tol=0.0, abs_tol=1e-12)
             or bool(event["accepted"]) != expected_accepted
@@ -827,6 +897,8 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         "successful_compression_credit": successful_compressions,
         "policy_loss_mode": loss_mode,
         "learnability_logprob_statistic": statistic,
+        "learnability_threshold_mode": threshold_mode,
+        "max_seed_window_stddevs": max_seed_window_stddevs,
         "actor_rows": expected_actor_rows,
         "padding_rows": padding,
         "wall_seconds": float(completed["wall_seconds"]),
@@ -840,7 +912,7 @@ def main() -> None:
     parser.add_argument(
         "--integrity-only",
         action="store_true",
-        help="verify complete schema-v2/v3/v4 evidence without requiring nonzero revision learning signal",
+        help="verify complete schema-v2/v3/v4/v5 evidence without requiring nonzero revision learning signal",
     )
     args = parser.parse_args()
     result = verify(args.root, require_algorithm_signal=not args.integrity_only)

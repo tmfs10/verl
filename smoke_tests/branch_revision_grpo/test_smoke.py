@@ -50,6 +50,8 @@ def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(t
     assert "algorithm.branch_revision_grpo.num_positive_critiques=4" in rendered
     assert "algorithm.branch_revision_grpo.min_seed_window_percentile=0.20" in rendered
     assert "algorithm.branch_revision_grpo.learnability_logprob_statistic=mean" in rendered
+    assert "algorithm.branch_revision_grpo.learnability_threshold_mode=stddev" in rendered
+    assert "algorithm.branch_revision_grpo.max_seed_window_stddevs=15.0" in rendered
     assert "actor_rollout_ref.rollout.n=4" in rendered
     assert "algorithm.branch_revision_grpo.min_continuation_tokens=128" in rendered
     assert "data.max_response_length=2048" in rendered
@@ -157,6 +159,23 @@ def test_rendered_smoke_can_select_minimum_logprob_learnability(tmp_path: Path) 
     assert "+branch_revision_smoke.learnability_logprob_statistic=min" in rendered
 
 
+def test_rendered_smoke_can_select_percentile_learnability(tmp_path: Path) -> None:
+    command, _ = build_command(
+        run_tag="percentile",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        learnability_threshold_mode="percentile",
+        max_seed_window_stddevs=7.5,
+    )
+    rendered = " ".join(command)
+    assert "algorithm.branch_revision_grpo.learnability_threshold_mode=percentile" in rendered
+    assert "algorithm.branch_revision_grpo.max_seed_window_stddevs=7.5" in rendered
+
+
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
@@ -168,12 +187,16 @@ def test_rendered_smoke_can_select_minimum_logprob_learnability(tmp_path: Path) 
         ({"model_path": "/hf_models/not-supported"}, "model_path"),
         ({"loss_mode": "not-supported"}, "loss_mode"),
         ({"learnability_logprob_statistic": "median"}, "learnability_logprob_statistic"),
+        ({"learnability_threshold_mode": "rank"}, "learnability_threshold_mode"),
+        ({"max_seed_window_stddevs": -1.0}, "max_seed_window_stddevs"),
         ({"nodes": 3}, "at most two nodes"),
         ({"max_model_len": 3072}, "must be smaller than max_model_len"),
         ({"max_tokens_per_gpu": 2048}, "must fit one maximum-length original"),
     ],
 )
-def test_rendered_smoke_rejects_invalid_scale(overrides: dict[str, int | str], match: str, tmp_path: Path) -> None:
+def test_rendered_smoke_rejects_invalid_scale(
+    overrides: dict[str, int | float | str], match: str, tmp_path: Path
+) -> None:
     kwargs = {
         "run_tag": "invalid",
         "dry_run": False,
@@ -231,6 +254,8 @@ def _scaled_runtime_config(tmp_path: Path):
                     "enable_positive_compression": True,
                     "num_positive_critiques": 6,
                     "learnability_logprob_statistic": "mean",
+                    "learnability_threshold_mode": "stddev",
+                    "max_seed_window_stddevs": 15.0,
                     "critique_max_response_length": 2560,
                     "min_continuation_tokens": 128,
                     "audit_output_dir": str(tmp_path / "audit"),
@@ -260,6 +285,8 @@ def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
         "num_critiques": 6,
         "loss_mode": "dppo_tv",
         "learnability_logprob_statistic": "mean",
+        "learnability_threshold_mode": "stddev",
+        "max_seed_window_stddevs": 15.0,
         "nodes": 1,
         "max_prompt_length": 1024,
         "max_response_length": 2048,
@@ -336,7 +363,9 @@ def _fixture(
     *,
     include_continuation: bool = True,
     statistic: str = "mean",
-    schema_version: int = 4,
+    threshold_mode: str = "stddev",
+    max_seed_window_stddevs: float = 15.0,
+    schema_version: int = 5,
 ) -> None:
     attempt_id = "fixture"
     invocation_id = "invocation"
@@ -348,21 +377,25 @@ def _fixture(
     }
     _write_json(root / "status.json", completion)
     _write_json(root / "completed.json", completion)
+    branch_config = {
+        "num_critiques": 2,
+        "enable_positive_compression": True,
+        "num_positive_critiques": 2,
+        "positive_compression_target": 0.25,
+        "learnability_logprob_statistic": statistic,
+        "min_seed_window_percentile": 0.2,
+        "full_credit_seed_window_percentile": 0.5,
+        "min_continuation_tokens": 128,
+    }
+    if schema_version >= 5:
+        branch_config.update(
+            learnability_threshold_mode=threshold_mode,
+            max_seed_window_stddevs=max_seed_window_stddevs,
+        )
     _write_json(
         root / "resolved_config.json",
         {
-            "algorithm": {
-                "branch_revision_grpo": {
-                    "num_critiques": 2,
-                    "enable_positive_compression": True,
-                    "num_positive_critiques": 2,
-                    "positive_compression_target": 0.25,
-                    "learnability_logprob_statistic": statistic,
-                    "min_seed_window_percentile": 0.2,
-                    "full_credit_seed_window_percentile": 0.5,
-                    "min_continuation_tokens": 128,
-                }
-            },
+            "algorithm": {"branch_revision_grpo": branch_config},
             "data": {"train_batch_size": 8},
             "actor_rollout_ref": {
                 "rollout": {"n": 2},
@@ -452,6 +485,11 @@ def _fixture(
                 "rollout_window_counts": [{"rollout_id": rollout_id, "windows": 1} for rollout_id in originals],
                 "window_scores_sha256": _canonical_sha256(reference_scores, dtype="<f8"),
             }
+            if schema_version >= 5:
+                reference_payload.update(
+                    population_mean=float(np.mean(reference_scores, dtype=np.float64)),
+                    population_stddev=float(np.std(reference_scores, dtype=np.float64, ddof=0)),
+                )
         events.append(
             {
                 "event": "learnability_reference",
@@ -506,28 +544,36 @@ def _fixture(
                 seed_score = _aggregate(replacement_log_probs, statistic)
                 percentile = 1.0 if accepted else 0.0
                 reward_weight = 1.0 if accepted else 0.0
-                events.append(
-                    {
-                        "event": "learnability",
-                        "score_source": "vllm_prompt_logprobs",
-                        "reference_key": f"{statistic}:2",
-                        "rollout_id": rollout_id,
-                        "objective": objective,
-                        "critique_index": critique_index,
-                        "seed_tokens": 2,
-                        "logprob_statistic": statistic,
-                        "seed_score": seed_score,
-                        "scoring_prompt_ids": [*original["prompt_ids"], *revision_context_ids, *replacement_ids],
-                        "prompt_logprob_start": len(original["prompt_ids"]) + len(revision_context_ids),
-                        "scored_token_ids": replacement_ids,
-                        "scored_token_log_probs": replacement_log_probs,
-                        "percentile": percentile,
-                        "reward_weight": reward_weight,
-                        "accepted": accepted,
-                        "eligible_rollouts": len(originals),
-                        ("sampled_windows" if schema_version == 2 else "total_windows"): len(originals),
-                    }
-                )
+                learnability_event = {
+                    "event": "learnability",
+                    "score_source": "vllm_prompt_logprobs",
+                    "reference_key": f"{statistic}:2",
+                    "rollout_id": rollout_id,
+                    "objective": objective,
+                    "critique_index": critique_index,
+                    "seed_tokens": 2,
+                    "logprob_statistic": statistic,
+                    "seed_score": seed_score,
+                    "scoring_prompt_ids": [*original["prompt_ids"], *revision_context_ids, *replacement_ids],
+                    "prompt_logprob_start": len(original["prompt_ids"]) + len(revision_context_ids),
+                    "scored_token_ids": replacement_ids,
+                    "scored_token_log_probs": replacement_log_probs,
+                    "percentile": percentile,
+                    "reward_weight": reward_weight,
+                    "accepted": accepted,
+                    "eligible_rollouts": len(originals),
+                    ("sampled_windows" if schema_version == 2 else "total_windows"): len(originals),
+                }
+                if schema_version >= 5:
+                    learnability_event.update(
+                        threshold_mode=threshold_mode,
+                        reference_mean=-0.5,
+                        reference_stddev=0.0,
+                        stddevs_below_mean=None,
+                        acceptance_floor=-0.5 if threshold_mode == "stddev" else None,
+                        max_seed_window_stddevs=max_seed_window_stddevs,
+                    )
+                events.append(learnability_event)
             compression_fraction = 0.25 if accepted and objective == "compression" else None
             compression_credit = 1.0 if accepted and objective == "compression" else None
             edit_strings = (
@@ -660,6 +706,14 @@ def _fixture(
                 "correct": 14,
                 "positive_compression_enabled": True,
                 "learnability_logprob_statistic": statistic,
+                **(
+                    {
+                        "learnability_threshold_mode": threshold_mode,
+                        "max_seed_window_stddevs": max_seed_window_stddevs,
+                    }
+                    if schema_version >= 5
+                    else {}
+                ),
                 "original_rewards": original_rewards,
                 "prompt_pass_at_1": prompt_pass_at_1,
             },
@@ -706,6 +760,8 @@ def test_verifier_accepts_complete_live_contract(tmp_path: Path) -> None:
     assert result["status"] == "verified"
     assert result["valid_edits"] == 3
     assert result["successful_compression_credit"] == 1.0
+    assert result["learnability_threshold_mode"] == "stddev"
+    assert result["max_seed_window_stddevs"] == 15.0
 
 
 def test_verifier_retains_legacy_schema_v2_support(tmp_path: Path) -> None:
@@ -716,6 +772,20 @@ def test_verifier_retains_legacy_schema_v2_support(tmp_path: Path) -> None:
 def test_verifier_retains_legacy_schema_v3_support(tmp_path: Path) -> None:
     _fixture(tmp_path, schema_version=3)
     assert verify(tmp_path)["status"] == "verified"
+
+
+def test_verifier_retains_legacy_schema_v4_support(tmp_path: Path) -> None:
+    _fixture(tmp_path, schema_version=4)
+    result = verify(tmp_path)
+    assert result["status"] == "verified"
+    assert result["learnability_threshold_mode"] == "percentile"
+
+
+def test_verifier_accepts_explicit_schema_v5_percentile_mode(tmp_path: Path) -> None:
+    _fixture(tmp_path, threshold_mode="percentile")
+    result = verify(tmp_path)
+    assert result["status"] == "verified"
+    assert result["learnability_threshold_mode"] == "percentile"
 
 
 def test_verifier_rejects_schema_v4_joint_text_that_does_not_extend_prefix(tmp_path: Path) -> None:
@@ -864,6 +934,44 @@ def test_verifier_rejects_corrupted_exhaustive_reference_hash(tmp_path: Path) ->
         verify(tmp_path)
 
 
+@pytest.mark.parametrize("field", ["population_mean", "population_stddev"])
+def test_verifier_rejects_corrupted_population_statistics(field: str, tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    reference = next(event for event in events if event["event"] == "learnability_reference")
+    reference[field] = 1.0
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="corrupted population statistics"):
+        verify(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("threshold_mode", "percentile"),
+        ("reference_mean", 1.0),
+        ("reference_stddev", 1.0),
+        ("stddevs_below_mean", 1.0),
+        ("acceptance_floor", 1.0),
+        ("max_seed_window_stddevs", 14.0),
+    ],
+)
+def test_verifier_rejects_corrupted_stddev_learnability_evidence(
+    field: str,
+    value: object,
+    tmp_path: Path,
+) -> None:
+    _fixture(tmp_path)
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    learnability = next(event for event in events if event["event"] == "learnability")
+    learnability[field] = value
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="corrupted standard-deviation evidence"):
+        verify(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -950,6 +1058,8 @@ def test_extra_args_contains_no_async_or_critic_training() -> None:
     assert "actor_rollout_ref.rollout.repetition_penalty=1.0" in rendered
     assert "enable_positive_compression=true" in rendered
     assert "learnability_logprob_statistic=mean" in rendered
+    assert "learnability_threshold_mode=stddev" in rendered
+    assert "max_seed_window_stddevs=15.0" in rendered
     assert "learnability_windows_per_rollout" not in rendered
     assert "critique_max_response_length=2560" in rendered
     assert "min_continuation_tokens=128" in rendered

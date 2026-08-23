@@ -186,6 +186,8 @@ class BranchRevisionGRPOConfig(BaseConfig):
     num_positive_critiques: int = 4
     positive_compression_target: float = 0.25
     learnability_logprob_statistic: str = "mean"
+    learnability_threshold_mode: str = "stddev"
+    max_seed_window_stddevs: float = 15.0
     min_seed_window_percentile: float = 0.20
     full_credit_seed_window_percentile: float = 0.50
     critique_max_response_length: Optional[int] = 8192
@@ -226,6 +228,10 @@ class BranchRevisionGRPOConfig(BaseConfig):
             raise ValueError("algorithm.branch_revision_grpo.positive_compression_target must be in (0, 1]")
         if self.learnability_logprob_statistic not in {"mean", "min"}:
             raise ValueError("algorithm.branch_revision_grpo.learnability_logprob_statistic must be mean or min")
+        if self.learnability_threshold_mode not in {"stddev", "percentile"}:
+            raise ValueError("algorithm.branch_revision_grpo.learnability_threshold_mode must be stddev or percentile")
+        if not math.isfinite(self.max_seed_window_stddevs) or self.max_seed_window_stddevs < 0.0:
+            raise ValueError("algorithm.branch_revision_grpo.max_seed_window_stddevs must be finite and nonnegative")
         if not (
             math.isfinite(self.min_seed_window_percentile)
             and math.isfinite(self.full_credit_seed_window_percentile)

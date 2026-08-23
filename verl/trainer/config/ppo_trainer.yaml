@@ -213,6 +213,12 @@ algorithm:
     # Aggregate replacement and matched-window token log-probabilities by mean or minimum.
     learnability_logprob_statistic: mean
 
+    # Gate replacement seeds by standard-deviation distance or percentile.
+    learnability_threshold_mode: stddev
+
+    # In stddev mode, reject seeds more than this many population standard deviations below the window mean.
+    max_seed_window_stddevs: 15.0
+
     # Reject replacement seeds below this length-matched original-window percentile.
     min_seed_window_percentile: 0.20
 

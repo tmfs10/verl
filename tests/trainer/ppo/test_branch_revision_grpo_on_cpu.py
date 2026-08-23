@@ -639,7 +639,14 @@ def test_length_matched_learnability_enumerates_every_window_with_uniform_mass()
     assert first.eligible_rollouts == 2
     assert first.rollout_window_counts == (("short", 2), ("long", 19))
     assert first.total_windows == 21
-    score = score_seed_learnability(-2.0, first, minimum_percentile=0.0, full_credit_percentile=0.5)
+    score = score_seed_learnability(
+        -2.0,
+        first,
+        threshold_mode="percentile",
+        max_seed_window_stddevs=15.0,
+        minimum_percentile=0.0,
+        full_credit_percentile=0.5,
+    )
     assert score.percentile == pytest.approx(19 / 21)
 
 
@@ -706,6 +713,8 @@ def test_learnability_rejects_when_no_original_has_a_full_window(statistic: str)
     score = score_seed_learnability(
         -1.0,
         reference,
+        threshold_mode="stddev",
+        max_seed_window_stddevs=15.0,
         minimum_percentile=0.2,
         full_credit_percentile=0.5,
     )
@@ -723,18 +732,24 @@ def test_learnability_percentile_gates_and_ramps_reward_credit() -> None:
     rejected = score_seed_learnability(
         -4.1,
         reference,
+        threshold_mode="percentile",
+        max_seed_window_stddevs=15.0,
         minimum_percentile=0.20,
         full_credit_percentile=0.50,
     )
     partial = score_seed_learnability(
         -3.0,
         reference,
+        threshold_mode="percentile",
+        max_seed_window_stddevs=15.0,
         minimum_percentile=0.20,
         full_credit_percentile=0.70,
     )
     full = score_seed_learnability(
         -1.0,
         reference,
+        threshold_mode="percentile",
+        max_seed_window_stddevs=15.0,
         minimum_percentile=0.20,
         full_credit_percentile=0.50,
     )
@@ -742,6 +757,59 @@ def test_learnability_percentile_gates_and_ramps_reward_credit() -> None:
     assert partial.accepted and partial.percentile == pytest.approx(0.5)
     assert partial.reward_weight == pytest.approx(0.6)
     assert full.accepted and full.reward_weight == 1.0
+
+
+def test_learnability_stddev_gate_uses_population_statistics_and_binary_credit() -> None:
+    prefixes = build_rollout_logprob_prefixes(["r"], [[-2.0, 0.0]])
+    reference = build_learnability_reference(prefixes, window_size=1)
+    boundary = score_seed_learnability(
+        -3.0,
+        reference,
+        threshold_mode="stddev",
+        max_seed_window_stddevs=2.0,
+        minimum_percentile=0.2,
+        full_credit_percentile=0.5,
+    )
+    rejected = score_seed_learnability(
+        -3.0001,
+        reference,
+        threshold_mode="stddev",
+        max_seed_window_stddevs=2.0,
+        minimum_percentile=0.2,
+        full_credit_percentile=0.5,
+    )
+    assert reference.population_mean == pytest.approx(-1.0)
+    assert reference.population_stddev == pytest.approx(1.0)
+    assert boundary.acceptance_floor == pytest.approx(-3.0)
+    assert boundary.stddevs_below_mean == pytest.approx(2.0)
+    assert boundary.accepted and boundary.reward_weight == 1.0
+    assert not rejected.accepted and rejected.reward_weight == 0.0
+
+
+def test_learnability_stddev_gate_handles_zero_variance_without_division() -> None:
+    prefixes = build_rollout_logprob_prefixes(["r"], [[-0.5, -0.5]])
+    reference = build_learnability_reference(prefixes, window_size=1)
+    accepted = score_seed_learnability(
+        -0.5,
+        reference,
+        threshold_mode="stddev",
+        max_seed_window_stddevs=15.0,
+        minimum_percentile=0.2,
+        full_credit_percentile=0.5,
+    )
+    rejected = score_seed_learnability(
+        -0.5001,
+        reference,
+        threshold_mode="stddev",
+        max_seed_window_stddevs=15.0,
+        minimum_percentile=0.2,
+        full_credit_percentile=0.5,
+    )
+    assert reference.population_stddev == 0.0
+    assert accepted.stddevs_below_mean is None
+    assert accepted.acceptance_floor == pytest.approx(-0.5)
+    assert accepted.accepted and accepted.reward_weight == 1.0
+    assert not rejected.accepted and rejected.reward_weight == 0.0
 
 
 @pytest.mark.parametrize("statistic", ["mean", "min"])
@@ -758,6 +826,8 @@ def test_learnability_quantizes_both_sides_to_float32_before_comparison(statisti
     score = score_seed_learnability(
         aggregate_log_probs([raw_seed], statistic=statistic),
         reference,
+        threshold_mode="stddev",
+        max_seed_window_stddevs=15.0,
         minimum_percentile=0.2,
         full_credit_percentile=0.5,
     )
@@ -788,6 +858,8 @@ def _runtime_config(loss_mode="dppo_tv"):
                     "num_positive_critiques": 4,
                     "positive_compression_target": 0.25,
                     "learnability_logprob_statistic": "mean",
+                    "learnability_threshold_mode": "stddev",
+                    "max_seed_window_stddevs": 15.0,
                     "min_seed_window_percentile": 0.20,
                     "full_credit_seed_window_percentile": 0.50,
                     "critique_max_response_length": 16,
@@ -875,6 +947,31 @@ def test_branch_revision_config_accepts_both_learnability_statistics(statistic) 
 def test_branch_revision_config_rejects_unknown_learnability_statistic() -> None:
     with pytest.raises(ValueError, match="must be mean or min"):
         BranchRevisionGRPOConfig(learnability_logprob_statistic="median")
+
+
+@pytest.mark.parametrize("threshold_mode", ["stddev", "percentile"])
+def test_branch_revision_config_accepts_both_learnability_threshold_modes(threshold_mode) -> None:
+    feature = BranchRevisionGRPOConfig(learnability_threshold_mode=threshold_mode)
+    assert feature.learnability_threshold_mode == threshold_mode
+
+
+def test_branch_revision_config_defaults_to_fifteen_stddevs() -> None:
+    feature = BranchRevisionGRPOConfig()
+    assert feature.learnability_threshold_mode == "stddev"
+    assert feature.max_seed_window_stddevs == 15.0
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"learnability_threshold_mode": "rank"}, "must be stddev or percentile"),
+        ({"max_seed_window_stddevs": -1.0}, "finite and nonnegative"),
+        ({"max_seed_window_stddevs": float("nan")}, "finite and nonnegative"),
+    ],
+)
+def test_branch_revision_config_rejects_invalid_learnability_thresholds(kwargs, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        BranchRevisionGRPOConfig(**kwargs)
 
 
 @pytest.mark.parametrize(
@@ -1382,8 +1479,14 @@ def _critique(text: str, *, valid: bool, continuation: str = "") -> BranchRevisi
 def _learnability(*, percentile: float = 1.0, weight: float = 1.0, accepted: bool = True) -> LearnabilityScore:
     return LearnabilityScore(
         logprob_statistic="mean",
+        threshold_mode="stddev",
         seed_score=-0.1,
         percentile=percentile,
+        reference_mean=-0.5,
+        reference_stddev=0.1,
+        stddevs_below_mean=-4.0,
+        acceptance_floor=-2.0,
+        max_seed_window_stddevs=15.0,
         reward_weight=weight,
         accepted=accepted,
         eligible_rollouts=2,

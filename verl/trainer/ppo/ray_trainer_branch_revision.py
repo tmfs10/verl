@@ -56,7 +56,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import marked_timer
 
-_AUDIT_SCHEMA_VERSION = 4
+_AUDIT_SCHEMA_VERSION = 5
 
 
 def _add_exception_note(error: BaseException, note: str) -> None:
@@ -634,8 +634,7 @@ class BranchRevisionGRPOController:
                     not critique.new_continuation_ids
                     or not critique.revised_prefix_ids
                     or not critique.prefix_ids
-                    or [*critique.branch_prefix_ids, *critique.prefix_ids]
-                    != list(critique.continuation_prefix_ids)
+                    or [*critique.branch_prefix_ids, *critique.prefix_ids] != list(critique.continuation_prefix_ids)
                     or [*critique.continuation_prefix_ids, *critique.new_continuation_ids]
                     != list(critique.revised_prefix_ids)
                 ):
@@ -669,12 +668,16 @@ class BranchRevisionGRPOController:
                     for rollout_id, count in reference.rollout_window_counts
                 ],
                 window_scores_sha256=reference.window_scores_sha256,
+                population_mean=reference.population_mean,
+                population_stddev=reference.population_stddev,
             )
             for bundle, critique_index, critique, seed_values in proposals_by_length[seed_length]:
                 seed_score = aggregate_log_probs(seed_values, statistic=statistic)
                 score = score_seed_learnability(
                     seed_score,
                     reference,
+                    threshold_mode=self.feature.learnability_threshold_mode,
+                    max_seed_window_stddevs=self.feature.max_seed_window_stddevs,
                     minimum_percentile=self.feature.min_seed_window_percentile,
                     full_credit_percentile=self.feature.full_credit_seed_window_percentile,
                 )
@@ -688,6 +691,7 @@ class BranchRevisionGRPOController:
                     critique_index=critique_index,
                     seed_tokens=seed_length,
                     logprob_statistic=score.logprob_statistic,
+                    threshold_mode=score.threshold_mode,
                     seed_score=score.seed_score,
                     scoring_prompt_ids=[
                         *bundle.prompt_ids,
@@ -698,6 +702,11 @@ class BranchRevisionGRPOController:
                     scored_token_ids=list(critique.new_continuation_ids),
                     scored_token_log_probs=seed_values,
                     percentile=score.percentile,
+                    reference_mean=score.reference_mean,
+                    reference_stddev=score.reference_stddev,
+                    stddevs_below_mean=score.stddevs_below_mean,
+                    acceptance_floor=score.acceptance_floor,
+                    max_seed_window_stddevs=score.max_seed_window_stddevs,
                     reward_weight=score.reward_weight,
                     accepted=score.accepted,
                     eligible_rollouts=score.eligible_rollouts,
@@ -1140,6 +1149,11 @@ class BranchRevisionGRPOController:
         all_prompts = {bundle.prompt_group_id for bundle in bundles}
         parse_counts = Counter(critique.parse_reason for critique in critiques)
         learnability_scores = [score for bundle in selected for score in bundle.learnability.values()]
+        finite_stddev_distances = [
+            score.stddevs_below_mean
+            for score in learnability_scores
+            if score.stddevs_below_mean is not None and math.isfinite(score.stddevs_below_mean)
+        ]
         compression_fractions = [value for bundle in correct for value in bundle.compression_fractions.values()]
         compression_credits = [value for bundle in correct for value in bundle.compression_credits.values()]
         generated_continuation_tokens = [
@@ -1197,6 +1211,12 @@ class BranchRevisionGRPOController:
                 float(sum(score.reward_weight for score in learnability_scores) / len(learnability_scores))
                 if learnability_scores
                 else 0.0
+            ),
+            "branch_revision/learnability/mean_stddevs_below_mean": (
+                float(sum(finite_stddev_distances) / len(finite_stddev_distances)) if finite_stddev_distances else 0.0
+            ),
+            "branch_revision/learnability/max_stddevs_below_mean": (
+                float(max(finite_stddev_distances)) if finite_stddev_distances else 0.0
             ),
             "branch_revision/compression/mean_fraction": (
                 float(sum(compression_fractions) / len(compression_fractions)) if compression_fractions else 0.0
@@ -1273,6 +1293,8 @@ class BranchRevisionGRPOController:
             correct=sum(bundle.original_reward == 1.0 for bundle in bundles),
             positive_compression_enabled=self.feature.enable_positive_compression,
             learnability_logprob_statistic=self.feature.learnability_logprob_statistic,
+            learnability_threshold_mode=self.feature.learnability_threshold_mode,
+            max_seed_window_stddevs=self.feature.max_seed_window_stddevs,
             original_rewards=rewards,
             prompt_pass_at_1={
                 prompt_group_id: sum(group_rewards) / len(group_rewards)

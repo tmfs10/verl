@@ -84,6 +84,8 @@ class LearnabilityReference:
     sorted_window_scores: torch.Tensor
     rollout_window_counts: tuple[tuple[str, int], ...]
     eligible_rollouts: int
+    population_mean: float | None
+    population_stddev: float | None
 
     @property
     def total_windows(self) -> int:
@@ -99,8 +101,14 @@ class LearnabilityReference:
 @dataclass(frozen=True)
 class LearnabilityScore:
     logprob_statistic: str
+    threshold_mode: str
     seed_score: float
     percentile: float
+    reference_mean: float | None
+    reference_stddev: float | None
+    stddevs_below_mean: float | None
+    acceptance_floor: float | None
+    max_seed_window_stddevs: float
     reward_weight: float
     accepted: bool
     eligible_rollouts: int
@@ -537,8 +545,15 @@ def build_learnability_reference(
             sorted_window_scores=empty.clone(),
             rollout_window_counts=(),
             eligible_rollouts=0,
+            population_mean=None,
+            population_stddev=None,
         )
     window_scores = torch.cat(exhaustive_scores)
+    population = window_scores.detach().to(device="cpu", dtype=torch.float64).contiguous().numpy()
+    population_mean = float(np.mean(population, dtype=np.float64))
+    population_stddev = float(np.std(population, dtype=np.float64, ddof=0))
+    if not math.isfinite(population_mean) or not math.isfinite(population_stddev):
+        raise RuntimeError("exhaustive learnability reference produced non-finite population statistics")
     return LearnabilityReference(
         window_size=window_size,
         logprob_statistic=logprob_statistic,
@@ -546,6 +561,8 @@ def build_learnability_reference(
         sorted_window_scores=torch.sort(window_scores).values,
         rollout_window_counts=tuple(rollout_window_counts),
         eligible_rollouts=len(rollout_window_counts),
+        population_mean=population_mean,
+        population_stddev=population_stddev,
     )
 
 
@@ -553,13 +570,19 @@ def score_seed_learnability(
     seed_score: float,
     reference: LearnabilityReference,
     *,
+    threshold_mode: str,
+    max_seed_window_stddevs: float,
     minimum_percentile: float,
     full_credit_percentile: float,
 ) -> LearnabilityScore:
-    """Gate a replacement seed and linearly ramp reward credit by percentile."""
+    """Gate a replacement seed by stddev or percentile against exhaustive windows."""
 
     if not math.isfinite(seed_score):
         raise ValueError("replacement seed log-probability score must be finite")
+    if threshold_mode not in {"stddev", "percentile"}:
+        raise ValueError("learnability threshold mode must be stddev or percentile")
+    if not math.isfinite(max_seed_window_stddevs) or max_seed_window_stddevs < 0.0:
+        raise ValueError("maximum learnability standard deviations must be finite and nonnegative")
     if not 0.0 <= minimum_percentile < full_credit_percentile <= 1.0:
         raise ValueError("learnability percentiles must satisfy 0 <= minimum < full credit <= 1")
     if reference.total_windows == 0:
@@ -572,15 +595,37 @@ def score_seed_learnability(
         )
         percentile = float(boundary.detach().cpu().item()) / reference.total_windows
         percentile = min(max(percentile, 0.0), 1.0)
-    accepted = reference.total_windows > 0 and percentile >= minimum_percentile
-    reward_weight = min(
-        max((percentile - minimum_percentile) / (full_credit_percentile - minimum_percentile), 0.0),
-        1.0,
-    )
+    reference_mean = reference.population_mean
+    reference_stddev = reference.population_stddev
+    if reference_stddev is not None and reference_stddev > 0.0 and reference_mean is not None:
+        stddevs_below_mean = (reference_mean - seed_score) / reference_stddev
+    else:
+        stddevs_below_mean = None
+    if threshold_mode == "stddev":
+        acceptance_floor = (
+            reference_mean - max_seed_window_stddevs * reference_stddev
+            if reference_mean is not None and reference_stddev is not None
+            else None
+        )
+        accepted = acceptance_floor is not None and seed_score >= acceptance_floor
+        reward_weight = float(accepted)
+    else:
+        acceptance_floor = None
+        accepted = reference.total_windows > 0 and percentile >= minimum_percentile
+        reward_weight = min(
+            max((percentile - minimum_percentile) / (full_credit_percentile - minimum_percentile), 0.0),
+            1.0,
+        )
     return LearnabilityScore(
         logprob_statistic=reference.logprob_statistic,
+        threshold_mode=threshold_mode,
         seed_score=float(seed_score),
         percentile=percentile,
+        reference_mean=reference_mean,
+        reference_stddev=reference_stddev,
+        stddevs_below_mean=stddevs_below_mean,
+        acceptance_floor=acceptance_floor,
+        max_seed_window_stddevs=float(max_seed_window_stddevs),
         reward_weight=reward_weight,
         accepted=accepted,
         eligible_rollouts=reference.eligible_rollouts,

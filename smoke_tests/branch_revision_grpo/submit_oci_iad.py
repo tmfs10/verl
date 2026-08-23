@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import shlex
 import subprocess
 from pathlib import Path
@@ -56,6 +57,8 @@ def _extra_args(
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
     learnability_logprob_statistic: str = "mean",
+    learnability_threshold_mode: str = "stddev",
+    max_seed_window_stddevs: float = 15.0,
     nodes: int = 1,
     max_prompt_length: int = 1024,
     max_response_length: int = 2048,
@@ -67,6 +70,10 @@ def _extra_args(
         raise ValueError("loss_mode must be dppo_tv or vanilla")
     if learnability_logprob_statistic not in {"mean", "min"}:
         raise ValueError("learnability_logprob_statistic must be mean or min")
+    if learnability_threshold_mode not in {"stddev", "percentile"}:
+        raise ValueError("learnability_threshold_mode must be stddev or percentile")
+    if not math.isfinite(max_seed_window_stddevs) or max_seed_window_stddevs < 0.0:
+        raise ValueError("max_seed_window_stddevs must be finite and nonnegative")
     overrides = [
         "~critic.append_solution_to_prompt",
         "algorithm.adv_estimator=grpo",
@@ -78,6 +85,8 @@ def _extra_args(
         f"algorithm.branch_revision_grpo.num_positive_critiques={num_critiques}",
         "algorithm.branch_revision_grpo.positive_compression_target=0.25",
         f"algorithm.branch_revision_grpo.learnability_logprob_statistic={learnability_logprob_statistic}",
+        f"algorithm.branch_revision_grpo.learnability_threshold_mode={learnability_threshold_mode}",
+        f"algorithm.branch_revision_grpo.max_seed_window_stddevs={max_seed_window_stddevs}",
         "algorithm.branch_revision_grpo.min_seed_window_percentile=0.20",
         "algorithm.branch_revision_grpo.full_credit_seed_window_percentile=0.50",
         f"algorithm.branch_revision_grpo.critique_max_response_length={critique_max_response_length}",
@@ -131,7 +140,7 @@ def _extra_args(
         "trainer.critic_warmup=0",
         "trainer.logger=[file]",
         "trainer.project_name=branch_revision_grpo_smoke",
-        f"trainer.experiment_name=branch_revision_{loss_mode}_{learnability_logprob_statistic}",
+        f"trainer.experiment_name=branch_revision_{loss_mode}_{learnability_logprob_statistic}_{learnability_threshold_mode}",
         f"trainer.default_local_dir={remote_evidence}/checkpoints",
         "trainer.total_training_steps=1",
         "trainer.total_epochs=1",
@@ -150,6 +159,8 @@ def _extra_args(
         f"+branch_revision_smoke.model_path={model_path}",
         f"+branch_revision_smoke.loss_mode={loss_mode}",
         f"+branch_revision_smoke.learnability_logprob_statistic={learnability_logprob_statistic}",
+        f"+branch_revision_smoke.learnability_threshold_mode={learnability_threshold_mode}",
+        f"+branch_revision_smoke.max_seed_window_stddevs={max_seed_window_stddevs}",
         f"+branch_revision_smoke.nodes={nodes}",
         f"+branch_revision_smoke.max_prompt_length={max_prompt_length}",
         f"+branch_revision_smoke.max_response_length={max_response_length}",
@@ -176,6 +187,8 @@ def build_command(
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
     learnability_logprob_statistic: str = "mean",
+    learnability_threshold_mode: str = "stddev",
+    max_seed_window_stddevs: float = 15.0,
     nodes: int = 1,
     max_prompt_length: int = 1024,
     max_response_length: int = 2048,
@@ -209,6 +222,10 @@ def build_command(
         raise ValueError("loss_mode must be dppo_tv or vanilla")
     if learnability_logprob_statistic not in {"mean", "min"}:
         raise ValueError("learnability_logprob_statistic must be mean or min")
+    if learnability_threshold_mode not in {"stddev", "percentile"}:
+        raise ValueError("learnability_threshold_mode must be stddev or percentile")
+    if not math.isfinite(max_seed_window_stddevs) or max_seed_window_stddevs < 0.0:
+        raise ValueError("max_seed_window_stddevs must be finite and nonnegative")
     if nodes > 2:
         raise ValueError("this interactive-capable smoke launcher supports at most two nodes")
     if max_prompt_length + max_response_length >= max_model_len:
@@ -311,6 +328,8 @@ def build_command(
             model_path=model_path,
             loss_mode=loss_mode,
             learnability_logprob_statistic=learnability_logprob_statistic,
+            learnability_threshold_mode=learnability_threshold_mode,
+            max_seed_window_stddevs=max_seed_window_stddevs,
             nodes=nodes,
             max_prompt_length=max_prompt_length,
             max_response_length=max_response_length,
@@ -350,6 +369,8 @@ def main() -> None:
     parser.add_argument("--model-path", choices=sorted(SUPPORTED_MODEL_PATHS), default=MODEL_PATH)
     parser.add_argument("--loss-mode", choices=("dppo_tv", "vanilla"), default="dppo_tv")
     parser.add_argument("--learnability-logprob-statistic", choices=("mean", "min"), default="mean")
+    parser.add_argument("--learnability-threshold-mode", choices=("stddev", "percentile"), default="stddev")
+    parser.add_argument("--max-seed-window-stddevs", type=float, default=15.0)
     parser.add_argument("--nodes", type=int, default=1)
     parser.add_argument("--max-prompt-length", type=int, default=1024)
     parser.add_argument("--max-response-length", type=int, default=2048)
@@ -414,6 +435,8 @@ def main() -> None:
         model_path=args.model_path,
         loss_mode=args.loss_mode,
         learnability_logprob_statistic=args.learnability_logprob_statistic,
+        learnability_threshold_mode=args.learnability_threshold_mode,
+        max_seed_window_stddevs=args.max_seed_window_stddevs,
         nodes=args.nodes,
         max_prompt_length=args.max_prompt_length,
         max_response_length=args.max_response_length,
@@ -449,6 +472,8 @@ def main() -> None:
             model_path=args.model_path,
             loss_mode=args.loss_mode,
             learnability_logprob_statistic=args.learnability_logprob_statistic,
+            learnability_threshold_mode=args.learnability_threshold_mode,
+            max_seed_window_stddevs=args.max_seed_window_stddevs,
             nodes=args.nodes,
             max_prompt_length=args.max_prompt_length,
             max_response_length=args.max_response_length,

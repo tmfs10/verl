@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import time
@@ -72,6 +73,8 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "num_critiques",
         "loss_mode",
         "learnability_logprob_statistic",
+        "learnability_threshold_mode",
+        "max_seed_window_stddevs",
         "nodes",
         "max_prompt_length",
         "max_response_length",
@@ -96,6 +99,8 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "algorithm.branch_revision_grpo.learnability_logprob_statistic": smoke_contract[
             "learnability_logprob_statistic"
         ],
+        "algorithm.branch_revision_grpo.learnability_threshold_mode": smoke_contract["learnability_threshold_mode"],
+        "algorithm.branch_revision_grpo.max_seed_window_stddevs": smoke_contract["max_seed_window_stddevs"],
         "trainer.nnodes": smoke_contract["nodes"],
         "data.max_prompt_length": smoke_contract["max_prompt_length"],
         "data.max_response_length": smoke_contract["max_response_length"],
@@ -124,6 +129,16 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("branch-revision smoke loss_mode must be dppo_tv or vanilla")
     if smoke_contract["learnability_logprob_statistic"] not in {"mean", "min"}:
         raise ValueError("branch-revision smoke learnability_logprob_statistic must be mean or min")
+    if smoke_contract["learnability_threshold_mode"] not in {"stddev", "percentile"}:
+        raise ValueError("branch-revision smoke learnability_threshold_mode must be stddev or percentile")
+    max_seed_window_stddevs = smoke_contract["max_seed_window_stddevs"]
+    if (
+        not isinstance(max_seed_window_stddevs, int | float)
+        or isinstance(max_seed_window_stddevs, bool)
+        or not math.isfinite(float(max_seed_window_stddevs))
+        or float(max_seed_window_stddevs) < 0.0
+    ):
+        raise ValueError("branch-revision smoke max_seed_window_stddevs must be finite and nonnegative")
     if smoke_contract["n_samples"] < 2:
         raise ValueError("branch-revision smoke n_samples must be at least 2 for a GRPO acceptance group")
     if smoke_contract["num_critiques"] < 2:

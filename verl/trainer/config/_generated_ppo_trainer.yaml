@@ -728,6 +728,8 @@ algorithm:
     num_positive_critiques: 4
     positive_compression_target: 0.25
     learnability_logprob_statistic: mean
+    learnability_threshold_mode: stddev
+    max_seed_window_stddevs: 15.0
     min_seed_window_percentile: 0.2
     full_credit_seed_window_percentile: 0.5
     critique_max_response_length: 8192
