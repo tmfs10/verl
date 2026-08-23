@@ -132,6 +132,23 @@ def test_rendered_smoke_supports_two_node_32k_context_and_8k_answers(tmp_path: P
     assert "--partition interactive" in rendered
 
 
+def test_rendered_smoke_allows_four_nodes_only_on_normal_partitions(tmp_path: Path) -> None:
+    common = {
+        "run_tag": "four-node-reproduction",
+        "dry_run": False,
+        "python": Path("/python"),
+        "launcher": Path("/launcher"),
+        "verl_root": Path("/verl"),
+        "reward_file": Path("/reward.py"),
+        "config_dir": tmp_path,
+        "nodes": 4,
+    }
+    command, _ = build_command(**common)
+    assert "--nodes 4" in " ".join(command)
+    with pytest.raises(ValueError, match="interactive.*at most two nodes"):
+        build_command(**common, partition="interactive")
+
+
 def test_rendered_smoke_can_select_native_clipped_ppo(tmp_path: Path) -> None:
     command, _ = build_command(
         run_tag="vanilla",
@@ -196,7 +213,7 @@ def test_rendered_smoke_can_select_percentile_learnability(tmp_path: Path) -> No
         ({"max_seed_window_stddevs": -1.0}, "max_seed_window_stddevs"),
         ({"training_steps": 0}, "training_steps"),
         ({"partition": "batch_block1"}, "partition must be interactive"),
-        ({"nodes": 3}, "at most two nodes"),
+        ({"nodes": 5}, "at most four nodes"),
         ({"max_model_len": 3072}, "must be smaller than max_model_len"),
         ({"max_tokens_per_gpu": 2048}, "must fit one maximum-length original"),
     ],

@@ -231,10 +231,12 @@ def build_command(
         raise ValueError("learnability_threshold_mode must be stddev or percentile")
     if not math.isfinite(max_seed_window_stddevs) or max_seed_window_stddevs < 0.0:
         raise ValueError("max_seed_window_stddevs must be finite and nonnegative")
-    if nodes > 2:
-        raise ValueError("this interactive-capable smoke launcher supports at most two nodes")
+    if nodes > 4:
+        raise ValueError("branch-revision smoke supports at most four nodes")
     if partition not in {None, "interactive"}:
         raise ValueError("branch-revision smoke partition must be interactive when explicitly selected")
+    if partition == "interactive" and nodes > 2:
+        raise ValueError("OCI-IAD interactive branch-revision smoke supports at most two nodes")
     if max_prompt_length + max_response_length >= max_model_len:
         raise ValueError("max_prompt_length + max_response_length must be smaller than max_model_len")
     if critique_max_response_length >= max_model_len:

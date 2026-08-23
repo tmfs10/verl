@@ -78,6 +78,9 @@ python3 -m smoke_tests.branch_revision_grpo.submit_oci_iad dry-run \
 Use `--training-steps 5` for prompt-logprob memory acceptance. A one-step cell
 does not exercise the higher structured-edit compliance observed after policy
 updates and is not sufficient evidence against prompt-logprob OOMs.
+The `interactive` partition is limited to at most two nodes. An unchanged
+four-node reproduction may omit `--partition`; it then uses the configured
+normal OCI-IAD batch partitions.
 
 The launcher derives an execution-only cluster YAML from the authoritative OCI-IAD configuration, targets the previously authorized `iad-2` SSH route, uses the validated shared VeRL image, explicitly disables requeue, disables W&B, and stores all runtime artifacts under `/home/siddjain/data` locally and `/output/smoke_tests/branch_revision_grpo` remotely.
 

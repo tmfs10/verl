@@ -145,8 +145,8 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("branch-revision smoke n_samples must be at least 2 for a GRPO acceptance group")
     if smoke_contract["num_critiques"] < 2:
         raise ValueError("branch-revision smoke num_critiques must be at least 2 for GRPO")
-    if smoke_contract["nodes"] > 2:
-        raise ValueError("branch-revision smoke supports at most two nodes")
+    if smoke_contract["nodes"] > 4:
+        raise ValueError("branch-revision smoke supports at most four nodes")
     if smoke_contract["max_prompt_length"] + smoke_contract["max_response_length"] >= smoke_contract["max_model_len"]:
         raise ValueError("branch-revision smoke prompt plus response must be smaller than model context")
     if smoke_contract["max_tokens_per_gpu"] < (
