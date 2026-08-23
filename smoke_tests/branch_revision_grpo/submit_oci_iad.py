@@ -65,6 +65,7 @@ def _extra_args(
     max_model_len: int = 8192,
     critique_max_response_length: int = 2560,
     max_tokens_per_gpu: int = 8192,
+    training_steps: int = 1,
 ) -> str:
     if loss_mode not in {"dppo_tv", "vanilla"}:
         raise ValueError("loss_mode must be dppo_tv or vanilla")
@@ -142,7 +143,7 @@ def _extra_args(
         "trainer.project_name=branch_revision_grpo_smoke",
         f"trainer.experiment_name=branch_revision_{loss_mode}_{learnability_logprob_statistic}_{learnability_threshold_mode}",
         f"trainer.default_local_dir={remote_evidence}/checkpoints",
-        "trainer.total_training_steps=1",
+        f"trainer.total_training_steps={training_steps}",
         "trainer.total_epochs=1",
         "trainer.val_before_train=false",
         "trainer.save_freq=-1",
@@ -167,6 +168,7 @@ def _extra_args(
         f"+branch_revision_smoke.max_model_len={max_model_len}",
         f"+branch_revision_smoke.critique_max_response_length={critique_max_response_length}",
         f"+branch_revision_smoke.max_tokens_per_gpu={max_tokens_per_gpu}",
+        f"+branch_revision_smoke.training_steps={training_steps}",
     ]
     return " ".join(overrides)
 
@@ -195,6 +197,7 @@ def build_command(
     max_model_len: int = 8192,
     critique_max_response_length: int = 2560,
     max_tokens_per_gpu: int = 8192,
+    training_steps: int = 1,
 ) -> tuple[list[str], str]:
     positive = {
         "n_prompts": n_prompts,
@@ -206,6 +209,7 @@ def build_command(
         "max_model_len": max_model_len,
         "critique_max_response_length": critique_max_response_length,
         "max_tokens_per_gpu": max_tokens_per_gpu,
+        "training_steps": training_steps,
     }
     for name, value in positive.items():
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -336,6 +340,7 @@ def build_command(
             max_model_len=max_model_len,
             critique_max_response_length=critique_max_response_length,
             max_tokens_per_gpu=max_tokens_per_gpu,
+            training_steps=training_steps,
         ),
     ]
     if dry_run:
@@ -377,6 +382,7 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--critique-max-response-length", type=int, default=2560)
     parser.add_argument("--max-tokens-per-gpu", type=int, default=8192)
+    parser.add_argument("--training-steps", type=int, default=1)
     args = parser.parse_args()
 
     local_run_dir = args.local_run_dir.expanduser().resolve()
@@ -443,6 +449,7 @@ def main() -> None:
         max_model_len=args.max_model_len,
         critique_max_response_length=args.critique_max_response_length,
         max_tokens_per_gpu=args.max_tokens_per_gpu,
+        training_steps=args.training_steps,
     )
     git = _git_provenance(repo_root)
     provenance = {
@@ -480,6 +487,7 @@ def main() -> None:
             max_model_len=args.max_model_len,
             critique_max_response_length=args.critique_max_response_length,
             max_tokens_per_gpu=args.max_tokens_per_gpu,
+            training_steps=args.training_steps,
         )
         result = _run(dry_command, local_run_dir / "dry_run.log")
         if result.returncode:

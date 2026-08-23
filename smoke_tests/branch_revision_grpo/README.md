@@ -66,12 +66,17 @@ python3 -m smoke_tests.branch_revision_grpo.submit_oci_iad dry-run \
   --nodes 2 --max-prompt-length 2048 --max-response-length 8192 \
   --critique-max-response-length 8192 --max-model-len 32768 \
   --max-tokens-per-gpu 32768 \
+  --training-steps 5 \
   --loss-mode dppo_tv --learnability-logprob-statistic mean \
   --learnability-threshold-mode stddev --max-seed-window-stddevs 15
 
 # Repeat the identical arguments with action `submit`, then use the standard
 # status, collect, verify-integrity, and verify actions above.
 ```
+
+Use `--training-steps 5` for prompt-logprob memory acceptance. A one-step cell
+does not exercise the higher structured-edit compliance observed after policy
+updates and is not sufficient evidence against prompt-logprob OOMs.
 
 The launcher derives an execution-only cluster YAML from the authoritative OCI-IAD configuration, targets the previously authorized `iad-2` SSH route, uses the validated shared VeRL image, explicitly disables requeue, disables W&B, and stores all runtime artifacts under `/home/siddjain/data` locally and `/output/smoke_tests/branch_revision_grpo` remotely.
 

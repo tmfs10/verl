@@ -39,7 +39,6 @@ EXPECTED = {
     "actor_rollout_ref.actor.ppo_epochs": 1,
     "algorithm.branch_revision_grpo.min_continuation_tokens": 128,
     "trainer.n_gpus_per_node": 8,
-    "trainer.total_training_steps": 1,
     "trainer.val_before_train": False,
     "trainer.save_freq": -1,
     "trainer.test_freq": -1,
@@ -81,6 +80,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "max_model_len",
         "critique_max_response_length",
         "max_tokens_per_gpu",
+        "training_steps",
     }
     if set(smoke_contract) != required_contract:
         raise ValueError(
@@ -108,6 +108,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "algorithm.branch_revision_grpo.critique_max_response_length": smoke_contract["critique_max_response_length"],
         "actor_rollout_ref.actor.ppo_max_token_len_per_gpu": smoke_contract["max_tokens_per_gpu"],
         "actor_rollout_ref.rollout.max_num_batched_tokens": smoke_contract["max_tokens_per_gpu"],
+        "trainer.total_training_steps": smoke_contract["training_steps"],
     }
     for name in (
         "n_prompts",
@@ -119,6 +120,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "max_model_len",
         "critique_max_response_length",
         "max_tokens_per_gpu",
+        "training_steps",
     ):
         value = smoke_contract[name]
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:

@@ -112,6 +112,7 @@ def test_rendered_smoke_supports_two_node_32k_context_and_8k_answers(tmp_path: P
         max_model_len=32768,
         critique_max_response_length=8192,
         max_tokens_per_gpu=32768,
+        training_steps=5,
     )
     rendered = " ".join(command)
     assert "--nodes 2" in rendered
@@ -125,6 +126,8 @@ def test_rendered_smoke_supports_two_node_32k_context_and_8k_answers(tmp_path: P
     assert "algorithm.branch_revision_grpo.critique_max_response_length=8192" in rendered
     assert "algorithm.branch_revision_grpo.num_critiques=2" in rendered
     assert "algorithm.branch_revision_grpo.num_positive_critiques=2" in rendered
+    assert "trainer.total_training_steps=5" in rendered
+    assert "+branch_revision_smoke.training_steps=5" in rendered
 
 
 def test_rendered_smoke_can_select_native_clipped_ppo(tmp_path: Path) -> None:
@@ -189,6 +192,7 @@ def test_rendered_smoke_can_select_percentile_learnability(tmp_path: Path) -> No
         ({"learnability_logprob_statistic": "median"}, "learnability_logprob_statistic"),
         ({"learnability_threshold_mode": "rank"}, "learnability_threshold_mode"),
         ({"max_seed_window_stddevs": -1.0}, "max_seed_window_stddevs"),
+        ({"training_steps": 0}, "training_steps"),
         ({"nodes": 3}, "at most two nodes"),
         ({"max_model_len": 3072}, "must be smaller than max_model_len"),
         ({"max_tokens_per_gpu": 2048}, "must fit one maximum-length original"),
@@ -293,6 +297,7 @@ def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
         "max_model_len": 8192,
         "critique_max_response_length": 2560,
         "max_tokens_per_gpu": 8192,
+        "training_steps": 1,
     }
 
 
