@@ -17,6 +17,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, Optional
 
@@ -43,6 +44,105 @@ CONTROL_METHOD_CONCURRENCY = 16
 PROMPT_LOGPROBS_SLICE_START = "_verl_prompt_logprobs_slice_start"
 
 
+@dataclass
+class PromptLogprobAdmissionPermit:
+    """One weighted prompt-logprob admission owned by a single vLLM server."""
+
+    request_sequence: int
+    prompt_tokens: int
+    charged_tokens: int
+    wait_seconds: float
+    inflight_prompt_tokens_at_grant: int
+    inflight_charged_tokens_at_grant: int
+    oversized: bool
+    released: bool = False
+
+
+class PromptLogprobTokenAdmission:
+    """Bound prompt-logprob prefills by their complete input-token volume.
+
+    Requests larger than the configured capacity are admitted alone. They are
+    charged at capacity so no smaller request can overlap their prefill.
+    """
+
+    def __init__(self, capacity: int):
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError("prompt-logprob admission capacity must be a positive integer")
+        self.capacity = capacity
+        self._condition = asyncio.Condition()
+        self._inflight_prompt_tokens = 0
+        self._inflight_charged_tokens = 0
+        self._oversized_inflight = False
+        self._request_count = 0
+        self._high_water_prompt_tokens = 0
+        self._high_water_charged_tokens = 0
+
+    async def acquire(self, prompt_tokens: int) -> PromptLogprobAdmissionPermit:
+        if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int) or prompt_tokens <= 0:
+            raise ValueError("prompt-logprob admission weight must be a positive integer")
+        started = asyncio.get_running_loop().time()
+        oversized = prompt_tokens > self.capacity
+        charged_tokens = min(prompt_tokens, self.capacity)
+        async with self._condition:
+            await self._condition.wait_for(
+                lambda: (
+                    self._inflight_charged_tokens == 0
+                    if oversized
+                    else (
+                        not self._oversized_inflight and self._inflight_charged_tokens + charged_tokens <= self.capacity
+                    )
+                )
+            )
+            self._request_count += 1
+            self._inflight_prompt_tokens += prompt_tokens
+            self._inflight_charged_tokens += charged_tokens
+            self._oversized_inflight = oversized
+            self._high_water_prompt_tokens = max(
+                self._high_water_prompt_tokens,
+                self._inflight_prompt_tokens,
+            )
+            self._high_water_charged_tokens = max(
+                self._high_water_charged_tokens,
+                self._inflight_charged_tokens,
+            )
+            return PromptLogprobAdmissionPermit(
+                request_sequence=self._request_count,
+                prompt_tokens=prompt_tokens,
+                charged_tokens=charged_tokens,
+                wait_seconds=asyncio.get_running_loop().time() - started,
+                inflight_prompt_tokens_at_grant=self._inflight_prompt_tokens,
+                inflight_charged_tokens_at_grant=self._inflight_charged_tokens,
+                oversized=oversized,
+            )
+
+    async def release(self, permit: PromptLogprobAdmissionPermit) -> dict[str, int | float | bool]:
+        async with self._condition:
+            if permit.released:
+                raise RuntimeError("prompt-logprob admission permit was released twice")
+            permit.released = True
+            self._inflight_prompt_tokens -= permit.prompt_tokens
+            self._inflight_charged_tokens -= permit.charged_tokens
+            if self._inflight_prompt_tokens < 0 or self._inflight_charged_tokens < 0:
+                raise RuntimeError("prompt-logprob admission counters became negative")
+            if permit.oversized:
+                if self._inflight_prompt_tokens != 0 or self._inflight_charged_tokens != 0:
+                    raise RuntimeError("oversized prompt-logprob request overlapped another prefill")
+                self._oversized_inflight = False
+            self._condition.notify_all()
+            return {
+                "capacity": self.capacity,
+                "request_sequence": permit.request_sequence,
+                "prompt_tokens": permit.prompt_tokens,
+                "charged_tokens": permit.charged_tokens,
+                "wait_seconds": permit.wait_seconds,
+                "inflight_prompt_tokens_at_grant": permit.inflight_prompt_tokens_at_grant,
+                "inflight_charged_tokens_at_grant": permit.inflight_charged_tokens_at_grant,
+                "high_water_prompt_tokens": self._high_water_prompt_tokens,
+                "high_water_charged_tokens": self._high_water_charged_tokens,
+                "oversized": permit.oversized,
+            }
+
+
 def extract_chosen_prompt_log_probs(
     prompt_token_ids: Sequence[int],
     prompt_logprobs: Sequence[Mapping[int, Any] | None],
@@ -52,7 +152,7 @@ def extract_chosen_prompt_log_probs(
     """Extract the observed token's prompt log probability from a vLLM result.
 
     vLLM returns one mapping per prompt position. The observed prompt token is
-    guaranteed to be present even when only one top alternative is requested.
+    guaranteed to be present even when zero top alternatives are requested.
     The first prompt token may have no conditional log probability.
     """
 
@@ -76,9 +176,7 @@ def extract_chosen_prompt_log_probs(
             continue
         token_id = token_ids[position]
         if token_id not in candidates:
-            raise RuntimeError(
-                f"vLLM prompt log probabilities omit observed token {token_id} at position {position}"
-            )
+            raise RuntimeError(f"vLLM prompt log probabilities omit observed token {token_id} at position {position}")
         value = candidates[token_id]
         log_prob = float(getattr(value, "logprob", value))
         if not math.isfinite(log_prob):

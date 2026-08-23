@@ -44,6 +44,7 @@ from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import (
     PROMPT_LOGPROBS_SLICE_START,
+    PromptLogprobTokenAdmission,
     RolloutMode,
     RolloutReplica,
     TokenOutput,
@@ -196,6 +197,11 @@ class vLLMHttpServer:
         self.node_rank = node_rank
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
+        self._prompt_logprob_admission = (
+            PromptLogprobTokenAdmission(self.config.prompt_logprob_max_inflight_tokens)
+            if self.config.prompt_logprob_max_inflight_tokens is not None
+            else None
+        )
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
 
@@ -603,8 +609,7 @@ class vLLMHttpServer:
                 raise ValueError(f"{PROMPT_LOGPROBS_SLICE_START} must be an integer")
             if not 0 <= prompt_log_prob_start <= len(prompt_ids):
                 raise ValueError(
-                    f"{PROMPT_LOGPROBS_SLICE_START}={prompt_log_prob_start} is outside "
-                    f"prompt length {len(prompt_ids)}"
+                    f"{PROMPT_LOGPROBS_SLICE_START}={prompt_log_prob_start} is outside prompt length {len(prompt_ids)}"
                 )
             if "prompt_logprobs" not in sampling_params:
                 raise ValueError(f"{PROMPT_LOGPROBS_SLICE_START} requires prompt_logprobs")
@@ -663,23 +668,43 @@ class vLLMHttpServer:
                     lora_name=VLLM_LORA_NAME, lora_int_id=VLLM_LORA_INT_ID, lora_path=VLLM_LORA_PATH
                 )
 
-        generator = self.engine.generate(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            lora_request=lora_request,
-            priority=priority,
-        )
+        prompt_logprob_permit = None
+        prompt_logprob_admission = None
+        if sampling_params.prompt_logprobs is not None and self._prompt_logprob_admission is not None:
+            prompt_logprob_permit = await self._prompt_logprob_admission.acquire(len(prompt_ids))
 
-        # Get final response
+        # Get final response. Extract the selected prompt slice as soon as vLLM
+        # exposes it so the full prompt-logprob structure and its admission
+        # budget are not retained through suffix decoding.
         final_res: Optional[RequestOutput] = None
-        returned_prompt_logprobs = None
-        returned_prompt_token_ids = None
-        async for output in generator:
-            final_res = output
-            if getattr(output, "prompt_logprobs", None) is not None:
-                returned_prompt_logprobs = output.prompt_logprobs
-                returned_prompt_token_ids = getattr(output, "prompt_token_ids", None)
+        prompt_log_prob_token_ids = None
+        prompt_log_probs = None
+        try:
+            generator = self.engine.generate(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                lora_request=lora_request,
+                priority=priority,
+            )
+            async for output in generator:
+                final_res = output
+                returned_prompt_logprobs = getattr(output, "prompt_logprobs", None)
+                if returned_prompt_logprobs is not None and prompt_log_probs is None:
+                    returned_prompt_token_ids = getattr(output, "prompt_token_ids", None)
+                    if returned_prompt_token_ids is None:
+                        returned_prompt_token_ids = prompt_ids
+                    slice_start = 0 if prompt_log_prob_start is None else prompt_log_prob_start
+                    prompt_log_prob_token_ids, prompt_log_probs = extract_chosen_prompt_log_probs(
+                        returned_prompt_token_ids,
+                        returned_prompt_logprobs,
+                        start=slice_start,
+                    )
+                    if prompt_logprob_permit is not None and not prompt_logprob_permit.released:
+                        prompt_logprob_admission = await self._prompt_logprob_admission.release(prompt_logprob_permit)
+        finally:
+            if prompt_logprob_permit is not None and not prompt_logprob_permit.released:
+                prompt_logprob_admission = await self._prompt_logprob_admission.release(prompt_logprob_permit)
         assert final_res is not None
 
         token_ids = final_res.outputs[0].token_ids
@@ -687,20 +712,9 @@ class vLLMHttpServer:
         if sampling_params.logprobs is not None:
             log_probs = [logprobs[token_ids[i]].logprob for i, logprobs in enumerate(final_res.outputs[0].logprobs)]
 
-        prompt_log_prob_token_ids = None
-        prompt_log_probs = None
         if sampling_params.prompt_logprobs is not None:
-            if returned_prompt_logprobs is None:
+            if prompt_log_probs is None or prompt_log_prob_token_ids is None:
                 raise RuntimeError("vLLM did not return requested prompt log probabilities")
-            result_prompt_ids = returned_prompt_token_ids
-            if result_prompt_ids is None:
-                result_prompt_ids = prompt_ids
-            slice_start = 0 if prompt_log_prob_start is None else prompt_log_prob_start
-            prompt_log_prob_token_ids, prompt_log_probs = extract_chosen_prompt_log_probs(
-                result_prompt_ids,
-                returned_prompt_logprobs,
-                start=slice_start,
-            )
 
         routed_experts = None
         if self.config.enable_rollout_routing_replay:
@@ -729,7 +743,18 @@ class vLLMHttpServer:
             routed_experts=routed_experts,
             stop_reason=stop_reason,
             num_preempted=num_preempted,
-            extra_fields={"global_steps": self.global_steps, "finish_reason": finish_reason},
+            extra_fields={
+                "global_steps": self.global_steps,
+                "finish_reason": finish_reason,
+                "prompt_logprob_admission": (
+                    {
+                        **prompt_logprob_admission,
+                        "server_id": f"replica:{self.replica_rank}:node:{self.node_rank}",
+                    }
+                    if prompt_logprob_admission is not None
+                    else None
+                ),
+            },
         )
 
     async def wake_up(self):
@@ -991,9 +1016,7 @@ class vLLMReplica(RolloutReplica):
             try:
                 # create server actor in each node with node affinity and cuda visible devices
                 for node_rank in range(nnodes):
-                    workers = self.workers[
-                        node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node
-                    ]
+                    workers = self.workers[node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node]
                     node_cuda_visible_devices = ",".join(
                         worker_cuda_visible_devices[
                             node_rank * gpus_per_replica_node : (node_rank + 1) * gpus_per_replica_node
@@ -1085,9 +1108,7 @@ class vLLMReplica(RolloutReplica):
                         ).encode("utf-8")
                     ).hexdigest()[:12]
                     service_role = "reward" if self.is_reward_model else "rollout"
-                    service_name = (
-                        f"article_rag_service_{service_role}_{node_id[:8]}_{service_config_hash}"
-                    )
+                    service_name = f"article_rag_service_{service_role}_{node_id[:8]}_{service_config_hash}"
                     sidecar_actor_cls = ray.remote(ArticleRagNodeSidecar)
                     try:
                         self._article_rag_service = ray.get_actor(service_name)
@@ -1122,9 +1143,7 @@ class vLLMReplica(RolloutReplica):
                         "VERL_ARTICLE_RAG_ANSWER_BASE_URL": service_info["answer_api_base"],
                     }
                     self._article_rag_sidecar_env = dict(sidecar_env)
-                    await asyncio.gather(
-                        *[server.set_env_vars.remote(sidecar_env) for server in self.servers]
-                    )
+                    await asyncio.gather(*[server.set_env_vars.remote(sidecar_env) for server in self.servers])
                 return
             except Exception:
                 logger.exception(

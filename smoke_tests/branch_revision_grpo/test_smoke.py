@@ -56,6 +56,8 @@ def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(t
     assert "algorithm.branch_revision_grpo.min_continuation_tokens=128" in rendered
     assert "data.max_response_length=2048" in rendered
     assert "actor_rollout_ref.rollout.max_model_len=8192" in rendered
+    assert "actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens=8192" in rendered
+    assert "actor_rollout_ref.rollout.gpu_memory_utilization=0.6" in rendered
     assert "reward.reward_model.launch_reward_fn_async=false" in rendered
     assert "--enable_wandb" not in command
     assert "--no_requeue" in command
@@ -124,6 +126,8 @@ def test_rendered_smoke_supports_two_node_32k_context_and_8k_answers(tmp_path: P
     assert "data.max_response_length=8192" in rendered
     assert "actor_rollout_ref.rollout.n=8" in rendered
     assert "actor_rollout_ref.rollout.max_model_len=32768" in rendered
+    assert "actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens=8192" in rendered
+    assert "actor_rollout_ref.rollout.gpu_memory_utilization=0.6" in rendered
     assert "algorithm.branch_revision_grpo.critique_max_response_length=8192" in rendered
     assert "algorithm.branch_revision_grpo.num_critiques=2" in rendered
     assert "algorithm.branch_revision_grpo.num_positive_critiques=2" in rendered
@@ -213,6 +217,8 @@ def test_rendered_smoke_can_select_percentile_learnability(tmp_path: Path) -> No
         ({"learnability_logprob_statistic": "median"}, "learnability_logprob_statistic"),
         ({"learnability_threshold_mode": "rank"}, "learnability_threshold_mode"),
         ({"max_seed_window_stddevs": -1.0}, "max_seed_window_stddevs"),
+        ({"prompt_logprob_max_inflight_tokens": 0}, "prompt_logprob_max_inflight_tokens"),
+        ({"gpu_memory_utilization": 1.0}, "gpu_memory_utilization"),
         ({"training_steps": 0}, "training_steps"),
         ({"partition": "batch_block1"}, "partition must be interactive"),
         ({"nodes": 5}, "at most four nodes"),
@@ -258,6 +264,8 @@ def _scaled_runtime_config(tmp_path: Path):
                     "n": 4,
                     "max_model_len": 8192,
                     "max_num_batched_tokens": 8192,
+                    "prompt_logprob_max_inflight_tokens": 8192,
+                    "gpu_memory_utilization": 0.6,
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": -1,
@@ -299,6 +307,9 @@ def _scaled_runtime_config(tmp_path: Path):
                 "logger": ["file"],
                 "rollout_data_dir": None,
             },
+            "ray_kwargs": {
+                "ray_init": {"runtime_env": {"env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}}}
+            },
         }
     )
 
@@ -319,6 +330,8 @@ def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
         "max_model_len": 8192,
         "critique_max_response_length": 2560,
         "max_tokens_per_gpu": 8192,
+        "prompt_logprob_max_inflight_tokens": 8192,
+        "gpu_memory_utilization": 0.6,
         "training_steps": 1,
     }
 
@@ -783,14 +796,160 @@ def _fixture(
     )
 
 
+def _add_prompt_logprob_admission_evidence(root: Path, *, capacity: int = 8192) -> None:
+    config_path = root / "resolved_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["actor_rollout_ref"]["rollout"]["prompt_logprob_max_inflight_tokens"] = capacity
+    _write_json(config_path, config)
+
+    path = _audit_path(root)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    admissions = []
+    request_sequence = 0
+    for event in events:
+        if event["event"] != "learnability":
+            continue
+        request_sequence += 1
+        prompt_tokens = len(event["scoring_prompt_ids"])
+        admission = {
+            "server_id": "replica:0:node:0",
+            "capacity": capacity,
+            "request_sequence": request_sequence,
+            "prompt_tokens": prompt_tokens,
+            "charged_tokens": min(prompt_tokens, capacity),
+            "wait_seconds": 0.0,
+            "inflight_prompt_tokens_at_grant": prompt_tokens,
+            "inflight_charged_tokens_at_grant": min(prompt_tokens, capacity),
+            "high_water_prompt_tokens": prompt_tokens,
+            "high_water_charged_tokens": min(prompt_tokens, capacity),
+            "oversized": prompt_tokens > capacity,
+        }
+        event["prompt_logprob_admission"] = admission
+        admissions.append(admission)
+    assert admissions
+    summary = {
+        "schema_version": events[0]["schema_version"],
+        "attempt_id": events[0]["attempt_id"],
+        "global_step": events[0]["global_step"],
+        "event": "prompt_logprob_admission_summary",
+        "capacity": capacity,
+        "requests": len(admissions),
+        "prompt_tokens": sum(item["prompt_tokens"] for item in admissions),
+        "per_server": {
+            "replica:0:node:0": {
+                "requests": len(admissions),
+                "prompt_tokens": sum(item["prompt_tokens"] for item in admissions),
+                "max_inflight_prompt_tokens": max(item["high_water_prompt_tokens"] for item in admissions),
+                "max_inflight_charged_tokens": max(item["high_water_charged_tokens"] for item in admissions),
+                "max_wait_seconds": 0.0,
+            }
+        },
+    }
+    events.insert(next(index for index, event in enumerate(events) if event["event"] == "actor_batch"), summary)
+    _write_jsonl(path, events)
+    _refresh_attempt_config_hash(root)
+
+
+def _duplicate_fixture_step(root: Path) -> None:
+    config_path = root / "resolved_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["trainer"]["total_training_steps"] = 2
+    _write_json(config_path, config)
+    first_events = [json.loads(line) for line in _audit_path(root).read_text(encoding="utf-8").splitlines()]
+    second_events = [{**event, "global_step": 2} for event in first_events]
+    if not any(event["event"] == "prompt_logprob_admission_summary" for event in second_events):
+        second_events.insert(
+            -2,
+            {
+                "schema_version": second_events[0]["schema_version"],
+                "attempt_id": second_events[0]["attempt_id"],
+                "global_step": 2,
+                "event": "prompt_logprob_admission_summary",
+                "prompt_tokens": 1,
+            },
+        )
+    _write_jsonl(root / "audit" / "attempt_fixture" / "step_00000002.jsonl", second_events)
+    metric_rows = [json.loads(line) for line in (root / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
+    _write_jsonl(root / "metrics.jsonl", [*metric_rows, *[{**row, "step": 2} for row in metric_rows]])
+    _refresh_attempt_config_hash(root)
+
+
 def test_verifier_accepts_complete_live_contract(tmp_path: Path) -> None:
     _fixture(tmp_path)
     result = verify(tmp_path)
     assert result["status"] == "verified"
+
+
+def test_verifier_validates_prompt_logprob_admission_evidence(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    _add_prompt_logprob_admission_evidence(tmp_path)
+    result = verify(tmp_path)
+    assert result["status"] == "verified"
+
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    learnability = next(event for event in events if event["event"] == "learnability")
+    learnability["prompt_logprob_admission"]["high_water_charged_tokens"] = 8193
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="violates the prompt-logprob admission budget"):
+        verify(tmp_path)
+
+
+def test_verifier_requires_and_selects_a_completed_high_pressure_step(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    _duplicate_fixture_step(tmp_path)
+    result = verify(tmp_path)
+    assert result["selected_global_step"] == 2
+    assert len(result["audit_files"]) == 2
+
+    (tmp_path / "audit" / "attempt_fixture" / "step_00000002.jsonl").unlink()
+    with pytest.raises(ValueError, match="do not match the attempt range"):
+        verify(tmp_path)
     assert result["valid_edits"] == 3
     assert result["successful_compression_credit"] == pytest.approx(0.4026955278742087)
     assert result["learnability_threshold_mode"] == "stddev"
     assert result["max_seed_window_stddevs"] == 15.0
+
+
+def test_verifier_checks_admission_evidence_in_every_completed_step(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    _add_prompt_logprob_admission_evidence(tmp_path)
+    _duplicate_fixture_step(tmp_path)
+    second_path = tmp_path / "audit" / "attempt_fixture" / "step_00000002.jsonl"
+    events = [json.loads(line) for line in second_path.read_text(encoding="utf-8").splitlines()]
+    learnability = next(event for event in events if event["event"] == "learnability")
+    learnability["prompt_logprob_admission"]["high_water_charged_tokens"] = 8193
+    _write_jsonl(second_path, events)
+    with pytest.raises(ValueError, match="violates the prompt-logprob admission budget"):
+        verify(tmp_path)
+
+
+def test_verifier_uses_resumed_attempt_step_range(tmp_path: Path) -> None:
+    _fixture(tmp_path)
+    config_path = tmp_path / "resolved_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["trainer"]["total_training_steps"] = 3
+    _write_json(config_path, config)
+
+    attempt_path = tmp_path / "audit" / "attempt_fixture" / "attempt.json"
+    attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+    attempt["starting_global_step"] = 3
+    _write_json(attempt_path, attempt)
+    _refresh_attempt_config_hash(tmp_path)
+
+    first_path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in first_path.read_text(encoding="utf-8").splitlines()]
+    _write_jsonl(
+        first_path.with_name("step_00000003.jsonl"),
+        [{**event, "global_step": 3} for event in events],
+    )
+    first_path.unlink()
+    metric_rows = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text(encoding="utf-8").splitlines()]
+    _write_jsonl(tmp_path / "metrics.jsonl", [{**row, "step": 3} for row in metric_rows])
+
+    result = verify(tmp_path)
+    assert result["selected_global_step"] == 3
+    assert len(result["audit_files"]) == 1
 
 
 def test_verifier_accepts_padding_for_the_full_two_node_data_parallel_world(tmp_path: Path) -> None:
@@ -1099,3 +1258,5 @@ def test_extra_args_contains_no_async_or_critic_training() -> None:
     assert "learnability_windows_per_rollout" not in rendered
     assert "critique_max_response_length=2560" in rendered
     assert "min_continuation_tokens=128" in rendered
+    assert "prompt_logprob_max_inflight_tokens=8192" in rendered
+    assert "gpu_memory_utilization=0.6" in rendered

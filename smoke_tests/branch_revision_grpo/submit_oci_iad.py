@@ -65,6 +65,8 @@ def _extra_args(
     max_model_len: int = 8192,
     critique_max_response_length: int = 2560,
     max_tokens_per_gpu: int = 8192,
+    prompt_logprob_max_inflight_tokens: int = 8192,
+    gpu_memory_utilization: float = 0.6,
     training_steps: int = 1,
 ) -> str:
     if loss_mode not in {"dppo_tv", "vanilla"}:
@@ -75,6 +77,8 @@ def _extra_args(
         raise ValueError("learnability_threshold_mode must be stddev or percentile")
     if not math.isfinite(max_seed_window_stddevs) or max_seed_window_stddevs < 0.0:
         raise ValueError("max_seed_window_stddevs must be finite and nonnegative")
+    if not math.isfinite(gpu_memory_utilization) or not 0.0 < gpu_memory_utilization < 1.0:
+        raise ValueError("gpu_memory_utilization must be finite and inside (0, 1)")
     overrides = [
         "~critic.append_solution_to_prompt",
         "algorithm.adv_estimator=grpo",
@@ -129,7 +133,8 @@ def _extra_args(
         f"actor_rollout_ref.rollout.max_model_len={max_model_len}",
         f"actor_rollout_ref.rollout.max_num_batched_tokens={max_tokens_per_gpu}",
         "actor_rollout_ref.rollout.max_num_seqs=32",
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.7",
+        f"actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens={prompt_logprob_max_inflight_tokens}",
+        f"actor_rollout_ref.rollout.gpu_memory_utilization={gpu_memory_utilization}",
         "actor_rollout_ref.rollout.enforce_eager=true",
         "actor_rollout_ref.rollout.enable_chunked_prefill=true",
         "actor_rollout_ref.rollout.enable_prefix_caching=true",
@@ -168,6 +173,8 @@ def _extra_args(
         f"+branch_revision_smoke.max_model_len={max_model_len}",
         f"+branch_revision_smoke.critique_max_response_length={critique_max_response_length}",
         f"+branch_revision_smoke.max_tokens_per_gpu={max_tokens_per_gpu}",
+        f"+branch_revision_smoke.prompt_logprob_max_inflight_tokens={prompt_logprob_max_inflight_tokens}",
+        f"+branch_revision_smoke.gpu_memory_utilization={gpu_memory_utilization}",
         f"+branch_revision_smoke.training_steps={training_steps}",
     ]
     return " ".join(overrides)
@@ -197,6 +204,8 @@ def build_command(
     max_model_len: int = 8192,
     critique_max_response_length: int = 2560,
     max_tokens_per_gpu: int = 8192,
+    prompt_logprob_max_inflight_tokens: int = 8192,
+    gpu_memory_utilization: float = 0.6,
     training_steps: int = 1,
     partition: str | None = None,
 ) -> tuple[list[str], str]:
@@ -210,6 +219,7 @@ def build_command(
         "max_model_len": max_model_len,
         "critique_max_response_length": critique_max_response_length,
         "max_tokens_per_gpu": max_tokens_per_gpu,
+        "prompt_logprob_max_inflight_tokens": prompt_logprob_max_inflight_tokens,
         "training_steps": training_steps,
     }
     for name, value in positive.items():
@@ -231,6 +241,8 @@ def build_command(
         raise ValueError("learnability_threshold_mode must be stddev or percentile")
     if not math.isfinite(max_seed_window_stddevs) or max_seed_window_stddevs < 0.0:
         raise ValueError("max_seed_window_stddevs must be finite and nonnegative")
+    if not math.isfinite(gpu_memory_utilization) or not 0.0 < gpu_memory_utilization < 1.0:
+        raise ValueError("gpu_memory_utilization must be finite and inside (0, 1)")
     if nodes > 4:
         raise ValueError("branch-revision smoke supports at most four nodes")
     if partition not in {None, "interactive"}:
@@ -344,6 +356,8 @@ def build_command(
             max_model_len=max_model_len,
             critique_max_response_length=critique_max_response_length,
             max_tokens_per_gpu=max_tokens_per_gpu,
+            prompt_logprob_max_inflight_tokens=prompt_logprob_max_inflight_tokens,
+            gpu_memory_utilization=gpu_memory_utilization,
             training_steps=training_steps,
         ),
     ]
@@ -390,6 +404,8 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=8192)
     parser.add_argument("--critique-max-response-length", type=int, default=2560)
     parser.add_argument("--max-tokens-per-gpu", type=int, default=8192)
+    parser.add_argument("--prompt-logprob-max-inflight-tokens", type=int, default=8192)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--training-steps", type=int, default=1)
     parser.add_argument("--partition", choices=("interactive",))
     args = parser.parse_args()
@@ -458,6 +474,8 @@ def main() -> None:
         max_model_len=args.max_model_len,
         critique_max_response_length=args.critique_max_response_length,
         max_tokens_per_gpu=args.max_tokens_per_gpu,
+        prompt_logprob_max_inflight_tokens=args.prompt_logprob_max_inflight_tokens,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         training_steps=args.training_steps,
         partition=args.partition,
     )
@@ -497,6 +515,8 @@ def main() -> None:
             max_model_len=args.max_model_len,
             critique_max_response_length=args.critique_max_response_length,
             max_tokens_per_gpu=args.max_tokens_per_gpu,
+            prompt_logprob_max_inflight_tokens=args.prompt_logprob_max_inflight_tokens,
+            gpu_memory_utilization=args.gpu_memory_utilization,
             training_steps=args.training_steps,
             partition=args.partition,
         )

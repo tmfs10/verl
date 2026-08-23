@@ -35,6 +35,8 @@ from verl.workers.rollout.replica import PROMPT_LOGPROBS_SLICE_START, TokenOutpu
 
 BRANCH_REVISION_AGENT_NAME = "branch_revision_agent"
 BRANCH_REVISION_CHILD_FIELD = "__branch_revision_children__"
+BRANCH_REVISION_SCORE_FIELD = "__branch_revision_score__"
+BRANCH_REVISION_CONTINUATION_FIELD = "__branch_revision_continuation__"
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,26 @@ class BranchRevisionGenerationRecord:
     objective: str
     critiques: tuple[BranchRevisionCritiqueGeneration, ...]
     critique_prompt_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class BranchRevisionScoreGeneration:
+    rollout_id: str
+    critique_index: int
+    prompt_logprob_start: int
+    scored_token_ids: tuple[int, ...]
+    scored_token_log_probs: tuple[float, ...]
+    admission: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class BranchRevisionContinuationGeneration:
+    rollout_id: str
+    critique_index: int
+    token_ids: tuple[int, ...]
+    log_probs: tuple[float, ...]
+    finish_reason: str | None
+    max_tokens: int
 
 
 def _as_int_list(value: Any, name: str) -> list[int]:
@@ -126,7 +148,7 @@ async def _gather_and_drain(
 
 @register(BRANCH_REVISION_AGENT_NAME)
 class BranchRevisionAgentLoop(AgentLoopBase):
-    """Generate IID critiques, parse exact edits, then generate revised suffixes."""
+    """Run one blocking branch-revision critique, score, or continuation phase."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -143,6 +165,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         *,
         max_tokens: int,
         prompt_logprob_start: int | None = None,
+        response_logprobs: bool = True,
     ) -> dict[str, Any]:
         if max_tokens <= 0:
             raise ValueError("branch-revision generation max_tokens must be positive")
@@ -153,7 +176,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         result["top_p"] = 1.0
         result["top_k"] = -1
         result["repetition_penalty"] = 1.0
-        result["logprobs"] = True
+        result["logprobs"] = response_logprobs
         result.pop("prompt_logprobs", None)
         result.pop(PROMPT_LOGPROBS_SLICE_START, None)
         if prompt_logprob_start is not None:
@@ -161,7 +184,9 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 raise ValueError("branch-revision prompt_logprob_start must be an integer")
             if prompt_logprob_start <= 0:
                 raise ValueError("branch-revision prompt_logprob_start must be positive")
-            result["prompt_logprobs"] = 1
+            # Zero requests no alternatives. vLLM still includes the observed
+            # prompt token, which is the only entry learnability scoring needs.
+            result["prompt_logprobs"] = 0
             result[PROMPT_LOGPROBS_SLICE_START] = prompt_logprob_start
         return result
 
@@ -174,6 +199,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         max_tokens: int,
         kind: str,
         prompt_logprob_start: int | None = None,
+        response_logprobs: bool = True,
     ) -> TokenOutput:
         if len(prompt_ids) + max_tokens > self.max_model_len:
             raise ValueError(
@@ -187,6 +213,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 sampling_params,
                 max_tokens=max_tokens,
                 prompt_logprob_start=prompt_logprob_start,
+                response_logprobs=response_logprobs,
             ),
         )
 
@@ -205,8 +232,161 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         value = output.extra_fields.get("finish_reason", output.stop_reason)
         return None if value is None else str(value)
 
+    def _score_only_response(self, output: TokenOutput) -> list[int]:
+        if output.token_ids:
+            return [int(output.token_ids[0])]
+        token_id = self.tokenizer.eos_token_id
+        if token_id is None:
+            token_id = self.tokenizer.pad_token_id
+        if token_id is None:
+            raise RuntimeError("branch-revision score-only output requires a tokenizer EOS or pad token")
+        return [int(token_id)]
+
+    async def _run_score_phase(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        started: float,
+        **kwargs,
+    ) -> AgentLoopOutput:
+        rollout_id = str(kwargs["branch_revision_rollout_id"])
+        critique_index = int(kwargs["branch_revision_critique_index"])
+        route_key = str(kwargs["branch_revision_route_key"])
+        prompt_ids = _as_int_list(kwargs["branch_revision_parent_prompt_ids"], "parent prompt")
+        continuation_prefix_ids = _as_int_list(
+            kwargs["branch_revision_continuation_prefix_ids"],
+            "continuation prefix",
+        )
+        new_continuation_ids = _as_int_list(
+            kwargs["branch_revision_new_continuation_ids"],
+            "new continuation",
+        )
+        scoring_prompt = [*prompt_ids, *continuation_prefix_ids, *new_continuation_ids]
+        prompt_logprob_start = len(prompt_ids) + len(continuation_prefix_ids)
+        output = await self._generate(
+            route_key,
+            scoring_prompt,
+            sampling_params,
+            max_tokens=1,
+            kind=f"score[{critique_index}]",
+            prompt_logprob_start=prompt_logprob_start,
+            response_logprobs=False,
+        )
+        if output.prompt_log_prob_start != prompt_logprob_start:
+            raise RuntimeError("branch-revision score prompt-logprob boundary changed in transit")
+        if (
+            output.prompt_log_prob_token_ids is None
+            or [int(token) for token in output.prompt_log_prob_token_ids] != new_continuation_ids
+        ):
+            raise RuntimeError("branch-revision score prompt log probabilities misalign with replacement tokens")
+        if output.prompt_log_probs is None or len(output.prompt_log_probs) != len(new_continuation_ids):
+            raise RuntimeError("branch-revision score did not return one prompt log probability per replacement token")
+        if any(value is None for value in output.prompt_log_probs):
+            raise RuntimeError("branch-revision replacement token unexpectedly lacks a prompt log probability")
+        normalized = normalize_log_probs_float32(value for value in output.prompt_log_probs if value is not None)
+        admission = output.extra_fields.get("prompt_logprob_admission")
+        if not isinstance(admission, dict):
+            raise RuntimeError("branch-revision score is missing prompt-logprob admission evidence")
+        record = BranchRevisionScoreGeneration(
+            rollout_id=rollout_id,
+            critique_index=critique_index,
+            prompt_logprob_start=prompt_logprob_start,
+            scored_token_ids=tuple(new_continuation_ids),
+            scored_token_log_probs=tuple(float(value) for value in normalized.tolist()),
+            admission=dict(admission),
+        )
+        response_ids = self._score_only_response(output)
+        return AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            response_mask=[0] * len(response_ids),
+            response_logprobs=None,
+            routed_experts=None,
+            multi_modal_data={},
+            num_turns=1,
+            metrics={
+                "generate_sequences": time.monotonic() - started,
+                "tool_calls": 0.0,
+                "num_preempted": int(output.num_preempted or 0),
+            },
+            extra_fields={
+                BRANCH_REVISION_SCORE_FIELD: record,
+                "turn_scores": [],
+                "tool_rewards": [],
+                "stop_reason": "completed",
+                "finish_reason": "branch_revision_score_complete",
+            },
+        )
+
+    async def _run_continuation_phase(
+        self,
+        sampling_params: dict[str, Any],
+        *,
+        started: float,
+        **kwargs,
+    ) -> AgentLoopOutput:
+        rollout_id = str(kwargs["branch_revision_rollout_id"])
+        critique_index = int(kwargs["branch_revision_critique_index"])
+        route_key = str(kwargs["branch_revision_route_key"])
+        prompt_ids = _as_int_list(kwargs["branch_revision_parent_prompt_ids"], "parent prompt")
+        revised_prefix_ids = _as_int_list(
+            kwargs["branch_revision_revised_prefix_ids"],
+            "revised prefix",
+        )
+        max_tokens = int(kwargs["branch_revision_continuation_max_tokens"])
+        if max_tokens < self.feature.min_continuation_tokens:
+            raise ValueError("accepted branch revision lacks its minimum continuation budget")
+        output = await self._generate(
+            route_key,
+            [*prompt_ids, *revised_prefix_ids],
+            sampling_params,
+            max_tokens=max_tokens,
+            kind=f"continuation[{critique_index}]",
+        )
+        token_ids, log_probs = self._validated_output(
+            output,
+            cap=max_tokens,
+            kind=f"continuation[{critique_index}]",
+        )
+        record = BranchRevisionContinuationGeneration(
+            rollout_id=rollout_id,
+            critique_index=critique_index,
+            token_ids=tuple(token_ids),
+            log_probs=tuple(log_probs),
+            finish_reason=self._finish_reason(output),
+            max_tokens=max_tokens,
+        )
+        return AgentLoopOutput(
+            prompt_ids=prompt_ids,
+            response_ids=token_ids,
+            response_mask=[1] * len(token_ids),
+            response_logprobs=log_probs,
+            routed_experts=None,
+            multi_modal_data={},
+            num_turns=1,
+            metrics={
+                "generate_sequences": time.monotonic() - started,
+                "tool_calls": 0.0,
+                "num_preempted": int(output.num_preempted or 0),
+            },
+            extra_fields={
+                BRANCH_REVISION_CONTINUATION_FIELD: record,
+                "turn_scores": [],
+                "tool_rewards": [],
+                "stop_reason": "completed",
+                "finish_reason": "branch_revision_continuation_complete",
+            },
+        )
+
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         started = time.monotonic()
+        phase = str(kwargs.get("branch_revision_phase", "critique"))
+        if phase == "score":
+            return await self._run_score_phase(sampling_params, started=started, **kwargs)
+        if phase == "continuation":
+            return await self._run_continuation_phase(sampling_params, started=started, **kwargs)
+        if phase != "critique":
+            raise ValueError(f"unknown branch-revision child phase {phase!r}")
         rollout_id = str(kwargs["branch_revision_rollout_id"])
         objective = str(kwargs["branch_revision_parent_objective"])
         if objective not in {"recovery", "compression"}:
@@ -273,7 +453,6 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         )
 
         parsed_records: list[dict[str, Any] | None] = [None] * num_critiques
-        continuation_specs: list[tuple[int, int]] = []
         processing_errors: list[str] = []
         num_preempted = 0
         for index, raw_output in enumerate(critique_results):
@@ -328,81 +507,17 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                     "revised_prefix_ids": revised_prefix_ids,
                     "continuation_max_tokens": continuation_max_tokens,
                 }
-                if parse_reason == "valid":
-                    if continuation_max_tokens < self.feature.min_continuation_tokens:
-                        raise RuntimeError("valid branch revision unexpectedly lacks its minimum continuation capacity")
-                    continuation_specs.append((index, continuation_max_tokens))
+                if parse_reason == "valid" and continuation_max_tokens < self.feature.min_continuation_tokens:
+                    raise RuntimeError("valid branch revision unexpectedly lacks its minimum continuation capacity")
             except Exception as error:
                 processing_errors.append(f"critique[{index}]: {error!r}")
         if processing_errors:
             raise RuntimeError(
-                "branch-revision critique validation failed before continuation launch: " + "; ".join(processing_errors)
+                "branch-revision critique validation failed before score launch: " + "; ".join(processing_errors)
             )
         if any(record is None for record in parsed_records):
             raise RuntimeError("branch-revision critique validation did not produce every parsed record")
         complete_records = [record for record in parsed_records if record is not None]
-
-        continuation_indices = [index for index, _ in continuation_specs]
-        continuation_tasks = [
-            asyncio.create_task(
-                self._generate(
-                    f"{rollout_id}:continuation:{index}",
-                    [*prompt_ids, *complete_records[index]["revised_prefix_ids"]],
-                    sampling_params,
-                    max_tokens=max_tokens,
-                    kind=f"continuation[{index}]",
-                    prompt_logprob_start=len(prompt_ids)
-                    + len(complete_records[index]["continuation_prefix_ids"]),
-                )
-            )
-            for index, max_tokens in continuation_specs
-        ]
-
-        continuation_results = await _gather_and_drain(
-            continuation_tasks,
-            phase="continuation",
-            indices=continuation_indices,
-        )
-        for index, raw_output in zip(continuation_indices, continuation_results, strict=True):
-            if not isinstance(raw_output, TokenOutput):
-                raise TypeError(f"continuation[{index}] returned unexpected type {type(raw_output)!r}")
-            num_preempted += int(raw_output.num_preempted or 0)
-            max_tokens = self.response_length - len(complete_records[index]["revised_prefix_ids"])
-            continuation_ids, continuation_log_probs = self._validated_output(
-                raw_output,
-                cap=min(max_tokens, int(complete_records[index]["continuation_max_tokens"])),
-                kind=f"continuation[{index}]",
-            )
-            expected_seed_ids = [int(token) for token in complete_records[index]["new_continuation_ids"]]
-            prompt_seed_ids = raw_output.prompt_log_prob_token_ids
-            prompt_seed_log_probs = raw_output.prompt_log_probs
-            expected_start = len(prompt_ids) + len(complete_records[index]["continuation_prefix_ids"])
-            if raw_output.prompt_log_prob_start != expected_start:
-                raise RuntimeError(
-                    f"continuation[{index}] prompt log-probability slice starts at "
-                    f"{raw_output.prompt_log_prob_start!r}; expected {expected_start}"
-                )
-            if prompt_seed_ids is None or [int(token) for token in prompt_seed_ids] != expected_seed_ids:
-                raise RuntimeError(
-                    f"continuation[{index}] prompt log probabilities are not aligned to replacement tokens"
-                )
-            if prompt_seed_log_probs is None or len(prompt_seed_log_probs) != len(expected_seed_ids):
-                raise RuntimeError(
-                    f"continuation[{index}] did not return one prompt log probability per replacement token"
-                )
-            if any(value is None for value in prompt_seed_log_probs):
-                raise RuntimeError(
-                    f"continuation[{index}] replacement token unexpectedly lacks a prompt log probability"
-                )
-            normalized_seed_log_probs = normalize_log_probs_float32(
-                value for value in prompt_seed_log_probs if value is not None
-            )
-            complete_records[index]["continuation_ids"] = continuation_ids
-            complete_records[index]["continuation_log_probs"] = continuation_log_probs
-            complete_records[index]["continuation_finish_reason"] = self._finish_reason(raw_output)
-            complete_records[index]["new_continuation_log_probs"] = [
-                float(value) for value in normalized_seed_log_probs.tolist()
-            ]
 
         critiques = tuple(
             BranchRevisionCritiqueGeneration(
@@ -446,7 +561,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
             response_logprobs=solution_log_probs,
             routed_experts=None,
             multi_modal_data={},
-            num_turns=3,
+            num_turns=2,
             metrics={
                 "generate_sequences": time.monotonic() - started,
                 "tool_calls": 0.0,

@@ -30,9 +30,13 @@ from omegaconf import OmegaConf
 
 from verl.experimental.agent_loop.branch_revision_agent_loop import (
     BRANCH_REVISION_CHILD_FIELD,
+    BRANCH_REVISION_CONTINUATION_FIELD,
+    BRANCH_REVISION_SCORE_FIELD,
     BranchRevisionAgentLoop,
+    BranchRevisionContinuationGeneration,
     BranchRevisionCritiqueGeneration,
     BranchRevisionGenerationRecord,
+    BranchRevisionScoreGeneration,
     _gather_and_drain,
 )
 from verl.trainer.config import (
@@ -63,6 +67,7 @@ from verl.trainer.ppo.ray_trainer_branch_revision import (
 from verl.workers.actor import dp_actor
 from verl.workers.rollout.replica import (
     PROMPT_LOGPROBS_SLICE_START,
+    PromptLogprobTokenAdmission,
     TokenOutput,
     extract_chosen_prompt_log_probs,
 )
@@ -899,6 +904,7 @@ def _runtime_config(loss_mode="dppo_tv"):
                     "repetition_penalty": 1.0,
                     "calculate_log_probs": False,
                     "max_model_len": 128,
+                    "prompt_logprob_max_inflight_tokens": 8192,
                     "logprobs_mode": "processed_logprobs",
                     "skip_rollout": False,
                     "enable_rollout_routing_replay": False,
@@ -1083,7 +1089,7 @@ def test_child_sampling_always_uses_temperature_one_and_processed_logprobs() -> 
         max_tokens=17,
         prompt_logprob_start=23,
     )
-    assert scored["prompt_logprobs"] == 1
+    assert scored["prompt_logprobs"] == 0
     assert scored[PROMPT_LOGPROBS_SLICE_START] == 23
 
 
@@ -1106,7 +1112,54 @@ def test_extract_chosen_prompt_log_probs_slices_and_checks_observed_tokens() -> 
         extract_chosen_prompt_log_probs(token_ids, [None, {11: -1.0}, {99: -1.0}, {13: -1.0}], start=2)
 
 
-def test_agent_loop_generates_all_critiques_then_one_continuation_per_valid_edit() -> None:
+def test_prompt_logprob_admission_bounds_weighted_inflight_tokens_and_unblocks_waiters() -> None:
+    async def scenario() -> None:
+        admission = PromptLogprobTokenAdmission(8192)
+        first = await admission.acquire(5000)
+        second = await admission.acquire(3192)
+        blocked = asyncio.create_task(admission.acquire(1))
+        await asyncio.sleep(0)
+        assert not blocked.done()
+        first_evidence = await admission.release(first)
+        third = await blocked
+        assert first_evidence["high_water_charged_tokens"] == 8192
+        assert third.inflight_charged_tokens_at_grant == 3193
+        await admission.release(second)
+        await admission.release(third)
+
+    asyncio.run(scenario())
+
+
+def test_prompt_logprob_admission_runs_oversized_requests_alone_and_survives_waiter_cancellation() -> None:
+    async def scenario() -> None:
+        admission = PromptLogprobTokenAdmission(8192)
+        normal = await admission.acquire(1024)
+        oversized_task = asyncio.create_task(admission.acquire(9000))
+        cancelled = asyncio.create_task(admission.acquire(8000))
+        await asyncio.sleep(0)
+        assert not oversized_task.done()
+        assert not cancelled.done()
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        await admission.release(normal)
+        oversized = await oversized_task
+        assert oversized.oversized is True
+        assert oversized.charged_tokens == 8192
+        follower = asyncio.create_task(admission.acquire(1))
+        await asyncio.sleep(0)
+        assert not follower.done()
+        evidence = await admission.release(oversized)
+        assert evidence["prompt_tokens"] == 9000
+        assert evidence["high_water_prompt_tokens"] == 9000
+        await admission.release(await follower)
+        with pytest.raises(RuntimeError, match="released twice"):
+            await admission.release(oversized)
+
+    asyncio.run(scenario())
+
+
+def test_agent_loop_generates_and_parses_all_critiques_without_launching_scores_or_continuations() -> None:
     loop = _loop()
     calls: list[tuple[str, int, float, bool]] = []
 
@@ -1122,17 +1175,7 @@ def test_agent_loop_generates_all_critiques_then_one_continuation_per_valid_edit
         if kind == "critique[1]":
             text = "invalid structure"
             return TokenOutput(token_ids=_ids(text), log_probs=[-0.3] * len(_ids(text)))
-        assert kind == "continuation[0]"
-        assert decode_exact(prompt[-len(_ids("start deadbetter")) :], TOKENIZER) == "start deadbetter"
-        seed_ids = _ids("better")
-        assert prompt_logprob_start == len(prompt) - len(seed_ids)
-        return TokenOutput(
-            token_ids=_ids(" solved"),
-            log_probs=[-0.4] * len(_ids(" solved")),
-            prompt_log_prob_token_ids=seed_ids,
-            prompt_log_probs=[-0.25] * len(seed_ids),
-            prompt_log_prob_start=prompt_logprob_start,
-        )
+        raise AssertionError(f"critique phase unexpectedly launched {kind}")
 
     loop._generate = fake_generate
     solution_ids = _ids("start dead and waste")
@@ -1155,11 +1198,95 @@ def test_agent_loop_generates_all_critiques_then_one_continuation_per_valid_edit
     )
     assert [critique.parse_reason for critique in record.critiques] == ["valid", "tag_count"]
     assert record.objective == "recovery"
-    assert len(record.critiques[0].continuation_ids) > 0
+    assert record.critiques[0].continuation_ids == ()
     assert record.critiques[0].continuation_max_tokens >= loop.feature.min_continuation_tokens
-    assert record.critiques[0].new_continuation_log_probs == pytest.approx([-0.25] * len(_ids("better")))
+    assert record.critiques[0].new_continuation_log_probs == ()
     assert record.critiques[1].continuation_ids == ()
-    assert [call[0] for call in calls] == ["critique[0]", "critique[1]", "continuation[0]"]
+    assert [call[0] for call in calls] == ["critique[0]", "critique[1]"]
+
+
+def test_agent_loop_scores_only_the_replacement_slice_then_generates_suffix_without_prompt_logprobs() -> None:
+    loop = _loop()
+    calls: list[tuple[str, list[int], int | None, bool]] = []
+    admission = {
+        "server_id": "replica:0:node:0",
+        "capacity": 8192,
+        "request_sequence": 1,
+        "prompt_tokens": len(_ids("qstart deadbetter")),
+        "charged_tokens": len(_ids("qstart deadbetter")),
+        "wait_seconds": 0.0,
+        "inflight_prompt_tokens_at_grant": len(_ids("qstart deadbetter")),
+        "inflight_charged_tokens_at_grant": len(_ids("qstart deadbetter")),
+        "high_water_prompt_tokens": len(_ids("qstart deadbetter")),
+        "high_water_charged_tokens": len(_ids("qstart deadbetter")),
+        "oversized": False,
+    }
+
+    async def fake_generate(
+        _route,
+        prompt,
+        _params,
+        *,
+        max_tokens,
+        kind,
+        prompt_logprob_start=None,
+        response_logprobs=True,
+    ):
+        calls.append((kind, list(prompt), prompt_logprob_start, response_logprobs))
+        if kind == "score[0]":
+            seed_ids = _ids("better")
+            assert prompt == _ids("qstart deadbetter")
+            assert max_tokens == 1
+            assert prompt_logprob_start == len(_ids("qstart dead"))
+            assert response_logprobs is False
+            return TokenOutput(
+                token_ids=_ids("x"),
+                prompt_log_prob_token_ids=seed_ids,
+                prompt_log_probs=[-0.25] * len(seed_ids),
+                prompt_log_prob_start=prompt_logprob_start,
+                extra_fields={"prompt_logprob_admission": admission},
+            )
+        assert kind == "continuation[0]"
+        assert prompt == _ids("qstart deadbetter")
+        assert max_tokens == 128
+        assert prompt_logprob_start is None
+        assert response_logprobs is True
+        return TokenOutput(token_ids=_ids(" solved"), log_probs=[-0.4] * len(_ids(" solved")))
+
+    loop._generate = fake_generate
+    score_output = asyncio.run(
+        loop.run(
+            {},
+            branch_revision_phase="score",
+            branch_revision_rollout_id="p:0",
+            branch_revision_critique_index=0,
+            branch_revision_route_key="p:0:revision:0",
+            branch_revision_parent_prompt_ids=_ids("q"),
+            branch_revision_continuation_prefix_ids=_ids("start dead"),
+            branch_revision_new_continuation_ids=_ids("better"),
+        )
+    )
+    score = score_output.extra_fields[BRANCH_REVISION_SCORE_FIELD]
+    assert score.scored_token_ids == tuple(_ids("better"))
+    assert score.scored_token_log_probs == pytest.approx([-0.25] * len(_ids("better")))
+    assert score.admission == admission
+
+    continuation_output = asyncio.run(
+        loop.run(
+            {},
+            branch_revision_phase="continuation",
+            branch_revision_rollout_id="p:0",
+            branch_revision_critique_index=0,
+            branch_revision_route_key="p:0:revision:0",
+            branch_revision_parent_prompt_ids=_ids("q"),
+            branch_revision_revised_prefix_ids=_ids("start deadbetter"),
+            branch_revision_continuation_max_tokens=128,
+        )
+    )
+    continuation = continuation_output.extra_fields[BRANCH_REVISION_CONTINUATION_FIELD]
+    assert continuation.token_ids == tuple(_ids(" solved"))
+    assert continuation.log_probs == pytest.approx([-0.4] * len(_ids(" solved")))
+    assert [call[0] for call in calls] == ["score[0]", "continuation[0]"]
 
 
 def test_agent_loop_gives_block_breaking_edits_no_continuation_path() -> None:
@@ -1293,7 +1420,7 @@ def test_agent_loop_drains_all_sibling_failures_before_raising() -> None:
     assert sorted(completed) == ["critique[0]", "critique[1]"]
 
 
-def test_agent_loop_validates_every_critique_before_launching_continuations() -> None:
+def test_agent_loop_validates_every_critique_before_returning_score_candidates() -> None:
     loop = _loop()
     calls: list[str] = []
 
@@ -1305,11 +1432,11 @@ def test_agent_loop_validates_every_critique_before_launching_continuations() ->
             return TokenOutput(token_ids=_ids(text), log_probs=[-0.2] * len(_ids(text)))
         if kind == "critique[1]":
             return TokenOutput(token_ids=_ids("broken"), log_probs=None)
-        raise AssertionError("a continuation launched before every critique passed validation")
+        raise AssertionError("a score launched inside the critique phase")
 
     loop._generate = fake_generate
     solution_ids = _ids("start dead and waste")
-    with pytest.raises(RuntimeError, match="before continuation launch"):
+    with pytest.raises(RuntimeError, match="before score launch"):
         asyncio.run(
             loop.run(
                 {},
@@ -1363,7 +1490,11 @@ def _controller() -> BranchRevisionGRPOController:
                     "clip_ratio_high": None,
                     "clip_ratio_c": 3.0,
                 },
-                "rollout": {"n": 2, "max_model_len": 2048},
+                "rollout": {
+                    "n": 2,
+                    "max_model_len": 2048,
+                    "prompt_logprob_max_inflight_tokens": 8192,
+                },
             },
             "trainer": {"balance_batch": False},
         }
@@ -1476,6 +1607,23 @@ def _critique(text: str, *, valid: bool, continuation: str = "") -> BranchRevisi
     )
 
 
+def _admission_evidence(bundle: _Bundle, critique: BranchRevisionCritiqueGeneration) -> dict[str, object]:
+    prompt_tokens = len(bundle.prompt_ids) + len(critique.continuation_prefix_ids) + len(critique.new_continuation_ids)
+    return {
+        "server_id": "replica:0:node:0",
+        "capacity": 8192,
+        "request_sequence": 1,
+        "prompt_tokens": prompt_tokens,
+        "charged_tokens": prompt_tokens,
+        "wait_seconds": 0.0,
+        "inflight_prompt_tokens_at_grant": prompt_tokens,
+        "inflight_charged_tokens_at_grant": prompt_tokens,
+        "high_water_prompt_tokens": prompt_tokens,
+        "high_water_charged_tokens": prompt_tokens,
+        "oversized": False,
+    }
+
+
 def _learnability(*, percentile: float = 1.0, weight: float = 1.0, accepted: bool = True) -> LearnabilityScore:
     return LearnabilityScore(
         logprob_statistic="mean",
@@ -1541,6 +1689,7 @@ def test_controller_uses_configured_minimum_logprob_statistic() -> None:
             tuple(_ids("prompt")),
         ),
     )
+    bundle.score_admissions[0] = _admission_evidence(bundle, valid)
     controller._score_seed_learnability([bundle])
     assert bundle.learnability[0].logprob_statistic == "min"
     assert bundle.learnability[0].seed_score == pytest.approx(-0.75)
@@ -1830,7 +1979,7 @@ def test_child_request_selects_correct_rollouts_only_when_positive_compression_i
 def test_low_learnability_edit_is_not_rewarded_or_solution_trained(monkeypatch) -> None:
     controller = _controller()
     source, _ = _source_batch()
-    valid = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    valid = _critique(_structured("dead", "better"), valid=True)
     invalid = _critique("invalid", valid=False)
     rejected = _Bundle(
         source_row=0,
@@ -1904,7 +2053,10 @@ def test_full_controller_update_critiques_only_incorrect_and_trains_one_combined
     controller.config.actor_rollout_ref.rollout.prompt_length = 8
     controller.config.actor_rollout_ref.rollout.response_length = 256
     source, original_rewards = _source_batch()
-    valid = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    valid = replace(
+        _critique(_structured("dead", "better"), valid=True),
+        new_continuation_log_probs=(),
+    )
     invalid = _critique("invalid", valid=False)
     record = BranchRevisionGenerationRecord(
         "p:0",
@@ -1919,7 +2071,48 @@ def test_full_controller_update_critiques_only_incorrect_and_trains_one_combined
     child_output = DataProto.from_dict(
         tensors={"responses": torch.ones((1, 1), dtype=torch.long)},
         non_tensors={BRANCH_REVISION_CHILD_FIELD: child_values},
-        meta_info={"timing": {"child_internal": 0.25}},
+        meta_info={"timing": {"generate_sequences": 0.25}},
+    )
+    prompt_tokens = len(_ids("qstart deadbetter"))
+    score_values = np.empty(1, dtype=object)
+    score_values[0] = BranchRevisionScoreGeneration(
+        rollout_id="p:0",
+        critique_index=0,
+        prompt_logprob_start=len(_ids("qstart dead")),
+        scored_token_ids=tuple(_ids("better")),
+        scored_token_log_probs=tuple([-0.05] * len(_ids("better"))),
+        admission={
+            "server_id": "replica:0:node:0",
+            "capacity": 8192,
+            "request_sequence": 1,
+            "prompt_tokens": prompt_tokens,
+            "charged_tokens": prompt_tokens,
+            "wait_seconds": 0.0,
+            "inflight_prompt_tokens_at_grant": prompt_tokens,
+            "inflight_charged_tokens_at_grant": prompt_tokens,
+            "high_water_prompt_tokens": prompt_tokens,
+            "high_water_charged_tokens": prompt_tokens,
+            "oversized": False,
+        },
+    )
+    score_output = DataProto.from_dict(
+        tensors={"responses": torch.ones((1, 1), dtype=torch.long)},
+        non_tensors={BRANCH_REVISION_SCORE_FIELD: score_values},
+        meta_info={"timing": {"generate_sequences": 0.125}},
+    )
+    continuation_values = np.empty(1, dtype=object)
+    continuation_values[0] = BranchRevisionContinuationGeneration(
+        rollout_id="p:0",
+        critique_index=0,
+        token_ids=tuple(_ids(" solved")),
+        log_probs=tuple([-0.3] * len(_ids(" solved"))),
+        finish_reason="stop",
+        max_tokens=128,
+    )
+    continuation_output = DataProto.from_dict(
+        tensors={"responses": torch.ones((1, 1), dtype=torch.long)},
+        non_tensors={BRANCH_REVISION_CONTINUATION_FIELD: continuation_values},
+        meta_info={"timing": {"generate_sequences": 0.5}},
     )
     events: list[str] = []
     captured: dict[str, object] = {}
@@ -1929,6 +2122,18 @@ def test_full_controller_update_critiques_only_incorrect_and_trains_one_combined
         captured["batch"] = batch
         return DataProto(meta_info={"metrics": {"actor/pg_loss": [0.5]}})
 
+    def generate_sequences(request):
+        phase = request.non_tensor_batch["branch_revision_phase"].tolist()
+        assert len(set(phase)) == 1
+        events.append(f"generate_{phase[0]}")
+        if phase[0] == "critique":
+            return child_output
+        if phase[0] == "score":
+            return score_output
+        if phase[0] == "continuation":
+            return continuation_output
+        raise AssertionError(f"unexpected child phase {phase!r}")
+
     controller.trainer = SimpleNamespace(
         global_steps=1,
         actor_rollout_wg=SimpleNamespace(world_size=2),
@@ -1937,7 +2142,7 @@ def test_full_controller_update_critiques_only_incorrect_and_trains_one_combined
             sleep_replicas=lambda: events.append("sleep"),
         ),
         async_rollout_manager=SimpleNamespace(
-            generate_sequences=lambda request: events.append("generate") or child_output,
+            generate_sequences=generate_sequences,
             start_profile=lambda: events.append("start_profile"),
             stop_profile=lambda: events.append("stop_profile"),
         ),
@@ -1957,14 +2162,23 @@ def test_full_controller_update_critiques_only_incorrect_and_trains_one_combined
     metrics: dict[str, float] = {}
     timing: dict[str, float] = {}
     assert controller.run_update(source, original_rewards, metrics, timing)
-    assert events == ["restore", "generate", "sleep", "update_actor"]
+    assert events == [
+        "restore",
+        "generate_critique",
+        "generate_score",
+        "generate_continuation",
+        "sleep",
+        "update_actor",
+    ]
     assert metrics["branch_revision/incorrect_originals"] == 1.0
     assert metrics["branch_revision/critiques"] == 2.0
     assert metrics["branch_revision/continuations"] == 1.0
     assert metrics["branch_revision/flip/success_per_all_critiques"] == 0.5
     assert metrics["branch_revision/flip/success_per_valid_continuation"] == 1.0
     assert metrics["branch_revision/flip/success_per_continuation"] == 1.0
-    assert timing["child_internal"] == 0.25
+    assert timing["branch_revision_critique/generate_sequences"] == 0.25
+    assert timing["branch_revision_score/generate_sequences"] == 0.125
+    assert timing["branch_revision_continuation/generate_sequences"] == 0.5
     actor_batch = captured["batch"]
     assert actor_batch.non_tensor_batch["branch_revision_actor_kind"].tolist().count("critique") == 2
     assert actor_batch.non_tensor_batch["branch_revision_actor_kind"].tolist().count("continuation") == 1

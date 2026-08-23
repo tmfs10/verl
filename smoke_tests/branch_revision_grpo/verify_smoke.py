@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Verify one collected live branch-revision GRPO smoke run."""
+"""Verify one collected multi-step branch-revision GRPO stress smoke run."""
 
 from __future__ import annotations
 
@@ -151,6 +151,126 @@ def _expected_runtime_config(saved_config: dict[str, Any]) -> dict[str, Any]:
     return expected
 
 
+def _verify_prompt_logprob_admission_step(
+    events: list[dict[str, Any]],
+    *,
+    capacity: int | None,
+) -> tuple[int, int, int]:
+    """Validate every admission record in one step and return its pressure key."""
+
+    learnability_events = [event for event in events if event.get("event") == "learnability"]
+    summaries = [event for event in events if event.get("event") == "prompt_logprob_admission_summary"]
+    if capacity is None:
+        declared_tokens = sum(int(event.get("prompt_tokens", 0)) for event in summaries)
+        return declared_tokens, 0, len(learnability_events)
+
+    admissions: list[dict[str, Any]] = []
+    request_keys: set[tuple[str, int]] = set()
+    for event in learnability_events:
+        admission = event.get("prompt_logprob_admission")
+        if not isinstance(admission, dict):
+            raise ValueError("learnability event omitted prompt-logprob admission evidence")
+        scoring_prompt_ids = event.get("scoring_prompt_ids")
+        if not isinstance(scoring_prompt_ids, list) or not scoring_prompt_ids:
+            raise ValueError("learnability event omitted its scoring prompt")
+        prompt_tokens = len(scoring_prompt_ids)
+        charged_tokens = min(prompt_tokens, capacity)
+        oversized = prompt_tokens > capacity
+        server_id = admission.get("server_id")
+        numeric_fields = (
+            "request_sequence",
+            "prompt_tokens",
+            "charged_tokens",
+            "inflight_prompt_tokens_at_grant",
+            "inflight_charged_tokens_at_grant",
+            "high_water_prompt_tokens",
+            "high_water_charged_tokens",
+        )
+        try:
+            numeric = {name: int(admission[name]) for name in numeric_fields}
+            admitted_capacity = int(admission["capacity"])
+            wait_seconds = float(admission["wait_seconds"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("learnability event has incomplete prompt-logprob admission evidence") from error
+        if (
+            not isinstance(server_id, str)
+            or not server_id
+            or admitted_capacity != capacity
+            or numeric["request_sequence"] <= 0
+            or numeric["prompt_tokens"] != prompt_tokens
+            or numeric["charged_tokens"] != charged_tokens
+            or numeric["inflight_prompt_tokens_at_grant"] < prompt_tokens
+            or numeric["inflight_charged_tokens_at_grant"] < charged_tokens
+            or numeric["inflight_charged_tokens_at_grant"] > capacity
+            or numeric["high_water_prompt_tokens"] < numeric["inflight_prompt_tokens_at_grant"]
+            or numeric["high_water_charged_tokens"] < numeric["inflight_charged_tokens_at_grant"]
+            or numeric["high_water_charged_tokens"] > capacity
+            or not isinstance(admission.get("oversized"), bool)
+            or admission["oversized"] != oversized
+            or not math.isfinite(wait_seconds)
+            or wait_seconds < 0.0
+        ):
+            raise ValueError("learnability event violates the prompt-logprob admission budget")
+        if oversized and (
+            numeric["inflight_prompt_tokens_at_grant"] != prompt_tokens
+            or numeric["inflight_charged_tokens_at_grant"] != capacity
+        ):
+            raise ValueError("oversized learnability request did not run alone")
+        request_key = (server_id, numeric["request_sequence"])
+        if request_key in request_keys:
+            raise ValueError("step reused a per-server prompt-logprob admission request sequence")
+        request_keys.add(request_key)
+        admissions.append(admission)
+
+    if not admissions:
+        if summaries:
+            raise ValueError("prompt-logprob admission summary exists without any scored edit")
+        return 0, 0, 0
+
+    if len(summaries) != 1:
+        raise ValueError(f"expected exactly one prompt-logprob admission summary, got {len(summaries)}")
+    summary_event = summaries[0]
+    if (
+        int(summary_event.get("capacity", -1)) != capacity
+        or int(summary_event.get("requests", -1)) != len(admissions)
+        or int(summary_event.get("prompt_tokens", -1)) != sum(int(item["prompt_tokens"]) for item in admissions)
+    ):
+        raise ValueError("prompt-logprob admission summary has incorrect global totals")
+
+    expected_per_server: dict[str, dict[str, int | float]] = {}
+    for admission in admissions:
+        server_id = str(admission["server_id"])
+        server = expected_per_server.setdefault(
+            server_id,
+            {
+                "requests": 0,
+                "prompt_tokens": 0,
+                "max_inflight_prompt_tokens": 0,
+                "max_inflight_charged_tokens": 0,
+                "max_wait_seconds": 0.0,
+            },
+        )
+        server["requests"] = int(server["requests"]) + 1
+        server["prompt_tokens"] = int(server["prompt_tokens"]) + int(admission["prompt_tokens"])
+        server["max_inflight_prompt_tokens"] = max(
+            int(server["max_inflight_prompt_tokens"]),
+            int(admission["high_water_prompt_tokens"]),
+        )
+        server["max_inflight_charged_tokens"] = max(
+            int(server["max_inflight_charged_tokens"]),
+            int(admission["high_water_charged_tokens"]),
+        )
+        server["max_wait_seconds"] = max(
+            float(server["max_wait_seconds"]),
+            float(admission["wait_seconds"]),
+        )
+    if summary_event.get("per_server") != expected_per_server:
+        raise ValueError("prompt-logprob admission summary does not match per-request evidence")
+    total_prompt_tokens = sum(int(item["prompt_tokens"]) for item in admissions)
+    max_inflight_prompt_tokens = max(int(item["high_water_prompt_tokens"]) for item in admissions)
+    return total_prompt_tokens, max_inflight_prompt_tokens, len(admissions)
+
+
 def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, Any]:
     root = root.expanduser().resolve()
     status = _read_json(root / "status.json")
@@ -177,6 +297,11 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     expected_originals = int(resolved_config["data"]["train_batch_size"]) * int(
         resolved_config["actor_rollout_ref"]["rollout"]["n"]
     )
+    prompt_logprob_capacity = resolved_config["actor_rollout_ref"]["rollout"].get("prompt_logprob_max_inflight_tokens")
+    if prompt_logprob_capacity is not None:
+        prompt_logprob_capacity = int(prompt_logprob_capacity)
+        if prompt_logprob_capacity <= 0:
+            raise ValueError("smoke evidence has an invalid prompt-logprob admission capacity")
     loss_mode = str(resolved_config["actor_rollout_ref"]["actor"]["policy_loss"]["loss_mode"])
     if loss_mode not in {"dppo_tv", "vanilla"}:
         raise ValueError(f"unsupported actor policy loss in smoke evidence: {loss_mode!r}")
@@ -208,19 +333,53 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     if runtime_config != _expected_runtime_config(resolved_config):
         raise ValueError("audit attempt metadata does not match the resolved configuration")
     audit_files = sorted(attempt_dir.glob("step_*.jsonl"))
-    if len(audit_files) != 1:
-        raise ValueError(f"expected exactly one step-scoped audit file, got {audit_files!r}")
-    events = _read_jsonl(audit_files[0])
-    if any(
-        int(event.get("schema_version", -1)) != audit_schema_version or event.get("attempt_id") != attempt_id
-        for event in events
-    ):
-        raise ValueError("step audit mixes schema versions or attempt IDs")
-    if (
-        events[-1].get("event") != "step_complete"
-        or sum(event.get("event") == "step_complete" for event in events) != 1
-    ):
-        raise ValueError("selected audit step is incomplete")
+    expected_training_steps = int(resolved_config["trainer"].get("total_training_steps", 1))
+    starting_global_step = int(attempt.get("starting_global_step", -1))
+    if not 1 <= starting_global_step <= expected_training_steps:
+        raise ValueError("audit attempt starting_global_step must fall inside the configured training-step range")
+    expected_step_numbers = list(range(starting_global_step, expected_training_steps + 1))
+    actual_step_numbers: list[int] = []
+    audited_steps: list[tuple[Path, list[dict[str, Any]], tuple[int, int, int]]] = []
+    for audit_file in audit_files:
+        step_events = _read_jsonl(audit_file)
+        try:
+            filename_step = int(audit_file.stem.removeprefix("step_"))
+        except ValueError as error:
+            raise ValueError(f"invalid step audit filename: {audit_file}") from error
+        actual_step_numbers.append(filename_step)
+        if any(
+            int(event.get("schema_version", -1)) != audit_schema_version
+            or event.get("attempt_id") != attempt_id
+            or int(event.get("global_step", -1)) != filename_step
+            for event in step_events
+        ):
+            raise ValueError("step audit mixes schema versions, attempt IDs, or global steps")
+        if (
+            step_events[-1].get("event") != "step_complete"
+            or sum(event.get("event") == "step_complete" for event in step_events) != 1
+        ):
+            raise ValueError("selected audit step is incomplete")
+        _only(step_events, "iteration")
+        _only(step_events, "actor_batch")
+        pressure = _verify_prompt_logprob_admission_step(
+            step_events,
+            capacity=prompt_logprob_capacity,
+        )
+        audited_steps.append((audit_file, step_events, pressure))
+    if actual_step_numbers != expected_step_numbers:
+        raise ValueError(
+            "completed step-scoped audit files do not match the attempt range: "
+            f"expected={expected_step_numbers!r} actual={actual_step_numbers!r}"
+        )
+
+    # Deeply validate the completed step with the heaviest prompt-logprob
+    # workload. Every step's admission evidence was already validated above;
+    # the selected step receives the more expensive end-to-end reconstruction.
+    selected_audit_file, events, _ = max(
+        audited_steps,
+        key=lambda item: item[2],
+    )
+    selected_step = int(events[0]["global_step"])
     event_counts = Counter(str(event.get("event")) for event in events)
     iteration = _only(events, "iteration")
     actor_batch = _only(events, "actor_batch")
@@ -501,6 +660,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError("duplicate learnability evidence")
     if set(learnability_by_key) != structurally_valid_keys:
         raise ValueError("every structurally valid edit must have exactly one learnability assessment")
+    prompt_logprob_admissions: list[dict[str, Any]] = []
     for key, event in learnability_by_key.items():
         if event.get("score_source") != "vllm_prompt_logprobs":
             raise ValueError(f"learnability event {key!r} did not use vLLM prompt log probabilities")
@@ -544,6 +704,52 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             or len(scored_ids) != len(scored_log_probs)
         ):
             raise ValueError(f"learnability event {key!r} has a corrupted prompt-scoring slice")
+        if prompt_logprob_capacity is not None:
+            admission = event.get("prompt_logprob_admission")
+            if not isinstance(admission, dict):
+                raise ValueError(f"learnability event {key!r} omitted prompt-logprob admission evidence")
+            prompt_tokens = len(expected_prompt)
+            charged_tokens = min(prompt_tokens, prompt_logprob_capacity)
+            oversized = prompt_tokens > prompt_logprob_capacity
+            server_id = admission.get("server_id")
+            numeric_fields = (
+                "request_sequence",
+                "prompt_tokens",
+                "charged_tokens",
+                "inflight_prompt_tokens_at_grant",
+                "inflight_charged_tokens_at_grant",
+                "high_water_prompt_tokens",
+                "high_water_charged_tokens",
+            )
+            try:
+                numeric = {name: int(admission[name]) for name in numeric_fields}
+                wait_seconds = float(admission["wait_seconds"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"learnability event {key!r} has incomplete admission evidence") from error
+            if (
+                not isinstance(server_id, str)
+                or not server_id
+                or int(admission.get("capacity", -1)) != prompt_logprob_capacity
+                or numeric["request_sequence"] <= 0
+                or numeric["prompt_tokens"] != prompt_tokens
+                or numeric["charged_tokens"] != charged_tokens
+                or numeric["inflight_prompt_tokens_at_grant"] < prompt_tokens
+                or numeric["inflight_charged_tokens_at_grant"] < charged_tokens
+                or numeric["inflight_charged_tokens_at_grant"] > prompt_logprob_capacity
+                or numeric["high_water_prompt_tokens"] < numeric["inflight_prompt_tokens_at_grant"]
+                or numeric["high_water_charged_tokens"] < numeric["inflight_charged_tokens_at_grant"]
+                or numeric["high_water_charged_tokens"] > prompt_logprob_capacity
+                or bool(admission.get("oversized")) != oversized
+                or not math.isfinite(wait_seconds)
+                or wait_seconds < 0.0
+            ):
+                raise ValueError(f"learnability event {key!r} violates the prompt-logprob admission budget")
+            if oversized and (
+                numeric["inflight_prompt_tokens_at_grant"] != prompt_tokens
+                or numeric["inflight_charged_tokens_at_grant"] != prompt_logprob_capacity
+            ):
+                raise ValueError(f"oversized learnability request {key!r} did not run alone")
+            prompt_logprob_admissions.append(admission)
         expected_seed_score = _aggregate(scored_log_probs, statistic)
         if not math.isclose(float(event["seed_score"]), expected_seed_score, rel_tol=0.0, abs_tol=1e-12):
             raise ValueError(f"learnability event {key!r} has a corrupted replacement score")
@@ -613,6 +819,49 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             float(event["reward_weight"]), float(critique["learnability_weight"]), abs_tol=1e-9
         ):
             raise ValueError(f"learnability event {key!r} differs from its trained critique reward")
+
+    if prompt_logprob_capacity is not None and prompt_logprob_admissions:
+        admission_summary = _only(events, "prompt_logprob_admission_summary")
+        if (
+            int(admission_summary.get("capacity", -1)) != prompt_logprob_capacity
+            or int(admission_summary.get("requests", -1)) != len(prompt_logprob_admissions)
+            or int(admission_summary.get("prompt_tokens", -1))
+            != sum(int(item["prompt_tokens"]) for item in prompt_logprob_admissions)
+        ):
+            raise ValueError("prompt-logprob admission summary has incorrect global totals")
+        expected_per_server: dict[str, dict[str, int | float]] = {}
+        for admission in prompt_logprob_admissions:
+            server_id = str(admission["server_id"])
+            summary = expected_per_server.setdefault(
+                server_id,
+                {
+                    "requests": 0,
+                    "prompt_tokens": 0,
+                    "max_inflight_prompt_tokens": 0,
+                    "max_inflight_charged_tokens": 0,
+                    "max_wait_seconds": 0.0,
+                },
+            )
+            summary["requests"] = int(summary["requests"]) + 1
+            summary["prompt_tokens"] = int(summary["prompt_tokens"]) + int(admission["prompt_tokens"])
+            summary["max_inflight_prompt_tokens"] = max(
+                int(summary["max_inflight_prompt_tokens"]),
+                int(admission["high_water_prompt_tokens"]),
+            )
+            summary["max_inflight_charged_tokens"] = max(
+                int(summary["max_inflight_charged_tokens"]),
+                int(admission["high_water_charged_tokens"]),
+            )
+            summary["max_wait_seconds"] = max(
+                float(summary["max_wait_seconds"]),
+                float(admission["wait_seconds"]),
+            )
+        if admission_summary.get("per_server") != expected_per_server:
+            raise ValueError("prompt-logprob admission summary does not match per-request evidence")
+    elif prompt_logprob_capacity is not None and any(
+        event.get("event") == "prompt_logprob_admission_summary" for event in events
+    ):
+        raise ValueError("prompt-logprob admission summary exists without any scored edit")
 
     continuation_keys: set[tuple[str, int]] = set()
     for continuation in continuations:
@@ -819,9 +1068,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             raise ValueError(f"smoke has no nonuniform {objective} critique GRPO reward group")
 
     metrics = _read_jsonl(root / "metrics.jsonl")
-    step_rows = [row for row in metrics if int(row.get("step", -1)) == 1]
+    step_rows = [row for row in metrics if int(row.get("step", -1)) == selected_step]
     if not step_rows:
-        raise ValueError("file logger contains no global step 1 metrics")
+        raise ValueError(f"file logger contains no global step {selected_step} metrics")
     merged_metrics: dict[str, Any] = {}
     for row in step_rows:
         merged_metrics.update(row.get("data", {}))
@@ -888,7 +1137,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         "algorithm_signal_required": require_algorithm_signal,
         "audit_schema_version": audit_schema_version,
         "audit_attempt_id": attempt_id,
-        "audit_file": str(audit_files[0]),
+        "audit_file": str(selected_audit_file),
+        "audit_files": [str(path) for path in audit_files],
+        "selected_global_step": selected_step,
         "event_counts": dict(sorted(event_counts.items())),
         "incorrect_originals": incorrect,
         "correct_originals": correct,

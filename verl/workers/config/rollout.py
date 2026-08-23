@@ -175,6 +175,9 @@ class RolloutConfig(BaseConfig):
     pipeline_model_parallel_size: int = 1
     moe_tensor_parallel_size: int = 1
     max_num_batched_tokens: int = 8192
+    # Per-vLLM-server weighted admission budget for requests that ask vLLM to
+    # materialize prompt log probabilities. A prompt larger than this runs alone.
+    prompt_logprob_max_inflight_tokens: Optional[int] = None
     logprobs_mode: Optional[str] = "processed_logprobs"
     scheduling_policy: Optional[str] = "fcfs"
 
@@ -254,6 +257,12 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        if self.prompt_logprob_max_inflight_tokens is not None and (
+            isinstance(self.prompt_logprob_max_inflight_tokens, bool)
+            or not isinstance(self.prompt_logprob_max_inflight_tokens, int)
+            or self.prompt_logprob_max_inflight_tokens <= 0
+        ):
+            raise ValueError("prompt_logprob_max_inflight_tokens must be a positive integer")
         # Async server rollout is the production training path. Keep a narrow sync
         # exception for HFRollout, which is still used by offline generation/eval
         # code paths that call generate_sequences directly.

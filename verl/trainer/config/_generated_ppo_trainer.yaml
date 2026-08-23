@@ -244,6 +244,7 @@ actor_rollout_ref:
     expert_parallel_size: 1
     pipeline_model_parallel_size: 1
     max_num_batched_tokens: 8192
+    prompt_logprob_max_inflight_tokens: null
     max_model_len: null
     max_num_seqs: 1024
     enable_chunked_prefill: true

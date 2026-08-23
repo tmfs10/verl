@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""One-step branch-revision GRPO smoke with fail-closed evidence capture."""
+"""Multi-step branch-revision GRPO stress smoke with fail-closed evidence capture."""
 
 from __future__ import annotations
 
@@ -44,6 +44,7 @@ EXPECTED = {
     "trainer.test_freq": -1,
     "trainer.resume_mode": "disable",
 }
+CUDA_ALLOCATOR_CONFIG = "expandable_segments:True"
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -64,6 +65,16 @@ def _configure_file_logger(config, path: Path) -> None:
     )
 
 
+def _configure_cuda_allocator(config) -> None:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = CUDA_ALLOCATOR_CONFIG
+    OmegaConf.update(
+        config,
+        "ray_kwargs.ray_init.runtime_env.env_vars.PYTORCH_CUDA_ALLOC_CONF",
+        CUDA_ALLOCATOR_CONFIG,
+        force_add=True,
+    )
+
+
 def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any]) -> None:
     required_contract = {
         "model_path",
@@ -80,6 +91,8 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "max_model_len",
         "critique_max_response_length",
         "max_tokens_per_gpu",
+        "prompt_logprob_max_inflight_tokens",
+        "gpu_memory_utilization",
         "training_steps",
     }
     if set(smoke_contract) != required_contract:
@@ -108,6 +121,10 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "algorithm.branch_revision_grpo.critique_max_response_length": smoke_contract["critique_max_response_length"],
         "actor_rollout_ref.actor.ppo_max_token_len_per_gpu": smoke_contract["max_tokens_per_gpu"],
         "actor_rollout_ref.rollout.max_num_batched_tokens": smoke_contract["max_tokens_per_gpu"],
+        "actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens": smoke_contract[
+            "prompt_logprob_max_inflight_tokens"
+        ],
+        "actor_rollout_ref.rollout.gpu_memory_utilization": smoke_contract["gpu_memory_utilization"],
         "trainer.total_training_steps": smoke_contract["training_steps"],
     }
     for name in (
@@ -120,6 +137,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "max_model_len",
         "critique_max_response_length",
         "max_tokens_per_gpu",
+        "prompt_logprob_max_inflight_tokens",
         "training_steps",
     ):
         value = smoke_contract[name]
@@ -141,6 +159,14 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         or float(max_seed_window_stddevs) < 0.0
     ):
         raise ValueError("branch-revision smoke max_seed_window_stddevs must be finite and nonnegative")
+    gpu_memory_utilization = smoke_contract["gpu_memory_utilization"]
+    if (
+        not isinstance(gpu_memory_utilization, int | float)
+        or isinstance(gpu_memory_utilization, bool)
+        or not math.isfinite(float(gpu_memory_utilization))
+        or not 0.0 < float(gpu_memory_utilization) < 1.0
+    ):
+        raise ValueError("branch-revision smoke gpu_memory_utilization must be finite and inside (0, 1)")
     if smoke_contract["n_samples"] < 2:
         raise ValueError("branch-revision smoke n_samples must be at least 2 for a GRPO acceptance group")
     if smoke_contract["num_critiques"] < 2:
@@ -183,6 +209,11 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("validation generation temperature must be 1.0")
     if list(OmegaConf.select(config, "trainer.logger")) != ["file"]:
         raise ValueError("smoke must use only the local file logger (W&B disabled)")
+    if (
+        OmegaConf.select(config, "ray_kwargs.ray_init.runtime_env.env_vars.PYTORCH_CUDA_ALLOC_CONF")
+        != CUDA_ALLOCATOR_CONFIG
+    ):
+        raise ValueError("smoke must enable PyTorch expandable CUDA allocator segments for every Ray worker")
     if OmegaConf.select(config, "trainer.rollout_data_dir") is not None:
         raise ValueError("smoke child evidence belongs in the feature audit, not native rollout dumps")
     expected_audit = str(output_dir / "audit")
@@ -228,6 +259,7 @@ def main(config) -> None:
         del config.branch_revision_smoke
     config = migrate_legacy_reward_impl(config)
     config = _apply_reward_focus_mask_alignment(config)
+    _configure_cuda_allocator(config)
     validate_branch_revision_runtime_config(config)
     _configure_file_logger(config, output_dir / "metrics.jsonl")
     OmegaConf.resolve(config)

@@ -22,7 +22,7 @@ import os
 import socket
 import uuid
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import numpy as np
@@ -34,8 +34,12 @@ from verl import DataProto
 from verl.experimental.agent_loop.branch_revision_agent_loop import (
     BRANCH_REVISION_AGENT_NAME,
     BRANCH_REVISION_CHILD_FIELD,
+    BRANCH_REVISION_CONTINUATION_FIELD,
+    BRANCH_REVISION_SCORE_FIELD,
+    BranchRevisionContinuationGeneration,
     BranchRevisionCritiqueGeneration,
     BranchRevisionGenerationRecord,
+    BranchRevisionScoreGeneration,
 )
 from verl.trainer.config import BranchRevisionGRPOConfig
 from verl.trainer.ppo import core_algos
@@ -107,6 +111,9 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
         raise ValueError("branch-revision actor strategy must be fsdp or fsdp2")
     if config.actor_rollout_ref.rollout.name != "vllm":
         raise ValueError("branch-revision GRPO currently supports only the dense vLLM rollout engine")
+    admission_capacity = config.actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens
+    if isinstance(admission_capacity, bool) or not isinstance(admission_capacity, int) or admission_capacity <= 0:
+        raise ValueError("branch-revision GRPO requires a positive prompt-logprob per-server token budget")
     if config.critic.get("enable", None) is not False:
         raise ValueError("branch-revision GRPO is actor-only and requires critic.enable=false")
     if str(config.algorithm.adv_estimator).lower() != "grpo":
@@ -252,6 +259,7 @@ class _Bundle:
     original_reward: float
     record: BranchRevisionGenerationRecord | None = None
     learnability: dict[int, LearnabilityScore] = field(default_factory=dict)
+    score_admissions: dict[int, dict[str, Any]] = field(default_factory=dict)
     continuation_rewards: dict[int, float] = field(default_factory=dict)
     compression_fractions: dict[int, float] = field(default_factory=dict)
     compression_credits: dict[int, float] = field(default_factory=dict)
@@ -453,6 +461,7 @@ class BranchRevisionGRPOController:
             if key != BRANCH_REVISION_CHILD_FIELD
         }
         non_tensors["agent_name"] = np.array([BRANCH_REVISION_AGENT_NAME] * len(selected), dtype=object)
+        non_tensors["branch_revision_phase"] = np.array(["critique"] * len(selected), dtype=object)
         non_tensors["branch_revision_rollout_id"] = np.array([bundle.rollout_id for bundle in selected], dtype=object)
         non_tensors["branch_revision_parent_prompt_ids"] = self._object_array(
             [bundle.prompt_ids for bundle in selected]
@@ -477,7 +486,7 @@ class BranchRevisionGRPOController:
             meta_info={"global_steps": self.trainer.global_steps},
         )
 
-    def _generate_sequences_with_lifecycle(self, request: DataProto, *, profile_rollout: bool) -> DataProto:
+    def _run_with_rollout_lifecycle(self, callback, *, profile_rollout: bool):
         primary_error: BaseException | None = None
         profile_cleanup_required = False
         try:
@@ -485,7 +494,7 @@ class BranchRevisionGRPOController:
             if profile_rollout:
                 profile_cleanup_required = True
                 self.trainer.async_rollout_manager.start_profile()
-            return self.trainer.async_rollout_manager.generate_sequences(request)
+            return callback()
         except BaseException as error:
             primary_error = error
             raise
@@ -608,6 +617,238 @@ class BranchRevisionGRPOController:
             elif bundle.rollout_id in records:
                 raise RuntimeError("unselected original solution unexpectedly received branch critiques")
 
+    def _phase_non_tensors(self, source: DataProto, rows: list[int]) -> dict[str, np.ndarray]:
+        return {
+            key: np.take(values, rows, axis=0).copy()
+            for key, values in source.non_tensor_batch.items()
+            if key
+            not in {
+                BRANCH_REVISION_CHILD_FIELD,
+                BRANCH_REVISION_SCORE_FIELD,
+                BRANCH_REVISION_CONTINUATION_FIELD,
+            }
+        }
+
+    def _make_score_request(self, source: DataProto, bundles: list[_Bundle]) -> DataProto | None:
+        items: list[tuple[_Bundle, int, BranchRevisionCritiqueGeneration]] = []
+        for bundle in bundles:
+            if bundle.record is None:
+                continue
+            items.extend(
+                (bundle, critique_index, critique)
+                for critique_index, critique in enumerate(bundle.record.critiques)
+                if critique.valid
+            )
+        if not items:
+            return None
+        rows = [bundle.source_row for bundle, _, _ in items]
+        non_tensors = self._phase_non_tensors(source, rows)
+        non_tensors["agent_name"] = np.array([BRANCH_REVISION_AGENT_NAME] * len(items), dtype=object)
+        non_tensors["branch_revision_phase"] = np.array(["score"] * len(items), dtype=object)
+        non_tensors["branch_revision_rollout_id"] = np.array(
+            [bundle.rollout_id for bundle, _, _ in items],
+            dtype=object,
+        )
+        non_tensors["branch_revision_critique_index"] = np.array(
+            [critique_index for _, critique_index, _ in items],
+            dtype=np.int64,
+        )
+        non_tensors["branch_revision_route_key"] = np.array(
+            [f"{bundle.rollout_id}:revision:{critique_index}" for bundle, critique_index, _ in items],
+            dtype=object,
+        )
+        non_tensors["branch_revision_parent_prompt_ids"] = self._object_array(
+            [bundle.prompt_ids for bundle, _, _ in items]
+        )
+        non_tensors["branch_revision_continuation_prefix_ids"] = self._object_array(
+            [list(critique.continuation_prefix_ids) for _, _, critique in items]
+        )
+        non_tensors["branch_revision_new_continuation_ids"] = self._object_array(
+            [list(critique.new_continuation_ids) for _, _, critique in items]
+        )
+        return DataProto.from_dict(
+            non_tensors=non_tensors,
+            meta_info={"global_steps": self.trainer.global_steps},
+        )
+
+    @staticmethod
+    def _coerce_score(value: Any) -> BranchRevisionScoreGeneration:
+        if isinstance(value, BranchRevisionScoreGeneration):
+            return value
+        if not isinstance(value, dict):
+            raise TypeError(f"invalid branch-revision score record {type(value)!r}")
+        admission = value.get("admission")
+        if not isinstance(admission, dict):
+            raise TypeError("branch-revision score admission evidence must be a mapping")
+        return BranchRevisionScoreGeneration(
+            rollout_id=str(value["rollout_id"]),
+            critique_index=int(value["critique_index"]),
+            prompt_logprob_start=int(value["prompt_logprob_start"]),
+            scored_token_ids=tuple(int(token) for token in value["scored_token_ids"]),
+            scored_token_log_probs=tuple(_float32_list(value["scored_token_log_probs"])),
+            admission=dict(admission),
+        )
+
+    def _extract_scores(self, output: DataProto) -> dict[tuple[str, int], BranchRevisionScoreGeneration]:
+        raw = output.non_tensor_batch.pop(BRANCH_REVISION_SCORE_FIELD, None)
+        if raw is None or len(raw) != len(output):
+            raise RuntimeError("branch-revision score stage did not return one record per proposal")
+        records: dict[tuple[str, int], BranchRevisionScoreGeneration] = {}
+        for value in raw:
+            record = self._coerce_score(value)
+            key = (record.rollout_id, record.critique_index)
+            if key in records:
+                raise RuntimeError(f"duplicate branch-revision score key {key!r}")
+            records[key] = record
+        return records
+
+    def _attach_scores(
+        self,
+        bundles: list[_Bundle],
+        scores: dict[tuple[str, int], BranchRevisionScoreGeneration],
+    ) -> None:
+        expected = {
+            (bundle.rollout_id, critique_index)
+            for bundle in bundles
+            if bundle.record is not None
+            for critique_index, critique in enumerate(bundle.record.critiques)
+            if critique.valid
+        }
+        if set(scores) != expected:
+            raise RuntimeError("branch-revision score stage returned an unexpected proposal set")
+        for bundle in bundles:
+            if bundle.record is None:
+                continue
+            critiques = list(bundle.record.critiques)
+            for critique_index, critique in enumerate(critiques):
+                if not critique.valid:
+                    continue
+                score = scores[(bundle.rollout_id, critique_index)]
+                expected_start = len(bundle.prompt_ids) + len(critique.continuation_prefix_ids)
+                if score.prompt_logprob_start != expected_start:
+                    raise RuntimeError("branch-revision score changed the prompt-logprob slice boundary")
+                if list(score.scored_token_ids) != list(critique.new_continuation_ids):
+                    raise RuntimeError("branch-revision score changed the replacement-token sequence")
+                if len(score.scored_token_log_probs) != len(critique.new_continuation_ids):
+                    raise RuntimeError("branch-revision score omitted replacement-token log probabilities")
+                critiques[critique_index] = replace(
+                    critique,
+                    new_continuation_log_probs=score.scored_token_log_probs,
+                )
+                bundle.score_admissions[critique_index] = dict(score.admission)
+            bundle.record = replace(bundle.record, critiques=tuple(critiques))
+
+    def _make_continuation_request(self, source: DataProto, bundles: list[_Bundle]) -> DataProto | None:
+        items: list[tuple[_Bundle, int, BranchRevisionCritiqueGeneration]] = []
+        for bundle in bundles:
+            if bundle.record is None:
+                continue
+            items.extend(
+                (bundle, critique_index, critique)
+                for critique_index, critique in enumerate(bundle.record.critiques)
+                if critique.valid
+                and bundle.learnability.get(critique_index, None) is not None
+                and bundle.learnability[critique_index].accepted
+            )
+        if not items:
+            return None
+        rows = [bundle.source_row for bundle, _, _ in items]
+        non_tensors = self._phase_non_tensors(source, rows)
+        non_tensors["agent_name"] = np.array([BRANCH_REVISION_AGENT_NAME] * len(items), dtype=object)
+        non_tensors["branch_revision_phase"] = np.array(["continuation"] * len(items), dtype=object)
+        non_tensors["branch_revision_rollout_id"] = np.array(
+            [bundle.rollout_id for bundle, _, _ in items],
+            dtype=object,
+        )
+        non_tensors["branch_revision_critique_index"] = np.array(
+            [critique_index for _, critique_index, _ in items],
+            dtype=np.int64,
+        )
+        non_tensors["branch_revision_route_key"] = np.array(
+            [f"{bundle.rollout_id}:revision:{critique_index}" for bundle, critique_index, _ in items],
+            dtype=object,
+        )
+        non_tensors["branch_revision_parent_prompt_ids"] = self._object_array(
+            [bundle.prompt_ids for bundle, _, _ in items]
+        )
+        non_tensors["branch_revision_revised_prefix_ids"] = self._object_array(
+            [list(critique.revised_prefix_ids) for _, _, critique in items]
+        )
+        non_tensors["branch_revision_continuation_max_tokens"] = np.array(
+            [critique.continuation_max_tokens for _, _, critique in items],
+            dtype=np.int64,
+        )
+        return DataProto.from_dict(
+            non_tensors=non_tensors,
+            meta_info={"global_steps": self.trainer.global_steps},
+        )
+
+    @staticmethod
+    def _coerce_continuation(value: Any) -> BranchRevisionContinuationGeneration:
+        if isinstance(value, BranchRevisionContinuationGeneration):
+            return value
+        if not isinstance(value, dict):
+            raise TypeError(f"invalid branch-revision continuation record {type(value)!r}")
+        return BranchRevisionContinuationGeneration(
+            rollout_id=str(value["rollout_id"]),
+            critique_index=int(value["critique_index"]),
+            token_ids=tuple(int(token) for token in value["token_ids"]),
+            log_probs=tuple(float(item) for item in value["log_probs"]),
+            finish_reason=value.get("finish_reason"),
+            max_tokens=int(value["max_tokens"]),
+        )
+
+    def _extract_continuations(
+        self,
+        output: DataProto,
+    ) -> dict[tuple[str, int], BranchRevisionContinuationGeneration]:
+        raw = output.non_tensor_batch.pop(BRANCH_REVISION_CONTINUATION_FIELD, None)
+        if raw is None or len(raw) != len(output):
+            raise RuntimeError("branch-revision continuation stage did not return one record per accepted edit")
+        records: dict[tuple[str, int], BranchRevisionContinuationGeneration] = {}
+        for value in raw:
+            record = self._coerce_continuation(value)
+            key = (record.rollout_id, record.critique_index)
+            if key in records:
+                raise RuntimeError(f"duplicate branch-revision continuation key {key!r}")
+            records[key] = record
+        return records
+
+    def _attach_continuations(
+        self,
+        bundles: list[_Bundle],
+        continuations: dict[tuple[str, int], BranchRevisionContinuationGeneration],
+    ) -> None:
+        expected = {
+            (bundle.rollout_id, critique_index)
+            for bundle in bundles
+            if bundle.record is not None
+            for critique_index, critique in enumerate(bundle.record.critiques)
+            if critique.valid and critique_index in bundle.learnability and bundle.learnability[critique_index].accepted
+        }
+        if set(continuations) != expected:
+            raise RuntimeError("branch-revision continuation stage returned an unexpected accepted-edit set")
+        for bundle in bundles:
+            if bundle.record is None:
+                continue
+            critiques = list(bundle.record.critiques)
+            for critique_index, critique in enumerate(critiques):
+                key = (bundle.rollout_id, critique_index)
+                if key not in expected:
+                    continue
+                continuation = continuations[key]
+                if continuation.max_tokens != critique.continuation_max_tokens:
+                    raise RuntimeError("branch-revision continuation changed its configured token budget")
+                if not continuation.token_ids or len(continuation.token_ids) != len(continuation.log_probs):
+                    raise RuntimeError("branch-revision continuation tokens and behavior log probabilities misalign")
+                critiques[critique_index] = replace(
+                    critique,
+                    continuation_ids=continuation.token_ids,
+                    continuation_log_probs=continuation.log_probs,
+                    continuation_finish_reason=continuation.finish_reason,
+                )
+            bundle.record = replace(bundle.record, critiques=tuple(critiques))
+
     def _score_seed_learnability(self, bundles: list[_Bundle]) -> None:
         """Score proposal seeds from vLLM prompt logprobs at their actual context."""
 
@@ -620,6 +861,7 @@ class BranchRevisionGRPOController:
             editable_log_probs,
         )
         statistic = self.feature.learnability_logprob_statistic
+        admission_records: list[dict[str, Any]] = []
         proposals_by_length: defaultdict[
             int,
             list[tuple[_Bundle, int, BranchRevisionCritiqueGeneration, list[float]]],
@@ -672,6 +914,62 @@ class BranchRevisionGRPOController:
                 population_stddev=reference.population_stddev,
             )
             for bundle, critique_index, critique, seed_values in proposals_by_length[seed_length]:
+                admission = bundle.score_admissions.get(critique_index)
+                if not isinstance(admission, dict):
+                    raise RuntimeError("valid branch revision is missing prompt-logprob admission evidence")
+                capacity = int(self.config.actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens)
+                expected_prompt_tokens = (
+                    len(bundle.prompt_ids) + len(critique.continuation_prefix_ids) + len(critique.new_continuation_ids)
+                )
+                required_admission = {
+                    "server_id",
+                    "capacity",
+                    "request_sequence",
+                    "prompt_tokens",
+                    "charged_tokens",
+                    "wait_seconds",
+                    "inflight_prompt_tokens_at_grant",
+                    "inflight_charged_tokens_at_grant",
+                    "high_water_prompt_tokens",
+                    "high_water_charged_tokens",
+                    "oversized",
+                }
+                if not required_admission.issubset(admission):
+                    raise RuntimeError("prompt-logprob admission evidence is incomplete")
+                try:
+                    admitted_capacity = int(admission["capacity"])
+                    request_sequence = int(admission["request_sequence"])
+                    prompt_tokens = int(admission["prompt_tokens"])
+                    charged_tokens = int(admission["charged_tokens"])
+                    wait_seconds = float(admission["wait_seconds"])
+                    inflight_prompt_tokens = int(admission["inflight_prompt_tokens_at_grant"])
+                    inflight_charged_tokens = int(admission["inflight_charged_tokens_at_grant"])
+                    high_water_prompt_tokens = int(admission["high_water_prompt_tokens"])
+                    high_water_charged_tokens = int(admission["high_water_charged_tokens"])
+                except (TypeError, ValueError) as error:
+                    raise RuntimeError("prompt-logprob admission evidence has invalid numeric fields") from error
+                oversized = expected_prompt_tokens > capacity
+                if (
+                    not isinstance(admission["server_id"], str)
+                    or not admission["server_id"]
+                    or admitted_capacity != capacity
+                    or request_sequence <= 0
+                    or prompt_tokens != expected_prompt_tokens
+                    or charged_tokens != min(expected_prompt_tokens, capacity)
+                    or not math.isfinite(wait_seconds)
+                    or wait_seconds < 0.0
+                    or inflight_prompt_tokens < prompt_tokens
+                    or inflight_charged_tokens < charged_tokens
+                    or inflight_charged_tokens > capacity
+                    or high_water_prompt_tokens < inflight_prompt_tokens
+                    or high_water_charged_tokens < inflight_charged_tokens
+                    or high_water_charged_tokens > capacity
+                    or bool(admission["oversized"]) != oversized
+                ):
+                    raise RuntimeError("prompt-logprob admission evidence violates its configured token budget")
+                if oversized and (inflight_prompt_tokens != prompt_tokens or inflight_charged_tokens != capacity):
+                    raise RuntimeError("oversized prompt-logprob request did not run alone")
+                admission_records.append(dict(admission))
                 seed_score = aggregate_log_probs(seed_values, statistic=statistic)
                 score = score_seed_learnability(
                     seed_score,
@@ -701,6 +999,7 @@ class BranchRevisionGRPOController:
                     prompt_logprob_start=len(bundle.prompt_ids) + len(critique.continuation_prefix_ids),
                     scored_token_ids=list(critique.new_continuation_ids),
                     scored_token_log_probs=seed_values,
+                    prompt_logprob_admission=admission,
                     percentile=score.percentile,
                     reference_mean=score.reference_mean,
                     reference_stddev=score.reference_stddev,
@@ -712,6 +1011,41 @@ class BranchRevisionGRPOController:
                     eligible_rollouts=score.eligible_rollouts,
                     total_windows=score.total_windows,
                 )
+        if admission_records:
+            per_server: dict[str, dict[str, int | float]] = {}
+            for admission in admission_records:
+                server_id = str(admission["server_id"])
+                summary = per_server.setdefault(
+                    server_id,
+                    {
+                        "requests": 0,
+                        "prompt_tokens": 0,
+                        "max_inflight_prompt_tokens": 0,
+                        "max_inflight_charged_tokens": 0,
+                        "max_wait_seconds": 0.0,
+                    },
+                )
+                summary["requests"] = int(summary["requests"]) + 1
+                summary["prompt_tokens"] = int(summary["prompt_tokens"]) + int(admission["prompt_tokens"])
+                summary["max_inflight_prompt_tokens"] = max(
+                    int(summary["max_inflight_prompt_tokens"]),
+                    int(admission["high_water_prompt_tokens"]),
+                )
+                summary["max_inflight_charged_tokens"] = max(
+                    int(summary["max_inflight_charged_tokens"]),
+                    int(admission["high_water_charged_tokens"]),
+                )
+                summary["max_wait_seconds"] = max(
+                    float(summary["max_wait_seconds"]),
+                    float(admission["wait_seconds"]),
+                )
+            self._audit(
+                "prompt_logprob_admission_summary",
+                capacity=int(self.config.actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens),
+                requests=len(admission_records),
+                prompt_tokens=sum(int(item["prompt_tokens"]) for item in admission_records),
+                per_server=per_server,
+            )
 
     def _make_reward_batch(
         self,
@@ -771,23 +1105,27 @@ class BranchRevisionGRPOController:
                     if (
                         not critique.new_continuation_ids
                         or not critique.revised_prefix_ids
-                        or not critique.continuation_ids
-                        or len(critique.continuation_ids) != len(critique.continuation_log_probs)
                         or critique.continuation_max_tokens < self.feature.min_continuation_tokens
                     ):
-                        raise RuntimeError("valid branch revision lacks one complete continuation record")
-                    if not all(math.isfinite(value) for value in critique.continuation_log_probs):
-                        raise RuntimeError(
-                            "branch-revision continuation contains non-finite behavior log probabilities"
-                        )
+                        raise RuntimeError("valid branch revision lacks its parsed replacement record")
                     learnability = bundle.learnability.get(critique_index)
                     if learnability is None:
                         raise RuntimeError("valid branch revision is missing its learnability assessment")
                     if learnability.accepted:
+                        if not critique.continuation_ids or len(critique.continuation_ids) != len(
+                            critique.continuation_log_probs
+                        ):
+                            raise RuntimeError("accepted branch revision lacks one complete continuation record")
+                        if not all(math.isfinite(value) for value in critique.continuation_log_probs):
+                            raise RuntimeError(
+                                "branch-revision continuation contains non-finite behavior log probabilities"
+                            )
                         rows.append(bundle.source_row)
                         prompts.append(bundle.prompt_ids)
                         responses.append([*critique.revised_prefix_ids, *critique.continuation_ids])
                         mapping.append((bundle_index, critique_index))
+                    elif critique.continuation_ids or critique.continuation_log_probs:
+                        raise RuntimeError("learnability-rejected branch revision unexpectedly generated a suffix")
                 elif (
                     critique.branch_prefix_ids
                     or critique.prefix_ids
@@ -927,7 +1265,8 @@ class BranchRevisionGRPOController:
                     compression_credit=bundle.compression_credits.get(critique_index),
                     generated_continuation_tokens=len(critique.continuation_ids),
                     continuation_reward_evaluated=critique_index in bundle.continuation_rewards,
-                    continuation_wasted_by_learnability=bool(critique.valid and not accepted),
+                    continuation_wasted_by_learnability=False,
+                    continuation_skipped_by_learnability=bool(critique.valid and not accepted),
                     parse_reason=critique.parse_reason,
                     prefix=critique.prefix_text,
                     prefix_plus_new_continuation=critique.prefix_plus_new_continuation_text,
@@ -1259,16 +1598,54 @@ class BranchRevisionGRPOController:
         self._audit_originals(bundles)
         request = self._make_child_request(source, bundles)
         if request is not None:
+
+            def run_child_pipeline() -> None:
+                output = self.trainer.async_rollout_manager.generate_sequences(request)
+                timing_raw.update(
+                    {
+                        f"branch_revision_critique/{key}": value
+                        for key, value in output.meta_info.get("timing", {}).items()
+                    }
+                )
+                self._attach_records(bundles, self._extract_records(output))
+
+                score_request = self._make_score_request(source, bundles)
+                if score_request is None:
+                    self._attach_scores(bundles, {})
+                else:
+                    score_output = self.trainer.async_rollout_manager.generate_sequences(score_request)
+                    timing_raw.update(
+                        {
+                            f"branch_revision_score/{key}": value
+                            for key, value in score_output.meta_info.get("timing", {}).items()
+                        }
+                    )
+                    self._attach_scores(bundles, self._extract_scores(score_output))
+
+                with marked_timer("branch_revision_learnability", timing_raw, color="blue"):
+                    self._score_seed_learnability(bundles)
+
+                continuation_request = self._make_continuation_request(source, bundles)
+                if continuation_request is None:
+                    self._attach_continuations(bundles, {})
+                else:
+                    continuation_output = self.trainer.async_rollout_manager.generate_sequences(continuation_request)
+                    timing_raw.update(
+                        {
+                            f"branch_revision_continuation/{key}": value
+                            for key, value in continuation_output.meta_info.get("timing", {}).items()
+                        }
+                    )
+                    self._attach_continuations(bundles, self._extract_continuations(continuation_output))
+
             with marked_timer("branch_revision_children", timing_raw, color="red"):
-                output = self._generate_sequences_with_lifecycle(request, profile_rollout=profile_rollout)
-                timing_raw.update(output.meta_info.get("timing", {}))
-                records = self._extract_records(output)
-            self._attach_records(bundles, records)
+                self._run_with_rollout_lifecycle(run_child_pipeline, profile_rollout=profile_rollout)
         else:
             self._attach_records(bundles, {})
-
-        with marked_timer("branch_revision_learnability", timing_raw, color="blue"):
-            self._score_seed_learnability(bundles)
+            self._attach_scores(bundles, {})
+            with marked_timer("branch_revision_learnability", timing_raw, color="blue"):
+                self._score_seed_learnability(bundles)
+            self._attach_continuations(bundles, {})
         with marked_timer("branch_revision_rewards", timing_raw, color="yellow"):
             self._evaluate_continuations(source, bundles)
         actor_batch, padding_rows = self._make_actor_batch(bundles)

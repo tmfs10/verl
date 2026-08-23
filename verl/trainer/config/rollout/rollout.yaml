@@ -69,6 +69,11 @@ pipeline_model_parallel_size: 1
 # max number of tokens in a batch
 max_num_batched_tokens: 8192
 
+# Optional maximum complete prompt-token volume admitted concurrently for
+# requests that ask one vLLM server to return prompt log probabilities.
+# Oversized prompts run alone. Null preserves native unbounded behavior.
+prompt_logprob_max_inflight_tokens: null
+
 # max length for rollout
 max_model_len: null
 
