@@ -307,9 +307,6 @@ def _scaled_runtime_config(tmp_path: Path):
                 "logger": ["file"],
                 "rollout_data_dir": None,
             },
-            "ray_kwargs": {
-                "ray_init": {"runtime_env": {"env_vars": {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}}}
-            },
         }
     )
 

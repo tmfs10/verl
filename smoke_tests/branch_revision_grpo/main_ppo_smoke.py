@@ -44,7 +44,6 @@ EXPECTED = {
     "trainer.test_freq": -1,
     "trainer.resume_mode": "disable",
 }
-CUDA_ALLOCATOR_CONFIG = "expandable_segments:True"
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -61,16 +60,6 @@ def _configure_file_logger(config, path: Path) -> None:
         config,
         "ray_kwargs.ray_init.runtime_env.env_vars.VERL_FILE_LOGGER_PATH",
         value,
-        force_add=True,
-    )
-
-
-def _configure_cuda_allocator(config) -> None:
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = CUDA_ALLOCATOR_CONFIG
-    OmegaConf.update(
-        config,
-        "ray_kwargs.ray_init.runtime_env.env_vars.PYTORCH_CUDA_ALLOC_CONF",
-        CUDA_ALLOCATOR_CONFIG,
         force_add=True,
     )
 
@@ -209,11 +198,6 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("validation generation temperature must be 1.0")
     if list(OmegaConf.select(config, "trainer.logger")) != ["file"]:
         raise ValueError("smoke must use only the local file logger (W&B disabled)")
-    if (
-        OmegaConf.select(config, "ray_kwargs.ray_init.runtime_env.env_vars.PYTORCH_CUDA_ALLOC_CONF")
-        != CUDA_ALLOCATOR_CONFIG
-    ):
-        raise ValueError("smoke must enable PyTorch expandable CUDA allocator segments for every Ray worker")
     if OmegaConf.select(config, "trainer.rollout_data_dir") is not None:
         raise ValueError("smoke child evidence belongs in the feature audit, not native rollout dumps")
     expected_audit = str(output_dir / "audit")
@@ -259,7 +243,6 @@ def main(config) -> None:
         del config.branch_revision_smoke
     config = migrate_legacy_reward_impl(config)
     config = _apply_reward_focus_mask_alignment(config)
-    _configure_cuda_allocator(config)
     validate_branch_revision_runtime_config(config)
     _configure_file_logger(config, output_dir / "metrics.jsonl")
     OmegaConf.resolve(config)
