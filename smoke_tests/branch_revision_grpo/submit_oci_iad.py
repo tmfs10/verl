@@ -322,7 +322,6 @@ def build_command(
         "grpo",
         "--seed",
         str(seed),
-        "--add_interactive",
         "--no_sandbox",
         "--no_requeue",
         "--disable_val_before_train",
@@ -348,6 +347,8 @@ def build_command(
             training_steps=training_steps,
         ),
     ]
+    if nodes <= 2:
+        command.append("--add_interactive")
     if partition is not None:
         command.extend(["--partition", partition])
     if dry_run:

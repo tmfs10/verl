@@ -144,7 +144,9 @@ def test_rendered_smoke_allows_four_nodes_only_on_normal_partitions(tmp_path: Pa
         "nodes": 4,
     }
     command, _ = build_command(**common)
-    assert "--nodes 4" in " ".join(command)
+    rendered = " ".join(command)
+    assert "--nodes 4" in rendered
+    assert "--add_interactive" not in command
     with pytest.raises(ValueError, match="interactive.*at most two nodes"):
         build_command(**common, partition="interactive")
 
