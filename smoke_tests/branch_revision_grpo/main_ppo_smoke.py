@@ -34,14 +34,9 @@ from verl.trainer.ppo.ray_trainer_branch_revision import validate_branch_revisio
 from verl.utils.device import auto_set_device
 
 EXPECTED = {
-    "data.max_prompt_length": 1024,
-    "data.max_response_length": 2048,
     "actor_rollout_ref.actor.ppo_mini_batch_size": 8,
     "actor_rollout_ref.actor.ppo_epochs": 1,
-    "actor_rollout_ref.rollout.max_model_len": 8192,
-    "algorithm.branch_revision_grpo.critique_max_response_length": 2560,
     "algorithm.branch_revision_grpo.min_continuation_tokens": 128,
-    "trainer.nnodes": 1,
     "trainer.n_gpus_per_node": 8,
     "trainer.total_training_steps": 1,
     "trainer.val_before_train": False,
@@ -77,6 +72,12 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "num_critiques",
         "loss_mode",
         "learnability_logprob_statistic",
+        "nodes",
+        "max_prompt_length",
+        "max_response_length",
+        "max_model_len",
+        "critique_max_response_length",
+        "max_tokens_per_gpu",
     }
     if set(smoke_contract) != required_contract:
         raise ValueError(
@@ -95,8 +96,25 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "algorithm.branch_revision_grpo.learnability_logprob_statistic": smoke_contract[
             "learnability_logprob_statistic"
         ],
+        "trainer.nnodes": smoke_contract["nodes"],
+        "data.max_prompt_length": smoke_contract["max_prompt_length"],
+        "data.max_response_length": smoke_contract["max_response_length"],
+        "actor_rollout_ref.rollout.max_model_len": smoke_contract["max_model_len"],
+        "algorithm.branch_revision_grpo.critique_max_response_length": smoke_contract["critique_max_response_length"],
+        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu": smoke_contract["max_tokens_per_gpu"],
+        "actor_rollout_ref.rollout.max_num_batched_tokens": smoke_contract["max_tokens_per_gpu"],
     }
-    for name in ("n_prompts", "n_samples", "num_critiques"):
+    for name in (
+        "n_prompts",
+        "n_samples",
+        "num_critiques",
+        "nodes",
+        "max_prompt_length",
+        "max_response_length",
+        "max_model_len",
+        "critique_max_response_length",
+        "max_tokens_per_gpu",
+    ):
         value = smoke_contract[name]
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"branch-revision smoke {name} must be a positive integer")
@@ -110,6 +128,14 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("branch-revision smoke n_samples must be at least 2 for a GRPO acceptance group")
     if smoke_contract["num_critiques"] < 2:
         raise ValueError("branch-revision smoke num_critiques must be at least 2 for GRPO")
+    if smoke_contract["nodes"] > 2:
+        raise ValueError("branch-revision smoke supports at most two nodes")
+    if smoke_contract["max_prompt_length"] + smoke_contract["max_response_length"] >= smoke_contract["max_model_len"]:
+        raise ValueError("branch-revision smoke prompt plus response must be smaller than model context")
+    if smoke_contract["max_tokens_per_gpu"] < (
+        smoke_contract["max_prompt_length"] + smoke_contract["max_response_length"]
+    ):
+        raise ValueError("branch-revision smoke token budget must fit one maximum-length original")
     for key, expected in dynamic_expected.items():
         actual = OmegaConf.select(config, key)
         if actual != expected:

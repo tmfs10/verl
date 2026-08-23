@@ -125,8 +125,7 @@ VALID_ANALYSIS = "The setup narrowed the choices. A local alternative is justifi
 def _structured(locator_prefix: str, new_continuation: str, analysis: str = VALID_ANALYSIS) -> str:
     joint = f"{locator_prefix}{new_continuation}"
     return (
-        f"{analysis}<prefix>{locator_prefix}</prefix>\n"
-        f"<prefix + new continuation>{joint}</prefix + new continuation>"
+        f"{analysis}<prefix>{locator_prefix}</prefix>\n<prefix + new continuation>{joint}</prefix + new continuation>"
     )
 
 
@@ -239,10 +238,9 @@ def test_terminal_eos_stripping_preserves_interior_special_token() -> None:
     [
         ("<prefix>x</prefix>", "tag_count"),
         (
-            "<prefix>x</prefix>\n<prefix + new continuation>xnew</prefix + new continuation>",
-            "empty_analysis",
+            _structured("", "new"),
+            "empty_prefix",
         ),
-        (_structured("", "new"), "empty_prefix"),
         (
             VALID_ANALYSIS
             + "<prefix>x</prefix>\n"
@@ -275,6 +273,20 @@ def test_parser_fails_closed_with_reason(critique: str, reason: str) -> None:
     )
     assert not parsed.valid
     assert parsed.reason == reason
+
+
+def test_parser_allows_empty_free_form_analysis() -> None:
+    parsed = parse_branch_revision(
+        _ids("x solution"),
+        _ids("<prefix>x</prefix>\n<prefix + new continuation>x new</prefix + new continuation>"),
+        TOKENIZER,
+        branch_max_tokens=128,
+        new_continuation_max_tokens=256,
+    )
+    assert parsed.valid
+    assert parsed.analysis_text == ""
+    assert parsed.prefix_text == "x"
+    assert parsed.new_continuation_text == " new"
 
 
 def test_parser_enforces_token_caps_without_trimming_contents() -> None:

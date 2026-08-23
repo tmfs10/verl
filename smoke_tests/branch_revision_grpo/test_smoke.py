@@ -92,6 +92,39 @@ def test_rendered_smoke_scales_dataset_batch_rollouts_and_critiques_together(tmp
     assert "+branch_revision_smoke.model_path=/hf_models/Qwen3-4B" in rendered
 
 
+def test_rendered_smoke_supports_two_node_32k_context_and_8k_answers(tmp_path: Path) -> None:
+    command, _ = build_command(
+        run_tag="two-node-32k",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        n_prompts=64,
+        n_samples=8,
+        num_critiques=2,
+        nodes=2,
+        max_prompt_length=2048,
+        max_response_length=8192,
+        max_model_len=32768,
+        critique_max_response_length=8192,
+        max_tokens_per_gpu=32768,
+    )
+    rendered = " ".join(command)
+    assert "--nodes 2" in rendered
+    assert "--max_prompt_len 2048" in rendered
+    assert "--max_len 10240" in rendered
+    assert "--max_tokens_per_gpu 32768" in rendered
+    assert "data.max_prompt_length=2048" in rendered
+    assert "data.max_response_length=8192" in rendered
+    assert "actor_rollout_ref.rollout.n=8" in rendered
+    assert "actor_rollout_ref.rollout.max_model_len=32768" in rendered
+    assert "algorithm.branch_revision_grpo.critique_max_response_length=8192" in rendered
+    assert "algorithm.branch_revision_grpo.num_critiques=2" in rendered
+    assert "algorithm.branch_revision_grpo.num_positive_critiques=2" in rendered
+
+
 def test_rendered_smoke_can_select_native_clipped_ppo(tmp_path: Path) -> None:
     command, _ = build_command(
         run_tag="vanilla",
@@ -135,6 +168,9 @@ def test_rendered_smoke_can_select_minimum_logprob_learnability(tmp_path: Path) 
         ({"model_path": "/hf_models/not-supported"}, "model_path"),
         ({"loss_mode": "not-supported"}, "loss_mode"),
         ({"learnability_logprob_statistic": "median"}, "learnability_logprob_statistic"),
+        ({"nodes": 3}, "at most two nodes"),
+        ({"max_model_len": 3072}, "must be smaller than max_model_len"),
+        ({"max_tokens_per_gpu": 2048}, "must fit one maximum-length original"),
     ],
 )
 def test_rendered_smoke_rejects_invalid_scale(overrides: dict[str, int | str], match: str, tmp_path: Path) -> None:
@@ -172,6 +208,7 @@ def _scaled_runtime_config(tmp_path: Path):
                 "rollout": {
                     "n": 4,
                     "max_model_len": 8192,
+                    "max_num_batched_tokens": 8192,
                     "temperature": 1.0,
                     "top_p": 1.0,
                     "top_k": -1,
@@ -181,6 +218,7 @@ def _scaled_runtime_config(tmp_path: Path):
                 "actor": {
                     "ppo_mini_batch_size": 8,
                     "ppo_epochs": 1,
+                    "ppo_max_token_len_per_gpu": 8192,
                     "policy_loss": {"loss_mode": "dppo_tv"},
                 },
             },
@@ -214,37 +252,32 @@ def _scaled_runtime_config(tmp_path: Path):
     )
 
 
+def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
+    return {
+        "model_path": str(tmp_path / "model"),
+        "n_prompts": n_prompts,
+        "n_samples": 4,
+        "num_critiques": 6,
+        "loss_mode": "dppo_tv",
+        "learnability_logprob_statistic": "mean",
+        "nodes": 1,
+        "max_prompt_length": 1024,
+        "max_response_length": 2048,
+        "max_model_len": 8192,
+        "critique_max_response_length": 2560,
+        "max_tokens_per_gpu": 8192,
+    }
+
+
 def test_scaled_runtime_contract_accepts_matching_resolved_dimensions(tmp_path: Path) -> None:
     config = _scaled_runtime_config(tmp_path)
-    _validate_contract(
-        config,
-        tmp_path,
-        {
-            "model_path": str(tmp_path / "model"),
-            "n_prompts": 32,
-            "n_samples": 4,
-            "num_critiques": 6,
-            "loss_mode": "dppo_tv",
-            "learnability_logprob_statistic": "mean",
-        },
-    )
+    _validate_contract(config, tmp_path, _scaled_smoke_contract(tmp_path))
 
 
 def test_scaled_runtime_contract_rejects_stale_fixed_dimension(tmp_path: Path) -> None:
     config = _scaled_runtime_config(tmp_path)
     with pytest.raises(ValueError, match="data.train_batch_size=8"):
-        _validate_contract(
-            config,
-            tmp_path,
-            {
-                "model_path": str(tmp_path / "model"),
-                "n_prompts": 8,
-                "n_samples": 4,
-                "num_critiques": 6,
-                "loss_mode": "dppo_tv",
-                "learnability_logprob_statistic": "mean",
-            },
-        )
+        _validate_contract(config, tmp_path, _scaled_smoke_contract(tmp_path, n_prompts=8))
 
 
 def _write_json(path: Path, value) -> None:
@@ -416,9 +449,7 @@ def _fixture(
             reference_payload = {
                 "window_weighting": "uniform_per_window",
                 "total_windows": len(originals),
-                "rollout_window_counts": [
-                    {"rollout_id": rollout_id, "windows": 1} for rollout_id in originals
-                ],
+                "rollout_window_counts": [{"rollout_id": rollout_id, "windows": 1} for rollout_id in originals],
                 "window_scores_sha256": _canonical_sha256(reference_scores, dtype="<f8"),
             }
         events.append(
@@ -457,9 +488,7 @@ def _fixture(
             if valid and schema_version >= 4 and original_index == 0:
                 branch_prefix_ids = []
             prefix_ids = [600 + original_index * 2 + critique_index] if valid and schema_version >= 4 else []
-            continuation_prefix_ids = (
-                [*branch_prefix_ids, *prefix_ids] if valid and schema_version >= 4 else []
-            )
+            continuation_prefix_ids = [*branch_prefix_ids, *prefix_ids] if valid and schema_version >= 4 else []
             replacement_ids = [
                 500 + original_index * 4 + critique_index * 2,
                 501 + original_index * 4 + critique_index * 2,
@@ -638,8 +667,7 @@ def _fixture(
         ]
     )
     events = [
-        {"schema_version": schema_version, "attempt_id": attempt_id, "global_step": 1, **event}
-        for event in events
+        {"schema_version": schema_version, "attempt_id": attempt_id, "global_step": 1, **event} for event in events
     ]
     _write_jsonl(_audit_path(root, attempt_id), events)
     _write_jsonl(

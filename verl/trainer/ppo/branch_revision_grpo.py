@@ -625,8 +625,6 @@ def parse_branch_revision(
         return _invalid("text_after_tags", solution_text, critique_text)
 
     analysis_text = critique_text[:prefix_open]
-    if not analysis_text.strip():
-        return _invalid("empty_analysis", solution_text, critique_text)
 
     prefix_text = critique_text[prefix_content_start:prefix_close]
     joint_text = critique_text[joint_content_start:joint_close]

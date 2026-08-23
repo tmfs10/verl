@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dry-run-first one-node OCI-IAD launcher for branch-revision GRPO smoke."""
+"""Dry-run-first OCI-IAD launcher for branch-revision GRPO smoke."""
 
 from __future__ import annotations
 
@@ -56,6 +56,12 @@ def _extra_args(
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
     learnability_logprob_statistic: str = "mean",
+    nodes: int = 1,
+    max_prompt_length: int = 1024,
+    max_response_length: int = 2048,
+    max_model_len: int = 8192,
+    critique_max_response_length: int = 2560,
+    max_tokens_per_gpu: int = 8192,
 ) -> str:
     if loss_mode not in {"dppo_tv", "vanilla"}:
         raise ValueError("loss_mode must be dppo_tv or vanilla")
@@ -74,15 +80,15 @@ def _extra_args(
         f"algorithm.branch_revision_grpo.learnability_logprob_statistic={learnability_logprob_statistic}",
         "algorithm.branch_revision_grpo.min_seed_window_percentile=0.20",
         "algorithm.branch_revision_grpo.full_credit_seed_window_percentile=0.50",
-        "algorithm.branch_revision_grpo.critique_max_response_length=2560",
+        f"algorithm.branch_revision_grpo.critique_max_response_length={critique_max_response_length}",
         "algorithm.branch_revision_grpo.branch_max_tokens=128",
         "algorithm.branch_revision_grpo.new_continuation_max_tokens=256",
         "algorithm.branch_revision_grpo.min_continuation_tokens=128",
         f"algorithm.branch_revision_grpo.audit_output_dir={remote_evidence}/audit",
         f"data.train_batch_size={n_prompts}",
         f"++data.gen_batch_size={n_prompts}",
-        "data.max_prompt_length=1024",
-        "data.max_response_length=2048",
+        f"data.max_prompt_length={max_prompt_length}",
+        f"data.max_response_length={max_response_length}",
         "data.filter_overlong_prompts=true",
         "data.filter_overlong_prompts_workers=8",
         "data.dataloader_num_workers=0",
@@ -94,7 +100,7 @@ def _extra_args(
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=null",
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.use_dynamic_bsz=true",
-        "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=8192",
+        f"actor_rollout_ref.actor.ppo_max_token_len_per_gpu={max_tokens_per_gpu}",
         "actor_rollout_ref.actor.use_kl_loss=false",
         f"actor_rollout_ref.actor.policy_loss.loss_mode={loss_mode}",
         "actor_rollout_ref.actor.fsdp_config.param_offload=false",
@@ -110,8 +116,8 @@ def _extra_args(
         "actor_rollout_ref.rollout.val_kwargs.top_p=1.0",
         "actor_rollout_ref.rollout.val_kwargs.top_k=-1",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        "actor_rollout_ref.rollout.max_model_len=8192",
-        "actor_rollout_ref.rollout.max_num_batched_tokens=8192",
+        f"actor_rollout_ref.rollout.max_model_len={max_model_len}",
+        f"actor_rollout_ref.rollout.max_num_batched_tokens={max_tokens_per_gpu}",
         "actor_rollout_ref.rollout.max_num_seqs=32",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.7",
         "actor_rollout_ref.rollout.enforce_eager=true",
@@ -144,6 +150,12 @@ def _extra_args(
         f"+branch_revision_smoke.model_path={model_path}",
         f"+branch_revision_smoke.loss_mode={loss_mode}",
         f"+branch_revision_smoke.learnability_logprob_statistic={learnability_logprob_statistic}",
+        f"+branch_revision_smoke.nodes={nodes}",
+        f"+branch_revision_smoke.max_prompt_length={max_prompt_length}",
+        f"+branch_revision_smoke.max_response_length={max_response_length}",
+        f"+branch_revision_smoke.max_model_len={max_model_len}",
+        f"+branch_revision_smoke.critique_max_response_length={critique_max_response_length}",
+        f"+branch_revision_smoke.max_tokens_per_gpu={max_tokens_per_gpu}",
     ]
     return " ".join(overrides)
 
@@ -164,11 +176,23 @@ def build_command(
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
     learnability_logprob_statistic: str = "mean",
+    nodes: int = 1,
+    max_prompt_length: int = 1024,
+    max_response_length: int = 2048,
+    max_model_len: int = 8192,
+    critique_max_response_length: int = 2560,
+    max_tokens_per_gpu: int = 8192,
 ) -> tuple[list[str], str]:
     positive = {
         "n_prompts": n_prompts,
         "n_samples": n_samples,
         "num_critiques": num_critiques,
+        "nodes": nodes,
+        "max_prompt_length": max_prompt_length,
+        "max_response_length": max_response_length,
+        "max_model_len": max_model_len,
+        "critique_max_response_length": critique_max_response_length,
+        "max_tokens_per_gpu": max_tokens_per_gpu,
     }
     for name, value in positive.items():
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -185,6 +209,14 @@ def build_command(
         raise ValueError("loss_mode must be dppo_tv or vanilla")
     if learnability_logprob_statistic not in {"mean", "min"}:
         raise ValueError("learnability_logprob_statistic must be mean or min")
+    if nodes > 2:
+        raise ValueError("this interactive-capable smoke launcher supports at most two nodes")
+    if max_prompt_length + max_response_length >= max_model_len:
+        raise ValueError("max_prompt_length + max_response_length must be smaller than max_model_len")
+    if critique_max_response_length >= max_model_len:
+        raise ValueError("critique_max_response_length must be smaller than max_model_len")
+    if max_tokens_per_gpu < max_prompt_length + max_response_length:
+        raise ValueError("max_tokens_per_gpu must fit one maximum-length original sequence")
     remote_output = f"/output/smoke_tests/branch_revision_grpo/{run_tag}"
     remote_evidence = f"{remote_output}/evidence"
     command = [
@@ -211,7 +243,7 @@ def build_command(
         "--time_limit",
         "02:00:00",
         "--nodes",
-        "1",
+        str(nodes),
         "--gpus",
         "8",
         "--actor_model",
@@ -231,11 +263,11 @@ def build_command(
         "--val_batch_size",
         "8",
         "--max_prompt_len",
-        "1024",
+        str(max_prompt_length),
         "--max_len",
-        "3072",
+        str(max_prompt_length + max_response_length),
         "--max_tokens_per_gpu",
-        "8192",
+        str(max_tokens_per_gpu),
         "--num_epochs",
         "1",
         "--num_training_jobs",
@@ -279,6 +311,12 @@ def build_command(
             model_path=model_path,
             loss_mode=loss_mode,
             learnability_logprob_statistic=learnability_logprob_statistic,
+            nodes=nodes,
+            max_prompt_length=max_prompt_length,
+            max_response_length=max_response_length,
+            max_model_len=max_model_len,
+            critique_max_response_length=critique_max_response_length,
+            max_tokens_per_gpu=max_tokens_per_gpu,
         ),
     ]
     if dry_run:
@@ -312,6 +350,12 @@ def main() -> None:
     parser.add_argument("--model-path", choices=sorted(SUPPORTED_MODEL_PATHS), default=MODEL_PATH)
     parser.add_argument("--loss-mode", choices=("dppo_tv", "vanilla"), default="dppo_tv")
     parser.add_argument("--learnability-logprob-statistic", choices=("mean", "min"), default="mean")
+    parser.add_argument("--nodes", type=int, default=1)
+    parser.add_argument("--max-prompt-length", type=int, default=1024)
+    parser.add_argument("--max-response-length", type=int, default=2048)
+    parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument("--critique-max-response-length", type=int, default=2560)
+    parser.add_argument("--max-tokens-per-gpu", type=int, default=8192)
     args = parser.parse_args()
 
     local_run_dir = args.local_run_dir.expanduser().resolve()
@@ -370,6 +414,12 @@ def main() -> None:
         model_path=args.model_path,
         loss_mode=args.loss_mode,
         learnability_logprob_statistic=args.learnability_logprob_statistic,
+        nodes=args.nodes,
+        max_prompt_length=args.max_prompt_length,
+        max_response_length=args.max_response_length,
+        max_model_len=args.max_model_len,
+        critique_max_response_length=args.critique_max_response_length,
+        max_tokens_per_gpu=args.max_tokens_per_gpu,
     )
     git = _git_provenance(repo_root)
     provenance = {
@@ -399,6 +449,12 @@ def main() -> None:
             model_path=args.model_path,
             loss_mode=args.loss_mode,
             learnability_logprob_statistic=args.learnability_logprob_statistic,
+            nodes=args.nodes,
+            max_prompt_length=args.max_prompt_length,
+            max_response_length=args.max_response_length,
+            max_model_len=args.max_model_len,
+            critique_max_response_length=args.critique_max_response_length,
+            max_tokens_per_gpu=args.max_tokens_per_gpu,
         )
         result = _run(dry_command, local_run_dir / "dry_run.log")
         if result.returncode:
