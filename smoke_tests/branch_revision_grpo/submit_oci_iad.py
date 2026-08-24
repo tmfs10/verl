@@ -55,6 +55,7 @@ def _extra_args(
     n_samples: int = 4,
     num_critiques: int = 4,
     critique_grpo_grouping: str = "per_original",
+    critique_advantage_mode: str = "grpo",
     enable_positive_compression: bool = True,
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
@@ -79,6 +80,10 @@ def _extra_args(
         raise ValueError("loss_mode must be dppo_tv or vanilla")
     if critique_grpo_grouping not in {"per_original", "batch"}:
         raise ValueError("critique_grpo_grouping must be per_original or batch")
+    if critique_advantage_mode not in {"grpo", "pass_at_1"}:
+        raise ValueError("critique_advantage_mode must be grpo or pass_at_1")
+    if critique_advantage_mode == "pass_at_1" and enable_positive_compression:
+        raise ValueError("pass_at_1 critique advantages require recovery-only generation")
     if not isinstance(enable_positive_compression, bool):
         raise ValueError("enable_positive_compression must be boolean")
     if learnability_logprob_statistic not in {"mean", "min"}:
@@ -102,6 +107,12 @@ def _extra_args(
         f"algorithm.branch_revision_grpo.critique_model_n_gpus_per_node={critique_model_n_gpus_per_node}",
         f"algorithm.branch_revision_grpo.num_critiques={num_critiques}",
         f"algorithm.branch_revision_grpo.critique_grpo_grouping={critique_grpo_grouping}",
+        f"algorithm.branch_revision_grpo.critique_advantage_mode={critique_advantage_mode}",
+        "algorithm.branch_revision_grpo.critique_invalid_penalty=0.20",
+        "algorithm.branch_revision_grpo.critique_learnability_rejection_penalty=0.05",
+        "algorithm.branch_revision_grpo.critique_advantage_rms_floor=0.10",
+        "algorithm.branch_revision_grpo.critique_advantage_clip=5.0",
+        "algorithm.branch_revision_grpo.critique_prompt_headroom_exponent=1.0",
         f"algorithm.branch_revision_grpo.enable_positive_compression={str(enable_positive_compression).lower()}",
         f"algorithm.branch_revision_grpo.num_positive_critiques={num_critiques}",
         "algorithm.branch_revision_grpo.positive_compression_target=0.25",
@@ -181,6 +192,7 @@ def _extra_args(
         f"+branch_revision_smoke.n_samples={n_samples}",
         f"+branch_revision_smoke.num_critiques={num_critiques}",
         f"+branch_revision_smoke.critique_grpo_grouping={critique_grpo_grouping}",
+        f"+branch_revision_smoke.critique_advantage_mode={critique_advantage_mode}",
         f"+branch_revision_smoke.enable_positive_compression={str(enable_positive_compression).lower()}",
         f"+branch_revision_smoke.model_path={model_path}",
         f"+branch_revision_smoke.loss_mode={loss_mode}",
@@ -218,6 +230,7 @@ def build_command(
     n_samples: int = 4,
     num_critiques: int = 4,
     critique_grpo_grouping: str = "per_original",
+    critique_advantage_mode: str = "grpo",
     enable_positive_compression: bool = True,
     seed: int = 43,
     model_path: str = MODEL_PATH,
@@ -267,6 +280,10 @@ def build_command(
         raise ValueError("separate_critique_model must be boolean")
     if critique_grpo_grouping not in {"per_original", "batch"}:
         raise ValueError("critique_grpo_grouping must be per_original or batch")
+    if critique_advantage_mode not in {"grpo", "pass_at_1"}:
+        raise ValueError("critique_advantage_mode must be grpo or pass_at_1")
+    if critique_advantage_mode == "pass_at_1" and enable_positive_compression:
+        raise ValueError("pass_at_1 critique advantages require recovery-only generation")
     if not isinstance(enable_positive_compression, bool):
         raise ValueError("enable_positive_compression must be boolean")
     if (
@@ -403,6 +420,7 @@ def build_command(
             n_samples=n_samples,
             num_critiques=num_critiques,
             critique_grpo_grouping=critique_grpo_grouping,
+            critique_advantage_mode=critique_advantage_mode,
             enable_positive_compression=enable_positive_compression,
             model_path=model_path,
             loss_mode=loss_mode,
@@ -456,6 +474,7 @@ def main() -> None:
     parser.add_argument("--n-samples", type=int, default=4)
     parser.add_argument("--num-critiques", type=int, default=4)
     parser.add_argument("--critique-grpo-grouping", choices=("per_original", "batch"), default="per_original")
+    parser.add_argument("--critique-advantage-mode", choices=("grpo", "pass_at_1"), default="grpo")
     parser.add_argument("--disable-positive-compression", action="store_true")
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument("--model-path", choices=sorted(SUPPORTED_MODEL_PATHS), default=MODEL_PATH)
@@ -546,6 +565,7 @@ def main() -> None:
         n_samples=args.n_samples,
         num_critiques=args.num_critiques,
         critique_grpo_grouping=args.critique_grpo_grouping,
+        critique_advantage_mode=args.critique_advantage_mode,
         enable_positive_compression=not args.disable_positive_compression,
         seed=args.seed,
         model_path=args.model_path,
@@ -593,6 +613,7 @@ def main() -> None:
             n_samples=args.n_samples,
             num_critiques=args.num_critiques,
             critique_grpo_grouping=args.critique_grpo_grouping,
+            critique_advantage_mode=args.critique_advantage_mode,
             enable_positive_compression=not args.disable_positive_compression,
             seed=args.seed,
             model_path=args.model_path,

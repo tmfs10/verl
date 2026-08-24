@@ -186,6 +186,12 @@ class BranchRevisionGRPOConfig(BaseConfig):
     critique_model_nnodes: int = 1
     critique_model_n_gpus_per_node: int = 8
     critique_grpo_grouping: str = "per_original"
+    critique_advantage_mode: str = "grpo"
+    critique_invalid_penalty: float = 0.20
+    critique_learnability_rejection_penalty: float = 0.05
+    critique_advantage_rms_floor: float = 0.10
+    critique_advantage_clip: float = 5.0
+    critique_prompt_headroom_exponent: float = 1.0
     num_critiques: int = 4
     enable_positive_compression: bool = False
     num_positive_critiques: int = 4
@@ -222,6 +228,23 @@ class BranchRevisionGRPOConfig(BaseConfig):
                 raise ValueError(f"algorithm.branch_revision_grpo.{name} must be a positive integer")
         if self.critique_grpo_grouping not in {"per_original", "batch"}:
             raise ValueError("algorithm.branch_revision_grpo.critique_grpo_grouping must be per_original or batch")
+        if self.critique_advantage_mode not in {"grpo", "pass_at_1"}:
+            raise ValueError("algorithm.branch_revision_grpo.critique_advantage_mode must be grpo or pass_at_1")
+        nonnegative_floats = {
+            "critique_invalid_penalty": self.critique_invalid_penalty,
+            "critique_learnability_rejection_penalty": self.critique_learnability_rejection_penalty,
+            "critique_prompt_headroom_exponent": self.critique_prompt_headroom_exponent,
+        }
+        for name, value in nonnegative_floats.items():
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"algorithm.branch_revision_grpo.{name} must be finite and nonnegative")
+        positive_floats = {
+            "critique_advantage_rms_floor": self.critique_advantage_rms_floor,
+            "critique_advantage_clip": self.critique_advantage_clip,
+        }
+        for name, value in positive_floats.items():
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"algorithm.branch_revision_grpo.{name} must be finite and positive")
         positive_ints = {
             "num_critiques": self.num_critiques,
             "num_positive_critiques": self.num_positive_critiques,
@@ -238,6 +261,10 @@ class BranchRevisionGRPOConfig(BaseConfig):
             raise ValueError("algorithm.branch_revision_grpo.num_positive_critiques must be at least 2 for GRPO")
         if not isinstance(self.enable_positive_compression, bool):
             raise ValueError("algorithm.branch_revision_grpo.enable_positive_compression must be boolean")
+        if self.critique_advantage_mode == "pass_at_1" and self.enable_positive_compression:
+            raise ValueError(
+                "algorithm.branch_revision_grpo.critique_advantage_mode=pass_at_1 currently supports recovery only"
+            )
         if self.critique_max_response_length is not None and (
             not isinstance(self.critique_max_response_length, int)
             or isinstance(self.critique_max_response_length, bool)

@@ -2107,6 +2107,121 @@ def test_batch_critique_grouping_normalizes_all_iteration_critiques_together() -
     assert metrics["branch_revision/critique_advantage/mean"] == pytest.approx(0.0, abs=1e-7)
 
 
+def test_pass_at_1_critique_advantages_keep_all_failure_signal_and_apply_penalties() -> None:
+    controller = _controller()
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        num_critiques=2,
+        critique_grpo_grouping="batch",
+        critique_advantage_mode="pass_at_1",
+    )
+    failed = _critique(_structured("dead", "better"), valid=True, continuation=" failed")
+    invalid = _critique("invalid", valid=False)
+    wrong = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("wrong"),
+        solution_log_probs=[-0.1] * len(_ids("wrong")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord("p:0", "recovery", (failed, invalid), tuple(_ids("prompt"))),
+        learnability={0: _learnability()},
+        continuation_rewards={0: 0.0},
+    )
+    correct = _Bundle(
+        source_row=1,
+        rollout_id="p:1",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("correct"),
+        solution_log_probs=[-0.1] * len(_ids("correct")),
+        original_reward=1.0,
+    )
+
+    rows = controller._actor_rows([wrong, correct])
+    critiques = [row for row in rows if row.kind == "critique"]
+    assert [row.reward for row in critiques] == pytest.approx([-0.5, -0.7])
+    expected_scale = math.sqrt((0.5**2 + 0.7**2) / 2.0)
+    assert [row.advantage_scale for row in critiques] == pytest.approx([expected_scale, expected_scale])
+    assert [row.prompt_weight for row in critiques] == pytest.approx([1.0, 1.0])
+    assert [row.advantage_override for row in critiques] == pytest.approx(
+        [-0.5 / expected_scale, -0.7 / expected_scale]
+    )
+    assert critiques[0].invalid_penalty == 0.0
+    assert critiques[1].invalid_penalty == pytest.approx(0.2)
+
+    actor_batch, padding_rows = controller._make_actor_batch([wrong, correct])
+    critique_indices = [
+        index
+        for index, kind in enumerate(actor_batch.non_tensor_batch["branch_revision_actor_kind"])
+        if kind == "critique"
+    ]
+    actual = [
+        float(actor_batch.batch["advantages"][index][actor_batch.batch["response_mask"][index].bool()][0])
+        for index in critique_indices
+    ]
+    assert actual == pytest.approx([-0.5 / expected_scale, -0.7 / expected_scale])
+    assert all(value < 0.0 for value in actual)
+    metrics = controller._metrics([wrong, correct], actor_batch, padding_rows)
+    assert metrics["branch_revision/critique_advantage_mode_is_pass_at_1"] == 1.0
+    assert metrics["branch_revision/critique_advantage/positive_fraction"] == 0.0
+    assert metrics["branch_revision/critique_advantage/negative_fraction"] == 1.0
+    assert metrics["branch_revision/critique_advantage/invalid_penalty_fraction"] == 0.5
+
+
+def test_pass_at_1_prompt_weights_downweight_easier_prompts_without_recentering() -> None:
+    controller = _controller()
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        num_critiques=2,
+        critique_grpo_grouping="batch",
+        critique_advantage_mode="pass_at_1",
+    )
+    successful = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    invalid = _critique("invalid", valid=False)
+    hard_wrong = _Bundle(
+        source_row=0,
+        rollout_id="hard:0",
+        prompt_group_id="hard",
+        prompt_ids=_ids("hard"),
+        solution_ids=_ids("wrong"),
+        solution_log_probs=[-0.1] * len(_ids("wrong")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord(
+            "hard:0", "recovery", (successful, invalid), tuple(_ids("hard prompt"))
+        ),
+        learnability={0: _learnability()},
+        continuation_rewards={0: 1.0},
+    )
+    easy_wrong = replace(hard_wrong, source_row=1, rollout_id="easy:0", prompt_group_id="easy")
+    easy_correct = _Bundle(
+        source_row=2,
+        rollout_id="easy:1",
+        prompt_group_id="easy",
+        prompt_ids=_ids("easy"),
+        solution_ids=_ids("correct"),
+        solution_log_probs=[-0.1] * len(_ids("correct")),
+        original_reward=1.0,
+    )
+    rows = controller._actor_rows([hard_wrong, easy_wrong, easy_correct])
+    critiques = [row for row in rows if row.kind == "critique"]
+    assert [row.reward for row in critiques] == pytest.approx([1.0, -0.2, 0.5, -0.7])
+    assert [row.prompt_weight for row in critiques] == pytest.approx([4 / 3, 4 / 3, 2 / 3, 2 / 3])
+    assert sum(row.advantage_override for row in critiques) != pytest.approx(0.0)
+
+
+def test_pass_at_1_critique_advantages_reject_positive_compression() -> None:
+    with pytest.raises(ValueError, match="currently supports recovery only"):
+        BranchRevisionGRPOConfig(
+            enable=True,
+            num_critiques=2,
+            critique_advantage_mode="pass_at_1",
+            enable_positive_compression=True,
+            num_positive_critiques=2,
+        )
+
+
 def test_per_original_critique_grouping_remains_the_default() -> None:
     controller = _controller()
     invalid = _critique("invalid", valid=False)

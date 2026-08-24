@@ -276,6 +276,13 @@ class _ActorRow:
     reward: float
     group_id: str
     kind: str
+    prompt_group_id: str
+    advantage_override: float | None = None
+    raw_advantage: float | None = None
+    advantage_scale: float | None = None
+    prompt_weight: float | None = None
+    invalid_penalty: float = 0.0
+    learnability_rejection_penalty: float = 0.0
 
 
 class BranchRevisionGRPOController:
@@ -1245,6 +1252,7 @@ class BranchRevisionGRPOController:
                     reward=bundle.original_reward,
                     group_id=solution_group,
                     kind="original",
+                    prompt_group_id=bundle.prompt_group_id,
                 )
             )
             if bundle.record is None:
@@ -1256,9 +1264,25 @@ class BranchRevisionGRPOController:
                 learnability = bundle.learnability.get(critique_index)
                 learnability_weight = learnability.reward_weight if learnability is not None else 0.0
                 accepted = bool(learnability is not None and learnability.accepted)
+                structurally_invalid = not critique.valid
+                learnability_rejected = bool(critique.valid and not accepted)
+                invalid_penalty = 0.0
+                learnability_rejection_penalty = 0.0
                 if bundle.record.objective == "recovery":
                     objective_credit = continuation_outcome
-                    critique_reward = objective_credit * learnability_weight - baseline
+                    if self.feature.critique_advantage_mode == "pass_at_1":
+                        invalid_penalty = self.feature.critique_invalid_penalty * float(structurally_invalid)
+                        learnability_rejection_penalty = (
+                            self.feature.critique_learnability_rejection_penalty * float(learnability_rejected)
+                        )
+                        critique_reward = (
+                            continuation_outcome
+                            - baseline
+                            - invalid_penalty
+                            - learnability_rejection_penalty
+                        )
+                    else:
+                        critique_reward = objective_credit * learnability_weight - baseline
                 elif bundle.record.objective == "compression":
                     objective_credit = bundle.compression_credits.get(critique_index, 0.0)
                     critique_reward = objective_credit * learnability_weight
@@ -1273,6 +1297,12 @@ class BranchRevisionGRPOController:
                         reward=critique_reward,
                         group_id=critique_group,
                         kind="critique",
+                        prompt_group_id=bundle.prompt_group_id,
+                        raw_advantage=(
+                            critique_reward if self.feature.critique_advantage_mode == "pass_at_1" else None
+                        ),
+                        invalid_penalty=invalid_penalty,
+                        learnability_rejection_penalty=learnability_rejection_penalty,
                     )
                 )
                 if critique.valid and accepted:
@@ -1285,6 +1315,7 @@ class BranchRevisionGRPOController:
                             reward=continuation_outcome,
                             group_id=solution_group,
                             kind="continuation",
+                            prompt_group_id=bundle.prompt_group_id,
                         )
                     )
                 self._audit(
@@ -1308,6 +1339,11 @@ class BranchRevisionGRPOController:
                     continuation_reward_evaluated=critique_index in bundle.continuation_rewards,
                     continuation_wasted_by_learnability=False,
                     continuation_skipped_by_learnability=bool(critique.valid and not accepted),
+                    critique_advantage_mode=self.feature.critique_advantage_mode,
+                    structurally_invalid=structurally_invalid,
+                    learnability_rejected=learnability_rejected,
+                    invalid_penalty=invalid_penalty,
+                    learnability_rejection_penalty=learnability_rejection_penalty,
                     parse_reason=critique.parse_reason,
                     prefix=critique.prefix_text,
                     prefix_plus_new_continuation=critique.prefix_plus_new_continuation_text,
@@ -1329,7 +1365,65 @@ class BranchRevisionGRPOController:
                     critique_prompt_ids=critique_prompt,
                     finish_reason=critique.finish_reason,
                 )
+        if self.feature.critique_advantage_mode == "pass_at_1":
+            rows = self._apply_external_critique_advantages(rows, prompt_pass_at_1)
         return rows
+
+    def _apply_external_critique_advantages(
+        self,
+        rows: list[_ActorRow],
+        prompt_pass_at_1: dict[str, float],
+    ) -> list[_ActorRow]:
+        critique_indices = [index for index, row in enumerate(rows) if row.kind == "critique"]
+        if not critique_indices:
+            return rows
+        raw = np.asarray([rows[index].reward for index in critique_indices], dtype=np.float64)
+        if not np.all(np.isfinite(raw)):
+            raise RuntimeError("external critique advantages contain non-finite raw values")
+        scale = max(
+            float(np.sqrt(np.mean(np.square(raw), dtype=np.float64))),
+            self.feature.critique_advantage_rms_floor,
+        )
+        scaled = np.clip(raw / scale, -self.feature.critique_advantage_clip, self.feature.critique_advantage_clip)
+
+        prompt_counts = Counter(rows[index].prompt_group_id for index in critique_indices)
+        unnormalized_weights: list[float] = []
+        for index in critique_indices:
+            row = rows[index]
+            if row.prompt_group_id not in prompt_pass_at_1:
+                raise RuntimeError("external critique advantage lost its prompt pass@1 baseline")
+            headroom = max(0.0, 1.0 - prompt_pass_at_1[row.prompt_group_id])
+            weight = headroom**self.feature.critique_prompt_headroom_exponent / prompt_counts[row.prompt_group_id]
+            unnormalized_weights.append(weight)
+        weight_mean = float(np.mean(np.asarray(unnormalized_weights, dtype=np.float64)))
+        if not math.isfinite(weight_mean) or weight_mean <= 0.0:
+            raise RuntimeError("external critique prompt weights must have a finite positive mean")
+        normalized_weights = np.asarray(unnormalized_weights, dtype=np.float64) / weight_mean
+
+        updated = list(rows)
+        for position, row_index in enumerate(critique_indices):
+            advantage = float(scaled[position] * normalized_weights[position])
+            row = rows[row_index]
+            updated[row_index] = replace(
+                row,
+                advantage_override=advantage,
+                advantage_scale=scale,
+                prompt_weight=float(normalized_weights[position]),
+            )
+            self._audit(
+                "critique_advantage",
+                actor_row_id=row.audit_row_id,
+                prompt_group_id=row.prompt_group_id,
+                mode=self.feature.critique_advantage_mode,
+                raw_advantage=float(raw[position]),
+                rms_scale=scale,
+                scaled_advantage=float(scaled[position]),
+                prompt_weight=float(normalized_weights[position]),
+                final_advantage=advantage,
+                invalid_penalty=row.invalid_penalty,
+                learnability_rejection_penalty=row.learnability_rejection_penalty,
+            )
+        return updated
 
     def _make_policy_batch(self, rows: list[_ActorRow], *, worker_group) -> tuple[DataProto, int]:
         if not rows:
@@ -1355,6 +1449,11 @@ class BranchRevisionGRPOController:
         kinds: list[str] = []
         audit_row_ids: list[str] = []
         scalar_rewards: list[float] = []
+        raw_advantages: list[float] = []
+        advantage_scales: list[float] = []
+        prompt_weights: list[float] = []
+        invalid_penalties: list[float] = []
+        learnability_rejection_penalties: list[float] = []
         for row_index, row in enumerate(rows):
             behavior = row.behavior_log_probs
             if not behavior or row.train_start <= 0 or row.train_start + len(behavior) != len(row.full_ids):
@@ -1375,6 +1474,11 @@ class BranchRevisionGRPOController:
             kinds.append(row.kind)
             audit_row_ids.append(row.audit_row_id)
             scalar_rewards.append(row.reward)
+            raw_advantages.append(row.raw_advantage if row.raw_advantage is not None else row.reward)
+            advantage_scales.append(row.advantage_scale if row.advantage_scale is not None else 1.0)
+            prompt_weights.append(row.prompt_weight if row.prompt_weight is not None else 1.0)
+            invalid_penalties.append(row.invalid_penalty)
+            learnability_rejection_penalties.append(row.learnability_rejection_penalty)
         for padding_index in range(padding_rows):
             row_index = len(rows) + padding_index
             attention_mask[row_index, 0] = 1
@@ -1382,6 +1486,11 @@ class BranchRevisionGRPOController:
             kinds.append("padding")
             audit_row_ids.append(f"padding:{padding_index}")
             scalar_rewards.append(0.0)
+            raw_advantages.append(0.0)
+            advantage_scales.append(1.0)
+            prompt_weights.append(1.0)
+            invalid_penalties.append(0.0)
+            learnability_rejection_penalties.append(0.0)
 
         advantages, returns = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=token_level_rewards,
@@ -1390,6 +1499,12 @@ class BranchRevisionGRPOController:
             norm_adv_by_std_in_grpo=bool(self.config.algorithm.norm_adv_by_std_in_grpo),
             config=self.config.algorithm,
         )
+        for row_index, row in enumerate(rows):
+            if row.advantage_override is None:
+                continue
+            override = torch.tensor(row.advantage_override, dtype=advantages.dtype)
+            advantages[row_index] = override * response_mask[row_index]
+            returns[row_index] = override * response_mask[row_index]
         input_ids = torch.cat([prompts, responses], dim=1)
         actor_batch = DataProto.from_dict(
             tensors={
@@ -1410,6 +1525,13 @@ class BranchRevisionGRPOController:
                 "branch_revision_actor_kind": np.array(kinds, dtype=object),
                 "branch_revision_audit_row_id": np.array(audit_row_ids, dtype=object),
                 "branch_revision_reward": np.array(scalar_rewards, dtype=np.float32),
+                "branch_revision_raw_advantage": np.array(raw_advantages, dtype=np.float32),
+                "branch_revision_advantage_scale": np.array(advantage_scales, dtype=np.float32),
+                "branch_revision_prompt_weight": np.array(prompt_weights, dtype=np.float32),
+                "branch_revision_invalid_penalty": np.array(invalid_penalties, dtype=np.float32),
+                "branch_revision_learnability_rejection_penalty": np.array(
+                    learnability_rejection_penalties, dtype=np.float32
+                ),
             },
         )
         actor_batch.meta_info.update(
@@ -1433,6 +1555,11 @@ class BranchRevisionGRPOController:
         group_ids = actor_batch.non_tensor_batch["uid"]
         audit_row_ids = actor_batch.non_tensor_batch["branch_revision_audit_row_id"]
         scalar_rewards = actor_batch.non_tensor_batch["branch_revision_reward"]
+        raw_advantages = actor_batch.non_tensor_batch["branch_revision_raw_advantage"]
+        advantage_scales = actor_batch.non_tensor_batch["branch_revision_advantage_scale"]
+        prompt_weights = actor_batch.non_tensor_batch["branch_revision_prompt_weight"]
+        invalid_penalties = actor_batch.non_tensor_batch["branch_revision_invalid_penalty"]
+        rejection_penalties = actor_batch.non_tensor_batch["branch_revision_learnability_rejection_penalty"]
         if len(set(str(value) for value in audit_row_ids)) != len(actor_batch):
             raise RuntimeError("branch-revision actor audit row IDs must be unique after balancing")
         actor_rows: list[dict[str, Any]] = []
@@ -1446,6 +1573,7 @@ class BranchRevisionGRPOController:
             train_stop = int(trained_positions[-1].item() + 2) if trained_positions.numel() else None
             old_log_probs = actor_batch.batch["old_log_probs"][row_index][trained]
             rollout_log_probs = actor_batch.batch["rollout_log_probs"][row_index][trained]
+            row_advantages = actor_batch.batch["advantages"][row_index][trained]
             actor_rows.append(
                 {
                     "balanced_row_index": row_index,
@@ -1453,6 +1581,12 @@ class BranchRevisionGRPOController:
                     "kind": str(kinds[row_index]),
                     "group_id": str(group_ids[row_index]),
                     "reward": float(scalar_rewards[row_index]),
+                    "raw_advantage": float(raw_advantages[row_index]),
+                    "advantage_scale": float(advantage_scales[row_index]),
+                    "prompt_weight": float(prompt_weights[row_index]),
+                    "invalid_penalty": float(invalid_penalties[row_index]),
+                    "learnability_rejection_penalty": float(rejection_penalties[row_index]),
+                    "advantage": float(row_advantages[0].item()) if row_advantages.numel() else 0.0,
                     "sequence_length": len(input_ids),
                     "response_width": int(response_mask.numel()),
                     "train_start": train_start,
@@ -1462,6 +1596,9 @@ class BranchRevisionGRPOController:
                     "old_log_probs_sha256": _canonical_sha256(old_log_probs.detach().cpu().tolist(), dtype="<f4"),
                     "rollout_log_probs_sha256": _canonical_sha256(
                         rollout_log_probs.detach().cpu().tolist(), dtype="<f4"
+                    ),
+                    "advantages_sha256": _canonical_sha256(
+                        row_advantages.detach().cpu().tolist(), dtype="<f4"
                     ),
                 }
             )
@@ -1479,6 +1616,7 @@ class BranchRevisionGRPOController:
             clip_ratio_low=self.config.actor_rollout_ref.actor.clip_ratio_low,
             clip_ratio_high=self.config.actor_rollout_ref.actor.clip_ratio_high,
             clip_ratio_c=float(self.config.actor_rollout_ref.actor.clip_ratio_c),
+            critique_advantage_mode=self.feature.critique_advantage_mode,
             actor_rows=actor_rows,
         )
 
@@ -1621,10 +1759,20 @@ class BranchRevisionGRPOController:
         critique_group_ids: list[str] = []
         critique_rewards: list[float] = []
         critique_advantages: list[float] = []
+        critique_raw_advantages: list[float] = []
+        critique_advantage_scales: list[float] = []
+        critique_prompt_weights: list[float] = []
+        critique_invalid_penalties: list[float] = []
+        critique_rejection_penalties: list[float] = []
         for batch in policy_batches:
             kinds = batch.non_tensor_batch["branch_revision_actor_kind"]
             group_ids = batch.non_tensor_batch["uid"]
             rewards = batch.non_tensor_batch["branch_revision_reward"]
+            raw_advantages = batch.non_tensor_batch["branch_revision_raw_advantage"]
+            advantage_scales = batch.non_tensor_batch["branch_revision_advantage_scale"]
+            prompt_weights = batch.non_tensor_batch["branch_revision_prompt_weight"]
+            invalid_penalties = batch.non_tensor_batch["branch_revision_invalid_penalty"]
+            rejection_penalties = batch.non_tensor_batch["branch_revision_learnability_rejection_penalty"]
             for row_index, kind in enumerate(kinds):
                 if kind != "critique":
                     continue
@@ -1638,6 +1786,11 @@ class BranchRevisionGRPOController:
                 critique_group_ids.append(str(group_ids[row_index]))
                 critique_rewards.append(float(rewards[row_index]))
                 critique_advantages.append(first_advantage)
+                critique_raw_advantages.append(float(raw_advantages[row_index]))
+                critique_advantage_scales.append(float(advantage_scales[row_index]))
+                critique_prompt_weights.append(float(prompt_weights[row_index]))
+                critique_invalid_penalties.append(float(invalid_penalties[row_index]))
+                critique_rejection_penalties.append(float(rejection_penalties[row_index]))
         critique_group_sizes = list(Counter(critique_group_ids).values())
 
         def distribution_metrics(values: list[float], prefix: str) -> dict[str, float]:
@@ -1728,6 +1881,27 @@ class BranchRevisionGRPOController:
             "branch_revision/critique_warmup_active": float(self._critique_warmup_active()),
             "branch_revision/separate_critique_model": float(self.feature.separate_critique_model),
             "branch_revision/critique_grpo_grouping_is_batch": float(self.feature.critique_grpo_grouping == "batch"),
+            "branch_revision/critique_advantage_mode_is_pass_at_1": float(
+                self.feature.critique_advantage_mode == "pass_at_1"
+            ),
+            "branch_revision/critique_advantage/raw_rms": (
+                float(np.sqrt(np.mean(np.square(np.asarray(critique_raw_advantages, dtype=np.float64)))))
+                if critique_raw_advantages
+                else 0.0
+            ),
+            "branch_revision/critique_advantage/rms_scale": (
+                float(max(critique_advantage_scales)) if critique_advantage_scales else 0.0
+            ),
+            "branch_revision/critique_advantage/invalid_penalty_fraction": (
+                float(sum(value > 0.0 for value in critique_invalid_penalties) / len(critique_invalid_penalties))
+                if critique_invalid_penalties
+                else 0.0
+            ),
+            "branch_revision/critique_advantage/learnability_rejection_penalty_fraction": (
+                float(sum(value > 0.0 for value in critique_rejection_penalties) / len(critique_rejection_penalties))
+                if critique_rejection_penalties
+                else 0.0
+            ),
             "branch_revision/critique_grpo_group_count": float(len(critique_group_sizes)),
             "branch_revision/critique_grpo_group_size_mean": (
                 float(sum(critique_group_sizes) / len(critique_group_sizes)) if critique_group_sizes else 0.0
@@ -1753,6 +1927,8 @@ class BranchRevisionGRPOController:
             ),
         }
         metrics.update(distribution_metrics(critique_rewards, "branch_revision/critique_reward"))
+        metrics.update(distribution_metrics(critique_raw_advantages, "branch_revision/critique_raw_advantage"))
+        metrics.update(distribution_metrics(critique_prompt_weights, "branch_revision/critique_prompt_weight"))
         metrics.update(distribution_metrics(critique_advantages, "branch_revision/critique_advantage"))
         denominator = len(critiques) or 1
         for reason, count in sorted(parse_counts.items()):
@@ -1935,6 +2111,12 @@ class BranchRevisionGRPOController:
             correct=sum(bundle.original_reward == 1.0 for bundle in bundles),
             positive_compression_enabled=self.feature.enable_positive_compression,
             critique_grpo_grouping=self.feature.critique_grpo_grouping,
+            critique_advantage_mode=self.feature.critique_advantage_mode,
+            critique_invalid_penalty=self.feature.critique_invalid_penalty,
+            critique_learnability_rejection_penalty=self.feature.critique_learnability_rejection_penalty,
+            critique_advantage_rms_floor=self.feature.critique_advantage_rms_floor,
+            critique_advantage_clip=self.feature.critique_advantage_clip,
+            critique_prompt_headroom_exponent=self.feature.critique_prompt_headroom_exponent,
             learnability_logprob_statistic=self.feature.learnability_logprob_statistic,
             learnability_threshold_mode=self.feature.learnability_threshold_mode,
             max_seed_window_stddevs=self.feature.max_seed_window_stddevs,

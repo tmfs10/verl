@@ -212,6 +212,24 @@ algorithm:
     # in the complete synchronous training iteration. This is never scoped to an optimizer microbatch or rank.
     critique_grpo_grouping: per_original
 
+    # Critique advantage estimator: centered GRPO or an external pass@1 baseline without recentering.
+    critique_advantage_mode: grpo
+
+    # Additive penalty applied to malformed or otherwise structurally invalid critiques in pass_at_1 mode.
+    critique_invalid_penalty: 0.20
+
+    # Additive penalty applied to structurally valid but learnability-rejected critiques in pass_at_1 mode.
+    critique_learnability_rejection_penalty: 0.05
+
+    # Lower bound for the per-iteration RMS divisor used by pass_at_1 critique advantages.
+    critique_advantage_rms_floor: 0.10
+
+    # Symmetric clip applied after RMS scaling and before prompt weighting.
+    critique_advantage_clip: 5.0
+
+    # Exponent on prompt headroom (1 - prompt pass@1) for per-prompt critique row weighting.
+    critique_prompt_headroom_exponent: 1.0
+
     # Number of IID critiques sampled for every incorrect original rollout.
     num_critiques: 4
 

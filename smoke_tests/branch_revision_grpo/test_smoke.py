@@ -48,6 +48,7 @@ def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(t
     assert "actor_rollout_ref.actor.policy_loss.loss_mode=dppo_tv" in rendered
     assert "algorithm.branch_revision_grpo.num_critiques=4" in rendered
     assert "algorithm.branch_revision_grpo.critique_grpo_grouping=per_original" in rendered
+    assert "algorithm.branch_revision_grpo.critique_advantage_mode=grpo" in rendered
     assert "algorithm.branch_revision_grpo.enable_positive_compression=true" in rendered
     assert "algorithm.branch_revision_grpo.num_positive_critiques=4" in rendered
     assert "algorithm.branch_revision_grpo.min_seed_window_percentile=0.20" in rendered
@@ -291,6 +292,40 @@ def test_rendered_smoke_supports_batch_grouped_recovery_only_critiques(tmp_path:
     assert "+branch_revision_smoke.enable_positive_compression=false" in rendered
 
 
+def test_rendered_smoke_supports_external_pass_at_1_recovery_advantages(tmp_path: Path) -> None:
+    command, _ = build_command(
+        run_tag="external-pass-at-1",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        critique_grpo_grouping="batch",
+        critique_advantage_mode="pass_at_1",
+        enable_positive_compression=False,
+    )
+    rendered = " ".join(command)
+    assert "algorithm.branch_revision_grpo.critique_advantage_mode=pass_at_1" in rendered
+    assert "+branch_revision_smoke.critique_advantage_mode=pass_at_1" in rendered
+    assert "algorithm.branch_revision_grpo.enable_positive_compression=false" in rendered
+
+
+def test_rendered_smoke_rejects_external_pass_at_1_with_compression(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="recovery-only"):
+        build_command(
+            run_tag="invalid-pass-at-1-compression",
+            dry_run=False,
+            python=Path("/python"),
+            launcher=Path("/launcher"),
+            verl_root=Path("/verl"),
+            reward_file=Path("/reward.py"),
+            config_dir=tmp_path,
+            critique_advantage_mode="pass_at_1",
+            enable_positive_compression=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
@@ -301,6 +336,7 @@ def test_rendered_smoke_supports_batch_grouped_recovery_only_critiques(tmp_path:
         ({"seed": -1}, "nonnegative"),
         ({"model_path": "/hf_models/not-supported"}, "model_path"),
         ({"loss_mode": "not-supported"}, "loss_mode"),
+        ({"critique_advantage_mode": "not-supported"}, "critique_advantage_mode"),
         ({"learnability_logprob_statistic": "median"}, "learnability_logprob_statistic"),
         ({"learnability_threshold_mode": "rank"}, "learnability_threshold_mode"),
         ({"max_seed_window_stddevs": -1.0}, "max_seed_window_stddevs"),
@@ -378,6 +414,7 @@ def _scaled_runtime_config(tmp_path: Path):
                     "critique_model_nnodes": 1,
                     "critique_model_n_gpus_per_node": 8,
                     "critique_grpo_grouping": "per_original",
+                    "critique_advantage_mode": "grpo",
                     "num_critiques": 6,
                     "enable_positive_compression": True,
                     "num_positive_critiques": 6,
@@ -412,6 +449,7 @@ def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
         "n_samples": 4,
         "num_critiques": 6,
         "critique_grpo_grouping": "per_original",
+        "critique_advantage_mode": "grpo",
         "enable_positive_compression": True,
         "loss_mode": "dppo_tv",
         "learnability_logprob_statistic": "mean",
@@ -464,12 +502,22 @@ def _actor_audit_row(source: dict, *, row_index: int, response_width: int) -> di
     else:
         train_stop = int(train_start) + len(behavior)
         response_mask[int(train_start) - 1 : train_stop - 1] = [1] * len(behavior)
+    advantage = float(source.get("advantage", 0.0))
+    advantage_values = [advantage] * len(behavior)
     return {
         "balanced_row_index": row_index,
         "actor_row_id": source["actor_row_id"],
         "kind": source["kind"],
         "group_id": source["group_id"],
         "reward": float(np.float32(source["reward"])),
+        "raw_advantage": float(np.float32(source.get("raw_advantage", source["reward"]))),
+        "advantage_scale": float(np.float32(source.get("advantage_scale", 1.0))),
+        "prompt_weight": float(np.float32(source.get("prompt_weight", 1.0))),
+        "invalid_penalty": float(np.float32(source.get("invalid_penalty", 0.0))),
+        "learnability_rejection_penalty": float(
+            np.float32(source.get("learnability_rejection_penalty", 0.0))
+        ),
+        "advantage": float(np.float32(advantage)),
         "sequence_length": len(full_ids),
         "response_width": response_width,
         "train_start": train_start,
@@ -478,6 +526,7 @@ def _actor_audit_row(source: dict, *, row_index: int, response_width: int) -> di
         "response_mask_sha256": _canonical_sha256(response_mask, dtype="u1"),
         "old_log_probs_sha256": _canonical_sha256(behavior, dtype="<f4"),
         "rollout_log_probs_sha256": _canonical_sha256(behavior, dtype="<f4"),
+        "advantages_sha256": _canonical_sha256(advantage_values, dtype="<f4"),
     }
 
 
@@ -505,8 +554,11 @@ def _fixture(
     nodes: int = 1,
     schema_version: int = 5,
     critique_grpo_grouping: str = "per_original",
+    critique_advantage_mode: str = "grpo",
     enable_positive_compression: bool = True,
 ) -> None:
+    if critique_advantage_mode == "pass_at_1" and enable_positive_compression:
+        raise ValueError("pass_at_1 fixture must disable positive compression")
     attempt_id = "fixture"
     invocation_id = "invocation"
     completion = {
@@ -520,6 +572,12 @@ def _fixture(
     branch_config = {
         "num_critiques": 2,
         "critique_grpo_grouping": critique_grpo_grouping,
+        "critique_advantage_mode": critique_advantage_mode,
+        "critique_invalid_penalty": 0.20,
+        "critique_learnability_rejection_penalty": 0.05,
+        "critique_advantage_rms_floor": 0.10,
+        "critique_advantage_clip": 5.0,
+        "critique_prompt_headroom_exponent": 1.0,
         "enable_positive_compression": enable_positive_compression,
         "num_positive_critiques": 2,
         "positive_compression_target": 0.25,
@@ -666,7 +724,19 @@ def _fixture(
             outcome = 1.0 if accepted else 0.0
             self_critique_rewards.append(outcome - baseline)
             objective_credit = 0.4026955278742087 if accepted and objective == "compression" else outcome
-            reward = outcome - baseline if objective == "recovery" else objective_credit
+            structurally_invalid = not valid
+            learnability_rejected = valid and not accepted
+            invalid_penalty = 0.20 * float(structurally_invalid) if critique_advantage_mode == "pass_at_1" else 0.0
+            rejection_penalty = (
+                0.05 * float(learnability_rejected) if critique_advantage_mode == "pass_at_1" else 0.0
+            )
+            reward = (
+                outcome - baseline - invalid_penalty - rejection_penalty
+                if critique_advantage_mode == "pass_at_1"
+                else outcome - baseline
+                if objective == "recovery"
+                else objective_credit
+            )
             critique_ids = [700 + original_index, 800 + critique_index]
             branch_prefix_ids = [original["solution_ids"][0]] if valid else []
             if valid and schema_version >= 4 and original_index == 0:
@@ -757,6 +827,11 @@ def _fixture(
                 "continuation_reward_evaluated": accepted,
                 "continuation_wasted_by_learnability": valid and not accepted,
                 "parse_reason": "valid" if valid else "tag_count",
+                "critique_advantage_mode": critique_advantage_mode,
+                "structurally_invalid": structurally_invalid,
+                "learnability_rejected": learnability_rejected,
+                "invalid_penalty": invalid_penalty,
+                "learnability_rejection_penalty": rejection_penalty,
                 **edit_strings,
                 "branch_prefix_ids": branch_prefix_ids,
                 "new_continuation_ids": replacement_ids,
@@ -812,6 +887,49 @@ def _fixture(
                     }
                 )
 
+    external_raw_rms = 0.0
+    external_scale = 1.0
+    if critique_advantage_mode == "pass_at_1":
+        critique_events = [event for event in events if event["event"] == "critique"]
+        raw_values = np.asarray([event["reward"] for event in critique_events], dtype=np.float64)
+        external_raw_rms = float(np.sqrt(np.mean(np.square(raw_values), dtype=np.float64)))
+        external_scale = max(external_raw_rms, 0.10)
+        scaled_values = np.clip(raw_values / external_scale, -5.0, 5.0)
+        prompt_counts = Counter(event["prompt_group_id"] for event in critique_events)
+        unnormalized = np.asarray(
+            [
+                (1.0 - prompt_pass_at_1[event["prompt_group_id"]]) / prompt_counts[event["prompt_group_id"]]
+                for event in critique_events
+            ],
+            dtype=np.float64,
+        )
+        normalized = unnormalized / float(np.mean(unnormalized, dtype=np.float64))
+        actor_source_by_id = {source["actor_row_id"]: source for source in actor_sources}
+        for position, critique in enumerate(critique_events):
+            final_advantage = float(scaled_values[position] * normalized[position])
+            evidence = {
+                "event": "critique_advantage",
+                "actor_row_id": critique["actor_row_id"],
+                "prompt_group_id": critique["prompt_group_id"],
+                "mode": "pass_at_1",
+                "raw_advantage": float(raw_values[position]),
+                "rms_scale": external_scale,
+                "scaled_advantage": float(scaled_values[position]),
+                "prompt_weight": float(normalized[position]),
+                "final_advantage": final_advantage,
+                "invalid_penalty": critique["invalid_penalty"],
+                "learnability_rejection_penalty": critique["learnability_rejection_penalty"],
+            }
+            events.append(evidence)
+            actor_source_by_id[critique["actor_row_id"]].update(
+                raw_advantage=float(raw_values[position]),
+                advantage_scale=external_scale,
+                prompt_weight=float(normalized[position]),
+                invalid_penalty=critique["invalid_penalty"],
+                learnability_rejection_penalty=critique["learnability_rejection_penalty"],
+                advantage=final_advantage,
+            )
+
     selected_original_count = 2 + (14 if enable_positive_compression else 0)
     critique_count = selected_original_count * 2
     rows = 16 + critique_count + continuation_count
@@ -841,6 +959,7 @@ def _fixture(
                 "padding": padding,
                 "pad_token_id": 0,
                 "policy_loss_mode": "dppo_tv",
+                "critique_advantage_mode": critique_advantage_mode,
                 "actor_rows": [
                     _actor_audit_row(source, row_index=index, response_width=response_width)
                     for index, source in enumerate(balanced_sources)
@@ -853,6 +972,12 @@ def _fixture(
                 "correct": 14,
                 "positive_compression_enabled": enable_positive_compression,
                 "critique_grpo_grouping": critique_grpo_grouping,
+                "critique_advantage_mode": critique_advantage_mode,
+                "critique_invalid_penalty": 0.20,
+                "critique_learnability_rejection_penalty": 0.05,
+                "critique_advantage_rms_floor": 0.10,
+                "critique_advantage_clip": 5.0,
+                "critique_prompt_headroom_exponent": 1.0,
                 "learnability_logprob_statistic": statistic,
                 **(
                     {
@@ -885,6 +1010,11 @@ def _fixture(
                     "branch_revision/recovery_critiques": 4.0,
                     "branch_revision/compression_critiques": 28.0 if enable_positive_compression else 0.0,
                     "branch_revision/critique_grpo_grouping_is_batch": float(critique_grpo_grouping == "batch"),
+                    "branch_revision/critique_advantage_mode_is_pass_at_1": float(
+                        critique_advantage_mode == "pass_at_1"
+                    ),
+                    "branch_revision/critique_advantage/raw_rms": external_raw_rms,
+                    "branch_revision/critique_advantage/rms_scale": external_scale,
                     "branch_revision/critique_grpo_group_count": float(
                         1 if critique_grpo_grouping == "batch" else selected_original_count
                     ),
@@ -1120,6 +1250,17 @@ def test_verifier_accepts_one_iteration_level_critique_grpo_group(tmp_path: Path
     result = verify(tmp_path)
     assert result["status"] == "verified"
     assert result["critique_grpo_grouping"] == "batch"
+
+
+def test_verifier_accepts_external_pass_at_1_critique_advantages(tmp_path: Path) -> None:
+    _fixture(
+        tmp_path,
+        critique_grpo_grouping="batch",
+        critique_advantage_mode="pass_at_1",
+        enable_positive_compression=False,
+    )
+    result = verify(tmp_path)
+    assert result["critique_advantage_mode"] == "pass_at_1"
 
     path = _audit_path(tmp_path)
     events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]

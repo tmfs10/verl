@@ -309,6 +309,16 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     critique_grpo_grouping = str(branch_config.get("critique_grpo_grouping", "per_original"))
     if critique_grpo_grouping not in {"per_original", "batch"}:
         raise ValueError(f"unsupported critique GRPO grouping in smoke evidence: {critique_grpo_grouping!r}")
+    critique_advantage_mode = str(branch_config.get("critique_advantage_mode", "grpo"))
+    if critique_advantage_mode not in {"grpo", "pass_at_1"}:
+        raise ValueError(f"unsupported critique advantage mode in smoke evidence: {critique_advantage_mode!r}")
+    critique_invalid_penalty = float(branch_config.get("critique_invalid_penalty", 0.20))
+    critique_rejection_penalty = float(branch_config.get("critique_learnability_rejection_penalty", 0.05))
+    critique_rms_floor = float(branch_config.get("critique_advantage_rms_floor", 0.10))
+    critique_advantage_clip = float(branch_config.get("critique_advantage_clip", 5.0))
+    critique_headroom_exponent = float(branch_config.get("critique_prompt_headroom_exponent", 1.0))
+    if critique_advantage_mode == "pass_at_1" and positive_compression_enabled:
+        raise ValueError("pass_at_1 critique advantages currently support recovery-only smoke evidence")
     min_continuation_tokens = int(branch_config["min_continuation_tokens"])
     statistic = str(branch_config["learnability_logprob_statistic"])
     if statistic not in {"mean", "min"}:
@@ -381,6 +391,8 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         iteration_event = _only(step_events, "iteration")
         if iteration_event.get("critique_grpo_grouping", "per_original") != critique_grpo_grouping:
             raise ValueError(f"step {filename_step} used the wrong critique GRPO grouping")
+        if iteration_event.get("critique_advantage_mode", "grpo") != critique_advantage_mode:
+            raise ValueError(f"step {filename_step} used the wrong critique advantage mode")
         if bool(iteration_event.get("positive_compression_enabled")) != positive_compression_enabled:
             raise ValueError(f"step {filename_step} used the wrong positive-compression mode")
         actor_batch_events = [event for event in step_events if event.get("event") == "actor_batch"]
@@ -439,6 +451,19 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError("iteration audit used a different learnability statistic than the resolved config")
     if iteration.get("critique_grpo_grouping", "per_original") != critique_grpo_grouping:
         raise ValueError("iteration audit used a different critique GRPO grouping than the resolved config")
+    if iteration.get("critique_advantage_mode", "grpo") != critique_advantage_mode:
+        raise ValueError("iteration audit used a different critique advantage mode than the resolved config")
+    if critique_advantage_mode == "pass_at_1" and any(
+        not math.isclose(float(iteration.get(field, float("nan"))), expected, rel_tol=0.0, abs_tol=1e-12)
+        for field, expected in (
+            ("critique_invalid_penalty", critique_invalid_penalty),
+            ("critique_learnability_rejection_penalty", critique_rejection_penalty),
+            ("critique_advantage_rms_floor", critique_rms_floor),
+            ("critique_advantage_clip", critique_advantage_clip),
+            ("critique_prompt_headroom_exponent", critique_headroom_exponent),
+        )
+    ):
+        raise ValueError("iteration audit used different external critique-advantage parameters")
     if audit_schema_version >= 5 and (
         iteration.get("learnability_threshold_mode") != threshold_mode
         or not math.isclose(
@@ -483,6 +508,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     continuations = [event for event in events if event.get("event") == "continuation"]
     reference_events = [event for event in events if event.get("event") == "learnability_reference"]
     learnability_events = [event for event in events if event.get("event") == "learnability"]
+    critique_advantage_events = [event for event in events if event.get("event") == "critique_advantage"]
     expected_critiques = incorrect * num_critiques + (
         correct * num_positive_critiques if positive_compression_enabled else 0
     )
@@ -546,11 +572,34 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             baseline, audited_prompt_pass_at_1[prompt_group_id], abs_tol=1e-9
         ):
             raise ValueError(f"critique {key!r} uses a pass@1 from the wrong original prompt group")
-        expected_reward = (
-            outcome * learnability_weight - baseline
-            if objective == "recovery"
-            else objective_credit * learnability_weight
-        )
+        structurally_invalid = critique["parse_reason"] != "valid"
+        learnability_rejected = not structurally_invalid and not accepted
+        expected_invalid_penalty = critique_invalid_penalty * float(structurally_invalid)
+        expected_rejection_penalty = critique_rejection_penalty * float(learnability_rejected)
+        if critique_advantage_mode == "pass_at_1":
+            expected_reward = outcome - baseline - expected_invalid_penalty - expected_rejection_penalty
+            if (
+                critique.get("critique_advantage_mode") != "pass_at_1"
+                or bool(critique.get("structurally_invalid")) != structurally_invalid
+                or bool(critique.get("learnability_rejected")) != learnability_rejected
+                or not math.isclose(
+                    float(critique.get("invalid_penalty", float("nan"))),
+                    expected_invalid_penalty,
+                    abs_tol=1e-9,
+                )
+                or not math.isclose(
+                    float(critique.get("learnability_rejection_penalty", float("nan"))),
+                    expected_rejection_penalty,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise ValueError(f"critique {key!r} has corrupted external-advantage penalty evidence")
+        else:
+            expected_reward = (
+                outcome * learnability_weight - baseline
+                if objective == "recovery"
+                else objective_credit * learnability_weight
+            )
         if not math.isclose(reward, expected_reward, abs_tol=1e-9):
             raise ValueError(
                 f"critique {key!r} reward does not match its objective and learnability credit; "
@@ -640,6 +689,59 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError("critique objective counts do not match original correctness counts")
     if any(len(prompts) != 1 for prompts in critique_prompts.values()):
         raise ValueError("IID critiques for one original rollout used different behavior-policy prompt IDs")
+
+    expected_external_advantages: dict[str, dict[str, float]] = {}
+    if critique_advantage_mode == "pass_at_1":
+        if len(critique_advantage_events) != len(critiques):
+            raise ValueError("external critique mode must retain one advantage event per critique")
+        raw_values = np.asarray([float(critique["reward"]) for critique in critiques], dtype=np.float64)
+        raw_rms = float(np.sqrt(np.mean(np.square(raw_values), dtype=np.float64)))
+        rms_scale = max(raw_rms, critique_rms_floor)
+        scaled_values = np.clip(raw_values / rms_scale, -critique_advantage_clip, critique_advantage_clip)
+        prompt_counts = Counter(str(critique["prompt_group_id"]) for critique in critiques)
+        unnormalized_weights = np.asarray(
+            [
+                max(0.0, 1.0 - audited_prompt_pass_at_1[str(critique["prompt_group_id"])])
+                ** critique_headroom_exponent
+                / prompt_counts[str(critique["prompt_group_id"])]
+                for critique in critiques
+            ],
+            dtype=np.float64,
+        )
+        weight_mean = float(np.mean(unnormalized_weights, dtype=np.float64))
+        if not math.isfinite(weight_mean) or weight_mean <= 0.0:
+            raise ValueError("external critique prompt weights have no positive finite mass")
+        prompt_weights = unnormalized_weights / weight_mean
+        expected_by_actor_row: dict[str, dict[str, float]] = {}
+        for position, critique in enumerate(critiques):
+            row_id = str(critique["actor_row_id"])
+            expected_by_actor_row[row_id] = {
+                "raw_advantage": float(raw_values[position]),
+                "rms_scale": rms_scale,
+                "scaled_advantage": float(scaled_values[position]),
+                "prompt_weight": float(prompt_weights[position]),
+                "final_advantage": float(scaled_values[position] * prompt_weights[position]),
+                "invalid_penalty": float(critique["invalid_penalty"]),
+                "learnability_rejection_penalty": float(critique["learnability_rejection_penalty"]),
+            }
+        audited_advantages = {str(event.get("actor_row_id")): event for event in critique_advantage_events}
+        if set(audited_advantages) != set(expected_by_actor_row):
+            raise ValueError("external critique advantage events do not map one-to-one onto critique rows")
+        for row_id, expected in expected_by_actor_row.items():
+            event = audited_advantages[row_id]
+            if event.get("mode") != "pass_at_1" or any(
+                not math.isclose(
+                    float(event.get(field, float("nan"))),
+                    value,
+                    rel_tol=0.0,
+                    abs_tol=1e-6,
+                )
+                for field, value in expected.items()
+            ):
+                raise ValueError(f"external critique advantage event {row_id!r} is inconsistent")
+        expected_external_advantages = expected_by_actor_row
+    elif critique_advantage_events:
+        raise ValueError("centered GRPO mode unexpectedly retained external critique advantage events")
 
     references = {str(event.get("reference_key")): event for event in reference_events}
     if len(references) != len(reference_events):
@@ -959,7 +1061,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         }
     for key, critique in critique_by_key.items():
         row_id = str(critique["actor_row_id"])
-        expected_sources[row_id] = {
+        expected_source = {
             "kind": "critique",
             "group_id": "critique:batch" if critique_grpo_grouping == "batch" else f"critique:{key[0]}",
             "reward": float(critique["reward"]),
@@ -967,6 +1069,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             "train_start": len(critique["critique_prompt_ids"]),
             "behavior_log_probs": _float32_values(critique["critique_log_probs"]),
         }
+        if critique_advantage_mode == "pass_at_1":
+            expected_source["external_advantage"] = expected_external_advantages[row_id]
+        expected_sources[row_id] = expected_source
     for continuation in continuations:
         rollout_id = str(continuation["rollout_id"])
         original = original_by_rollout[rollout_id]
@@ -1095,6 +1200,28 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
                 or row.get("rollout_log_probs_sha256") != _canonical_sha256(behavior, dtype="<f4")
             ):
                 raise ValueError(f"balanced {policy} row {row_id!r} does not match its source tensors")
+            external = expected.get("external_advantage")
+            if external is not None:
+                expected_advantage = float(external["final_advantage"])
+                expected_advantage_values = [expected_advantage] * len(behavior)
+                external_fields = {
+                    "raw_advantage": float(external["raw_advantage"]),
+                    "advantage_scale": float(external["rms_scale"]),
+                    "prompt_weight": float(external["prompt_weight"]),
+                    "invalid_penalty": float(external["invalid_penalty"]),
+                    "learnability_rejection_penalty": float(external["learnability_rejection_penalty"]),
+                    "advantage": expected_advantage,
+                }
+                if any(
+                    not math.isclose(
+                        float(row.get(field, float("nan"))),
+                        value,
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    )
+                    for field, value in external_fields.items()
+                ) or row.get("advantages_sha256") != _canonical_sha256(expected_advantage_values, dtype="<f4"):
+                    raise ValueError(f"balanced {policy} row {row_id!r} has corrupted external advantages")
         if seen_source_ids != set(expected_policy_sources) or balanced_indices != set(range(len(policy_rows))):
             raise ValueError(f"balanced {policy} audit lost, duplicated, or misindexed source rows")
 
@@ -1188,6 +1315,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         "branch_revision/continuations": float(len(continuations)),
         "branch_revision/policy_loss_is_dppo_tv": float(loss_mode == "dppo_tv"),
         "branch_revision/critique_grpo_grouping_is_batch": float(critique_grpo_grouping == "batch"),
+        "branch_revision/critique_advantage_mode_is_pass_at_1": float(critique_advantage_mode == "pass_at_1"),
         "branch_revision/critique_grpo_group_count": float(len(critique_groups)),
         "branch_revision/critique_grpo_group_size_mean": (
             float(sum(critique_groups.values()) / len(critique_groups)) if critique_groups else 0.0
@@ -1211,6 +1339,19 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         actual = float(merged_metrics.get(key, float("nan")))
         if actual != expected:
             raise ValueError(f"metric {key} mismatch: {actual!r} != {expected!r}")
+    if critique_advantage_mode == "pass_at_1":
+        expected_raw_rms = float(
+            np.sqrt(np.mean(np.square(np.asarray([critique["reward"] for critique in critiques], dtype=np.float64))))
+        )
+        expected_scale = max(expected_raw_rms, critique_rms_floor)
+        external_metric_expectations = {
+            "branch_revision/critique_advantage/raw_rms": expected_raw_rms,
+            "branch_revision/critique_advantage/rms_scale": expected_scale,
+        }
+        for key, expected in external_metric_expectations.items():
+            actual = float(merged_metrics.get(key, float("nan")))
+            if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-6):
+                raise ValueError(f"metric {key} mismatch: {actual!r} != {expected!r}")
     successful_recovery_count = sum(
         float(event["reward"]) for event in continuations if event.get("objective") == "recovery"
     )
@@ -1276,6 +1417,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         "successful_compression_credit": successful_compressions,
         "policy_loss_mode": loss_mode,
         "critique_grpo_grouping": critique_grpo_grouping,
+        "critique_advantage_mode": critique_advantage_mode,
         "learnability_logprob_statistic": statistic,
         "learnability_threshold_mode": threshold_mode,
         "max_seed_window_stddevs": max_seed_window_stddevs,

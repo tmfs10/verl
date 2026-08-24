@@ -664,6 +664,12 @@ algorithm:
     critique_model_nnodes: 1
     critique_model_n_gpus_per_node: 8
     critique_grpo_grouping: per_original
+    critique_advantage_mode: grpo
+    critique_invalid_penalty: 0.2
+    critique_learnability_rejection_penalty: 0.05
+    critique_advantage_rms_floor: 0.1
+    critique_advantage_clip: 5.0
+    critique_prompt_headroom_exponent: 1.0
     num_critiques: 4
     enable_positive_compression: false
     num_positive_critiques: 4

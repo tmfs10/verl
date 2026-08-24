@@ -70,6 +70,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "n_samples",
         "num_critiques",
         "critique_grpo_grouping",
+        "critique_advantage_mode",
         "enable_positive_compression",
         "loss_mode",
         "learnability_logprob_statistic",
@@ -101,6 +102,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "algorithm.branch_revision_grpo.num_critiques": smoke_contract["num_critiques"],
         "algorithm.branch_revision_grpo.num_positive_critiques": smoke_contract["num_critiques"],
         "algorithm.branch_revision_grpo.critique_grpo_grouping": smoke_contract["critique_grpo_grouping"],
+        "algorithm.branch_revision_grpo.critique_advantage_mode": smoke_contract["critique_advantage_mode"],
         "algorithm.branch_revision_grpo.enable_positive_compression": smoke_contract["enable_positive_compression"],
         "actor_rollout_ref.model.path": smoke_contract["model_path"],
         "critic.model.path": smoke_contract["model_path"],
@@ -155,6 +157,10 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("branch-revision smoke separate_critique_model must be boolean")
     if smoke_contract["critique_grpo_grouping"] not in {"per_original", "batch"}:
         raise ValueError("branch-revision smoke critique_grpo_grouping must be per_original or batch")
+    if smoke_contract["critique_advantage_mode"] not in {"grpo", "pass_at_1"}:
+        raise ValueError("branch-revision smoke critique_advantage_mode must be grpo or pass_at_1")
+    if smoke_contract["critique_advantage_mode"] == "pass_at_1" and smoke_contract["enable_positive_compression"]:
+        raise ValueError("branch-revision pass_at_1 smoke must disable positive compression")
     if not isinstance(smoke_contract["enable_positive_compression"], bool):
         raise ValueError("branch-revision smoke enable_positive_compression must be boolean")
     critique_warmup_steps = smoke_contract["critique_warmup_steps"]
