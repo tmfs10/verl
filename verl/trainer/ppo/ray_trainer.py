@@ -75,6 +75,28 @@ from verl.workers.reward_manager.conditional import _select_low_confidence_token
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
+def _build_critique_manager_config(config):
+    """Clone the actor config and give the critique rollout a distinct Ray namespace."""
+
+    critique_config = OmegaConf.create(OmegaConf.to_container(config, resolve=True))
+    custom = OmegaConf.select(critique_config, "actor_rollout_ref.rollout.custom", default=None)
+    if custom is None:
+        custom = {}
+    else:
+        custom = OmegaConf.to_container(custom, resolve=True)
+        if not isinstance(custom, dict):
+            raise TypeError("actor_rollout_ref.rollout.custom must be a mapping")
+    custom["server_name_prefix"] = "critique_actor"
+    OmegaConf.update(
+        critique_config,
+        "actor_rollout_ref.rollout.custom",
+        custom,
+        merge=False,
+        force_add=True,
+    )
+    return critique_config
+
+
 def _pack_reward_extra_info(values: list[Any]) -> np.ndarray:
     """Preserve ragged per-sample reward metadata as object arrays.
 
@@ -1268,15 +1290,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
         critique_actor_resource_pool = None
         if Role.CritiqueActorRollout in self.role_worker_mapping:
             critique_actor_resource_pool = self.resource_pool_manager.get_resource_pool(Role.CritiqueActorRollout)
-            self.critique_manager_config = OmegaConf.create(OmegaConf.to_container(self.config, resolve=True))
+            self.critique_manager_config = _build_critique_manager_config(self.config)
             critique_actor_config = self.critique_manager_config.actor_rollout_ref
-            critique_rollout_custom = (
-                OmegaConf.to_container(critique_actor_config.rollout.custom, resolve=True)
-                if critique_actor_config.rollout.custom is not None
-                else {}
-            )
-            critique_rollout_custom["server_name_prefix"] = "critique_actor"
-            critique_actor_config.rollout.custom = critique_rollout_custom
             critique_actor_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.CritiqueActorRollout],
                 config=critique_actor_config,

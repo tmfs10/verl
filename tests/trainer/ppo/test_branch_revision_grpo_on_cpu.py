@@ -59,6 +59,7 @@ from verl.trainer.ppo.branch_revision_grpo import (
     validate_binary_reward_row,
 )
 from verl.trainer.ppo.core_algos import compute_policy_loss_dppo_tv, compute_policy_loss_vanilla
+from verl.trainer.ppo.ray_trainer import _build_critique_manager_config
 from verl.trainer.ppo.ray_trainer_branch_revision import (
     BranchRevisionGRPOController,
     _Bundle,
@@ -116,6 +117,15 @@ def test_rollout_server_name_prefix_is_empty_by_default_and_namespaces_critique_
 def test_rollout_server_name_prefix_rejects_unsafe_ray_actor_names() -> None:
     with pytest.raises(ValueError, match="server_name_prefix"):
         get_rollout_server_name_prefix(SimpleNamespace(custom={"server_name_prefix": "critique actor"}))
+
+
+def test_critique_manager_config_force_adds_namespace_when_rollout_custom_is_absent() -> None:
+    config = OmegaConf.create({"actor_rollout_ref": {"rollout": {"name": "vllm"}}, "trainer": {"nnodes": 1}})
+    critique_config = _build_critique_manager_config(config)
+
+    assert OmegaConf.select(config, "actor_rollout_ref.rollout.custom", default=None) is None
+    assert critique_config.actor_rollout_ref.rollout.custom.server_name_prefix == "critique_actor"
+    assert critique_config.trainer.nnodes == 1
 
 
 def _ids(text: str) -> list[int]:
