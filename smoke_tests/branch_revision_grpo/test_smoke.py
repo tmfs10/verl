@@ -25,7 +25,12 @@ import pytest
 from omegaconf import OmegaConf
 
 from smoke_tests.branch_revision_grpo.main_ppo_smoke import _validate_contract
-from smoke_tests.branch_revision_grpo.submit_oci_iad import _extra_args, build_command
+from smoke_tests.branch_revision_grpo.submit_cw_dfw import CW_DFW_PROFILE
+from smoke_tests.branch_revision_grpo.submit_oci_iad import (
+    _extra_args,
+    _prepare_execution_config,
+    build_command,
+)
 from smoke_tests.branch_revision_grpo.verify_smoke import _aggregate, _canonical_sha256, verify
 
 
@@ -65,6 +70,76 @@ def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(t
     assert "--enable_wandb" not in command
     assert "--no_requeue" in command
     assert "--add_interactive" in command
+
+
+def test_rendered_cw_dfw_smoke_preserves_algorithm_contract_and_cluster_policy(tmp_path: Path) -> None:
+    command, remote_output = build_command(
+        profile=CW_DFW_PROFILE,
+        run_tag="cw-external-pass-at-1",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        n_prompts=32,
+        n_samples=8,
+        num_critiques=2,
+        critique_grpo_grouping="batch",
+        critique_advantage_mode="pass_at_1",
+        enable_positive_compression=False,
+        model_path="/hf_models/Qwen3-4B",
+        nodes=2,
+        max_prompt_length=2048,
+        max_response_length=8192,
+        max_model_len=32768,
+        critique_max_response_length=8192,
+        max_tokens_per_gpu=32768,
+        training_steps=2,
+        partition="interactive",
+        separate_critique_model=True,
+        critique_warmup_steps=1,
+    )
+    rendered = " ".join(command)
+    assert remote_output == "/output/smoke_tests/branch_revision_grpo/cw-external-pass-at-1"
+    assert "--cluster cw-dfw" in rendered
+    assert "--nodes 2" in rendered
+    assert "--trainer_nodes 1" in rendered
+    assert "--gpus 8" in rendered
+    assert "--partition interactive" in rendered
+    assert "--add_interactive" in command
+    assert "--no_requeue" in command
+    assert "--enable_wandb" not in command
+    assert "actor_rollout_ref.rollout.temperature=1.0" in rendered
+    assert "algorithm.branch_revision_grpo.critique_advantage_mode=pass_at_1" in rendered
+    assert "algorithm.branch_revision_grpo.critique_grpo_grouping=batch" in rendered
+    assert "algorithm.branch_revision_grpo.enable_positive_compression=false" in rendered
+    assert "algorithm.branch_revision_grpo.separate_critique_model=true" in rendered
+    assert "algorithm.branch_revision_grpo.critique_warmup_steps=1" in rendered
+    assert "trainer.nnodes=1" in rendered
+
+
+def test_cw_dfw_execution_config_preserves_authoritative_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    source = source_dir / "cw-dfw.yaml"
+    source.write_text(
+        f"ssh_tunnel:\n  host: source.example.com\ncontainers:\n  verl: {CW_DFW_PROFILE.verl_container}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "smoke_tests.branch_revision_grpo.submit_oci_iad._resolve_ssh_hostname",
+        lambda _alias: "resolved.example.com",
+    )
+    execution_dir = _prepare_execution_config(CW_DFW_PROFILE, source_dir, tmp_path / "run")
+    rendered = (execution_dir / "cw-dfw.yaml").read_text(encoding="utf-8")
+    assert "host: resolved.example.com" in rendered
+    assert f"verl: {CW_DFW_PROFILE.verl_container}" in rendered
+    provenance = json.loads((execution_dir / "provenance.json").read_text(encoding="utf-8"))
+    assert provenance["source_verl_container"] == CW_DFW_PROFILE.verl_container
+    assert provenance["execution_verl_container"] == CW_DFW_PROFILE.verl_container
 
 
 def test_rendered_smoke_scales_dataset_batch_rollouts_and_critiques_together(tmp_path: Path) -> None:
@@ -514,9 +589,7 @@ def _actor_audit_row(source: dict, *, row_index: int, response_width: int) -> di
         "advantage_scale": float(np.float32(source.get("advantage_scale", 1.0))),
         "prompt_weight": float(np.float32(source.get("prompt_weight", 1.0))),
         "invalid_penalty": float(np.float32(source.get("invalid_penalty", 0.0))),
-        "learnability_rejection_penalty": float(
-            np.float32(source.get("learnability_rejection_penalty", 0.0))
-        ),
+        "learnability_rejection_penalty": float(np.float32(source.get("learnability_rejection_penalty", 0.0))),
         "advantage": float(np.float32(advantage)),
         "sequence_length": len(full_ids),
         "response_width": response_width,
@@ -727,9 +800,7 @@ def _fixture(
             structurally_invalid = not valid
             learnability_rejected = valid and not accepted
             invalid_penalty = 0.20 * float(structurally_invalid) if critique_advantage_mode == "pass_at_1" else 0.0
-            rejection_penalty = (
-                0.05 * float(learnability_rejected) if critique_advantage_mode == "pass_at_1" else 0.0
-            )
+            rejection_penalty = 0.05 * float(learnability_rejected) if critique_advantage_mode == "pass_at_1" else 0.0
             reward = (
                 outcome - baseline - invalid_penalty - rejection_penalty
                 if critique_advantage_mode == "pass_at_1"

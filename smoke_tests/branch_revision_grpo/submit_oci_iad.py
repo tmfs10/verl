@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dry-run-first OCI-IAD launcher for branch-revision GRPO smoke."""
+"""Dry-run-first cluster launcher for branch-revision GRPO smoke."""
 
 from __future__ import annotations
 
@@ -21,31 +21,120 @@ import json
 import math
 import shlex
 import subprocess
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 
 from smoke_tests.intermediate_mc_value.topology.submit_oci_iad import (
     DEFAULT_CONFIG_DIR,
     DEFAULT_LAUNCHER,
     DEFAULT_PYTHON,
-    REMOTE_OUTPUT_ROOT,
-    SSH_ALIAS,
     TRAIN_DATA,
     VAL_DATA,
     _command_sha256,
-    _force_no_requeue,
     _git_provenance,
     _parse_job_id,
-    _prepare_execution_config,
-    _remote_host_output_path,
+    _replace_ssh_tunnel_host,
+    _replace_verl_container,
+    _resolve_ssh_hostname,
     _run,
     _sha256,
-    _ssh,
 )
 
 DEFAULT_VERL = Path("/home/siddjain/workspace/verl/verl_branch_revision_grpo")
 DEFAULT_REWARD = Path("/home/siddjain/workspace/scripts/src/nemo_verl/reward/verl_code_reward.py")
 MODEL_PATH = "/hf_models/Qwen3-1.7B"
 SUPPORTED_MODEL_PATHS = {MODEL_PATH, "/hf_models/Qwen3-4B"}
+
+
+@dataclass(frozen=True)
+class SmokeClusterProfile:
+    """Cluster-specific paths and scheduler policy for the shared smoke."""
+
+    cluster_name: str
+    config_filename: str
+    ssh_alias: str
+    remote_output_root: PurePosixPath
+    verl_container: str
+    replace_source_container: bool
+    allowed_partitions: tuple[str, ...] = ("interactive",)
+    max_interactive_nodes: int = 2
+
+
+OCI_IAD_PROFILE = SmokeClusterProfile(
+    cluster_name="oci-iad",
+    config_filename="oci-iad.yaml",
+    ssh_alias="iad-2",
+    remote_output_root=PurePosixPath("/lustre/fsw/portfolios/llmservice/users/siddjain/nemo-run/output"),
+    verl_container="/lustre/fsw/portfolios/llmservice/users/igitman/llm/images/nemo-skills-verl-0.7.0.sqsh",
+    replace_source_container=True,
+)
+
+
+def _prepare_execution_config(profile: SmokeClusterProfile, source_dir: Path, local_run_dir: Path) -> Path:
+    source = source_dir.expanduser().resolve() / profile.config_filename
+    if not source.is_file():
+        raise FileNotFoundError(f"missing authoritative {profile.cluster_name} config: {source}")
+    target_host = _resolve_ssh_hostname(profile.ssh_alias)
+    updated, original_host = _replace_ssh_tunnel_host(source.read_text(encoding="utf-8"), target_host)
+    updated, original_container = _replace_verl_container(updated, profile.verl_container)
+    if not profile.replace_source_container and original_container != profile.verl_container:
+        raise ValueError(
+            f"{profile.cluster_name} source VeRL container changed: "
+            f"{original_container!r} != {profile.verl_container!r}"
+        )
+    destination_dir = local_run_dir / "cluster_config"
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / profile.config_filename
+    destination.write_text(updated, encoding="utf-8")
+    (destination_dir / "provenance.json").write_text(
+        json.dumps(
+            {
+                "source": str(source),
+                "source_sha256": _sha256(source),
+                "source_host": original_host,
+                "ssh_alias": profile.ssh_alias,
+                "resolved_host": target_host,
+                "source_verl_container": original_container,
+                "execution_verl_container": profile.verl_container,
+                "execution_config_sha256": _sha256(destination),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return destination_dir
+
+
+def _remote_host_output_path(profile: SmokeClusterProfile, container_output: str) -> PurePosixPath:
+    path = PurePosixPath(container_output)
+    try:
+        relative = path.relative_to("/output")
+    except ValueError as exc:
+        raise ValueError(f"remote output must be under /output: {container_output}") from exc
+    return profile.remote_output_root / relative
+
+
+def _ssh(profile: SmokeClusterProfile, command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["ssh", profile.ssh_alias, command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _force_no_requeue(profile: SmokeClusterProfile, job_id: str) -> str:
+    result = _ssh(
+        profile,
+        f"scontrol update JobId={shlex.quote(job_id)} Requeue=0 && scontrol show job -o {shlex.quote(job_id)}",
+    )
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or f"could not force Requeue=0 for job {job_id}")
+    if "Requeue=0" not in result.stdout:
+        raise RuntimeError(f"scheduler did not record Requeue=0 for job {job_id}: {result.stdout.strip()}")
+    return result.stdout.strip()
 
 
 def _extra_args(
@@ -219,6 +308,7 @@ def _extra_args(
 
 def build_command(
     *,
+    profile: SmokeClusterProfile = OCI_IAD_PROFILE,
     run_tag: str,
     dry_run: bool,
     python: Path,
@@ -317,10 +407,18 @@ def build_command(
         raise ValueError("gpu_memory_utilization must be finite and inside (0, 1)")
     if nodes > 4:
         raise ValueError("branch-revision smoke supports at most four nodes")
-    if partition not in {None, "interactive"}:
-        raise ValueError("branch-revision smoke partition must be interactive when explicitly selected")
-    if partition == "interactive" and nodes > 2:
-        raise ValueError("OCI-IAD interactive branch-revision smoke supports at most two nodes")
+    if partition is not None and partition not in profile.allowed_partitions:
+        if profile.allowed_partitions == ("interactive",):
+            raise ValueError(
+                f"{profile.cluster_name} branch-revision smoke partition must be interactive when explicitly selected"
+            )
+        allowed = ", ".join(profile.allowed_partitions)
+        raise ValueError(f"{profile.cluster_name} branch-revision smoke partition must be one of {allowed}")
+    if partition == "interactive" and nodes > profile.max_interactive_nodes:
+        rendered_limit = "two" if profile.max_interactive_nodes == 2 else str(profile.max_interactive_nodes)
+        raise ValueError(
+            f"{profile.cluster_name} interactive branch-revision smoke supports at most {rendered_limit} nodes"
+        )
     if max_prompt_length + max_response_length >= max_model_len:
         raise ValueError("max_prompt_length + max_response_length must be smaller than max_model_len")
     if critique_max_response_length >= max_model_len:
@@ -333,7 +431,7 @@ def build_command(
         str(python),
         str(launcher),
         "--cluster",
-        "oci-iad",
+        profile.cluster_name,
         "--config_dir",
         str(config_dir),
         "--explicit_output_dir",
@@ -460,7 +558,7 @@ def _job_record(path: Path) -> dict[str, str]:
     return value
 
 
-def main() -> None:
+def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("dry-run", "submit", "status", "collect", "verify", "verify-integrity"))
     parser.add_argument("--run-tag", required=True)
@@ -522,8 +620,9 @@ def main() -> None:
         job_id = record["job_id"]
         if args.action == "status":
             result = _ssh(
+                profile,
                 f"sacct -X -j {shlex.quote(job_id)} -n -P "
-                "-o JobIDRaw,State,ExitCode,ElapsedRaw,AllocTRES,NodeList | head -1"
+                "-o JobIDRaw,State,ExitCode,ElapsedRaw,AllocTRES,NodeList | head -1",
             )
             if result.returncode:
                 raise RuntimeError(result.stderr.strip() or f"could not query Slurm job {job_id}")
@@ -531,8 +630,8 @@ def main() -> None:
             return
         destination = local_run_dir / "collected"
         destination.mkdir(parents=True, exist_ok=True)
-        source = _remote_host_output_path(record["remote_output"]) / "evidence"
-        result = subprocess.run(["rsync", "-a", f"{SSH_ALIAS}:{source}/", f"{destination}/"], check=False)
+        source = _remote_host_output_path(profile, record["remote_output"]) / "evidence"
+        result = subprocess.run(["rsync", "-a", f"{profile.ssh_alias}:{source}/", f"{destination}/"], check=False)
         if result.returncode:
             raise SystemExit(result.returncode)
         print(json.dumps({"status": "collected", "source": str(source), "destination": str(destination)}))
@@ -549,11 +648,12 @@ def main() -> None:
         print(rendered, end="")
         return
 
-    execution_config_dir = _prepare_execution_config(args.config_dir, local_run_dir)
+    execution_config_dir = _prepare_execution_config(profile, args.config_dir, local_run_dir)
     prompt_logprob_max_inflight_tokens = (
         None if args.disable_prompt_logprob_admission else args.prompt_logprob_max_inflight_tokens
     )
     submit_command, remote_output = build_command(
+        profile=profile,
         run_tag=args.run_tag,
         dry_run=False,
         python=args.python,
@@ -593,15 +693,17 @@ def main() -> None:
         "run_tag": args.run_tag,
         "git": git,
         "launcher_sha256": _sha256(args.launcher),
-        "execution_config_sha256": _sha256(execution_config_dir / "oci-iad.yaml"),
+        "execution_config_sha256": _sha256(execution_config_dir / profile.config_filename),
         "submit_command_sha256": _command_sha256(submit_command),
         "remote_output": remote_output,
-        "ssh_alias": SSH_ALIAS,
-        "remote_output_root": str(REMOTE_OUTPUT_ROOT),
+        "cluster_name": profile.cluster_name,
+        "ssh_alias": profile.ssh_alias,
+        "remote_output_root": str(profile.remote_output_root),
     }
 
     if args.action == "dry-run":
         dry_command, _ = build_command(
+            profile=profile,
             run_tag=args.run_tag,
             dry_run=True,
             python=args.python,
@@ -654,7 +756,7 @@ def main() -> None:
     if result.returncode:
         raise SystemExit(result.returncode)
     job_id = _parse_job_id(local_run_dir / "submit.log")
-    scheduler_contract = _force_no_requeue(job_id)
+    scheduler_contract = _force_no_requeue(profile, job_id)
     (local_run_dir / "scheduler_contract.txt").write_text(scheduler_contract + "\n", encoding="utf-8")
     job_path.write_text(
         json.dumps({"job_id": job_id, "remote_output": remote_output}, indent=2, sort_keys=True) + "\n",

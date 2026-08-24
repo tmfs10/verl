@@ -108,6 +108,57 @@ python3 -m smoke_tests.branch_revision_grpo.submit_oci_iad dry-run \
 
 The launcher derives an execution-only cluster YAML from the authoritative OCI-IAD configuration, targets the previously authorized `iad-2` SSH route, uses the validated shared VeRL image, explicitly disables requeue, disables W&B, and stores all runtime artifacts under `/home/siddjain/data` locally and `/output/smoke_tests/branch_revision_grpo` remotely.
 
+## CW-DFW workflow
+
+The CW launcher shares the OCI algorithm arguments and verifier but derives its
+execution snapshot from authoritative `cw-dfw.yaml`. It preserves CW's native
+`verl_vllm012_flashattn_20260321.sqsh` container, uses the documented `dfw`
+route, requests two complete eight-GPU `interactive` nodes, disables W&B and
+validation, and forces the submitted scheduler record to `Requeue=0`.
+
+The external-pass@1 recovery acceptance cell uses one actor node and one
+independent critique-policy node. It keeps every production algorithm setting
+except the deliberately shortened one-step warmup and two-step lifetime:
+
+```bash
+cd /home/siddjain/workspace/verl/verl_branch_revision_grpo
+RUN_TAG=branch-revision-cw-dfw-external-pass-at1-YYYYMMDDTHHMMSSZ
+RUN_DIR=/home/siddjain/data/intermediate_mc_value_model/verl/cw_dfw_external_pass_at1/smoke/$RUN_TAG
+
+COMMON_ARGS=(
+  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+  --model-path /hf_models/Qwen3-4B
+  --n-prompts 32 --n-samples 8 --num-critiques 2 --seed 43
+  --nodes 2 --partition interactive --training-steps 2
+  --max-prompt-length 2048 --max-response-length 8192
+  --critique-max-response-length 8192 --max-model-len 32768
+  --max-tokens-per-gpu 32768 --gpu-memory-utilization 0.6
+  --separate-critique-model --critique-warmup-steps 1
+  --critique-model-nnodes 1 --critique-model-n-gpus-per-node 8
+  --critique-grpo-grouping batch --critique-advantage-mode pass_at_1
+  --disable-positive-compression --loss-mode dppo_tv
+  --learnability-logprob-statistic mean
+  --learnability-threshold-mode stddev --max-seed-window-stddevs 15
+)
+
+python3 -m smoke_tests.branch_revision_grpo.submit_cw_dfw dry-run "${COMMON_ARGS[@]}"
+python3 -m smoke_tests.branch_revision_grpo.submit_cw_dfw submit "${COMMON_ARGS[@]}"
+python3 -m smoke_tests.branch_revision_grpo.submit_cw_dfw status \
+  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+python3 -m smoke_tests.branch_revision_grpo.submit_cw_dfw collect \
+  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+python3 -m smoke_tests.branch_revision_grpo.submit_cw_dfw verify-integrity \
+  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+python3 -m smoke_tests.branch_revision_grpo.submit_cw_dfw verify \
+  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+```
+
+Strict verification additionally reconstructs external pass@1 raw advantages,
+invalid and learnability-rejection penalties, RMS scaling, prompt-headroom
+weights, clipping, and the final actor tensor hashes. Do not weaken the
+successful-recovery requirement for a stochastic run; use a new timestamped
+seed-44 retry if seed 43 passes integrity but lacks algorithm signal.
+
 ## Acceptance matrix
 
 Local tests cover both prompt constants, free-form strict parsing, exact generated-prefix/joint agreement, overlapping and token-boundary ambiguity, final-answer markers, both sides of display-math/LaTeX/code-fence boundaries, exhaustive equal-per-window references, mean/min ranking and float32 boundaries, population-standard-deviation and percentile thresholds, zero-variance references, recovery and compression equations, rejected-continuation filtering, exact vLLM score-only prompt-logprob slicing/alignment, accepted-only suffix generation, weighted-admission concurrency/oversize/cancellation behavior, critique-failure draining, tokenizer-aware context headroom, retry-safe audit attempts, multi-step high-pressure selection, schema-v2/v3/v4/v5 verification, post-balance actor hashes, prompt/parent grouping, suffix-only continuation masks, both denominator metrics, and both `dppo_tv` and native clipped PPO (`vanilla`). Configuration composition must retain temperature `1.0`, `top_p=1`, `top_k=-1`, repetition penalty `1`, processed rollout log-probabilities, critic disablement, and synchronous reward evaluation.
