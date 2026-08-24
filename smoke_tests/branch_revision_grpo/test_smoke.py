@@ -88,7 +88,7 @@ def test_rendered_cw_dfw_smoke_preserves_algorithm_contract_and_cluster_policy(t
         critique_grpo_grouping="batch",
         critique_advantage_mode="pass_at_1",
         enable_positive_compression=False,
-        model_path="/hf_models/Qwen3-4B",
+        model_path="/hf_models/Qwen/Qwen3-4B",
         nodes=2,
         max_prompt_length=2048,
         max_response_length=8192,
@@ -110,6 +110,9 @@ def test_rendered_cw_dfw_smoke_preserves_algorithm_contract_and_cluster_policy(t
     assert "--add_interactive" in command
     assert "--no_requeue" in command
     assert "--enable_wandb" not in command
+    assert "--actor_model /hf_models/Qwen/Qwen3-4B" in rendered
+    assert "--critic_model /hf_models/Qwen/Qwen3-4B" in rendered
+    assert "+branch_revision_smoke.model_path=/hf_models/Qwen/Qwen3-4B" in rendered
     assert "actor_rollout_ref.rollout.temperature=1.0" in rendered
     assert "algorithm.branch_revision_grpo.critique_advantage_mode=pass_at_1" in rendered
     assert "algorithm.branch_revision_grpo.critique_grpo_grouping=batch" in rendered

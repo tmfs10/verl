@@ -56,6 +56,8 @@ class SmokeClusterProfile:
     remote_output_root: PurePosixPath
     verl_container: str
     replace_source_container: bool
+    supported_model_paths: tuple[str, ...] = tuple(sorted(SUPPORTED_MODEL_PATHS))
+    default_model_path: str = MODEL_PATH
     allowed_partitions: tuple[str, ...] = ("interactive",)
     max_interactive_nodes: int = 2
 
@@ -393,8 +395,8 @@ def build_command(
         raise ValueError("num_critiques must be at least 2 for GRPO")
     if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
         raise ValueError("seed must be a nonnegative integer")
-    if model_path not in SUPPORTED_MODEL_PATHS:
-        raise ValueError(f"model_path must be one of {sorted(SUPPORTED_MODEL_PATHS)!r}")
+    if model_path not in profile.supported_model_paths:
+        raise ValueError(f"model_path must be one of {sorted(profile.supported_model_paths)!r}")
     if loss_mode not in {"dppo_tv", "vanilla"}:
         raise ValueError("loss_mode must be dppo_tv or vanilla")
     if learnability_logprob_statistic not in {"mean", "min"}:
@@ -575,7 +577,11 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
     parser.add_argument("--critique-advantage-mode", choices=("grpo", "pass_at_1"), default="grpo")
     parser.add_argument("--disable-positive-compression", action="store_true")
     parser.add_argument("--seed", type=int, default=43)
-    parser.add_argument("--model-path", choices=sorted(SUPPORTED_MODEL_PATHS), default=MODEL_PATH)
+    parser.add_argument(
+        "--model-path",
+        choices=sorted(profile.supported_model_paths),
+        default=profile.default_model_path,
+    )
     parser.add_argument("--loss-mode", choices=("dppo_tv", "vanilla"), default="dppo_tv")
     parser.add_argument("--learnability-logprob-statistic", choices=("mean", "min"), default="mean")
     parser.add_argument("--learnability-threshold-mode", choices=("stddev", "percentile"), default="stddev")

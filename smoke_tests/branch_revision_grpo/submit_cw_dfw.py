@@ -25,6 +25,8 @@ CW_DFW_PROFILE = SmokeClusterProfile(
     remote_output_root=PurePosixPath("/lustre/fsw/portfolios/llmservice/users/siddjain/nemo-run/output"),
     verl_container=("/lustre/fsw/portfolios/llmservice/users/siddjain/containers/verl_vllm012_flashattn_20260321.sqsh"),
     replace_source_container=False,
+    supported_model_paths=("/hf_models/Qwen/Qwen3-4B",),
+    default_model_path="/hf_models/Qwen/Qwen3-4B",
 )
 
 
