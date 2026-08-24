@@ -166,6 +166,8 @@ def _extra_args(
     critique_warmup_steps: int = 0,
     critique_model_nnodes: int = 1,
     critique_model_n_gpus_per_node: int = 8,
+    resume_from_path: str | None = None,
+    expected_resume_step: int = 0,
 ) -> str:
     if loss_mode not in {"dppo_tv", "vanilla"}:
         raise ValueError("loss_mode must be dppo_tv or vanilla")
@@ -185,6 +187,7 @@ def _extra_args(
         raise ValueError("max_seed_window_stddevs must be finite and nonnegative")
     if not math.isfinite(gpu_memory_utilization) or not 0.0 < gpu_memory_utilization < 1.0:
         raise ValueError("gpu_memory_utilization must be finite and inside (0, 1)")
+    resume_mode = "resume_path" if resume_from_path is not None else "disable"
     actor_nodes = nodes - critique_model_nnodes if separate_critique_model else nodes
     overrides = [
         "~critic.append_solution_to_prompt",
@@ -276,7 +279,10 @@ def _extra_args(
         "trainer.log_val_generations=0",
         "trainer.rollout_data_dir=null",
         "trainer.validation_data_dir=null",
-        "trainer.resume_mode=disable",
+        f"trainer.resume_mode={resume_mode}",
+        f"trainer.resume_from_path={'null' if resume_from_path is None else resume_from_path}",
+        f"trainer.expected_resume_step={expected_resume_step}",
+        "trainer.load_dataloader_state_on_resume=true",
         "trainer.balance_batch=true",
         f"+branch_revision_smoke.output_dir={remote_evidence}",
         f"+branch_revision_smoke.n_prompts={n_prompts}",
@@ -304,6 +310,9 @@ def _extra_args(
         f"+branch_revision_smoke.critique_warmup_steps={critique_warmup_steps}",
         f"+branch_revision_smoke.critique_model_nnodes={critique_model_nnodes}",
         f"+branch_revision_smoke.critique_model_n_gpus_per_node={critique_model_n_gpus_per_node}",
+        f"+branch_revision_smoke.resume_mode={resume_mode}",
+        f"+branch_revision_smoke.resume_from_path={'null' if resume_from_path is None else resume_from_path}",
+        f"+branch_revision_smoke.expected_resume_step={expected_resume_step}",
     ]
     return " ".join(overrides)
 
@@ -344,6 +353,8 @@ def build_command(
     critique_warmup_steps: int = 0,
     critique_model_nnodes: int = 1,
     critique_model_n_gpus_per_node: int = 8,
+    resume_from_path: str | None = None,
+    expected_resume_step: int = 0,
 ) -> tuple[list[str], str]:
     positive = {
         "n_prompts": n_prompts,
@@ -395,6 +406,19 @@ def build_command(
         raise ValueError("num_critiques must be at least 2 for GRPO")
     if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:
         raise ValueError("seed must be a nonnegative integer")
+    if not isinstance(expected_resume_step, int) or isinstance(expected_resume_step, bool) or expected_resume_step < 0:
+        raise ValueError("expected_resume_step must be a nonnegative integer")
+    if resume_from_path is None:
+        if expected_resume_step != 0:
+            raise ValueError("a fresh smoke must use expected_resume_step=0")
+    else:
+        resume_path = PurePosixPath(resume_from_path)
+        if not resume_path.is_absolute() or not str(resume_path).startswith("/output/"):
+            raise ValueError("resume_from_path must be an absolute mounted /output path")
+        if resume_path.name != f"global_step_{expected_resume_step}" or expected_resume_step <= 0:
+            raise ValueError("resume_from_path must end in global_step_<expected_resume_step>")
+        if training_steps <= expected_resume_step:
+            raise ValueError("resumed smoke total training steps must exceed expected_resume_step")
     if model_path not in profile.supported_model_paths:
         raise ValueError(f"model_path must be one of {sorted(profile.supported_model_paths)!r}")
     if loss_mode not in {"dppo_tv", "vanilla"}:
@@ -540,6 +564,8 @@ def build_command(
             critique_warmup_steps=critique_warmup_steps,
             critique_model_nnodes=critique_model_nnodes,
             critique_model_n_gpus_per_node=critique_model_n_gpus_per_node,
+            resume_from_path=resume_from_path,
+            expected_resume_step=expected_resume_step,
         ),
     ]
     if nodes <= 2:
@@ -610,6 +636,8 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
     parser.add_argument("--critique-warmup-steps", type=int, default=0)
     parser.add_argument("--critique-model-nnodes", type=int, default=1)
     parser.add_argument("--critique-model-n-gpus-per-node", type=int, default=8)
+    parser.add_argument("--resume-from-path")
+    parser.add_argument("--expected-resume-step", type=int, default=0)
     parser.add_argument("--partition", choices=("interactive",))
     args = parser.parse_args()
 
@@ -693,6 +721,8 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
         critique_warmup_steps=args.critique_warmup_steps,
         critique_model_nnodes=args.critique_model_nnodes,
         critique_model_n_gpus_per_node=args.critique_model_n_gpus_per_node,
+        resume_from_path=args.resume_from_path,
+        expected_resume_step=args.expected_resume_step,
     )
     git = _git_provenance(repo_root)
     provenance = {
@@ -743,6 +773,8 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
             critique_warmup_steps=args.critique_warmup_steps,
             critique_model_nnodes=args.critique_model_nnodes,
             critique_model_n_gpus_per_node=args.critique_model_n_gpus_per_node,
+            resume_from_path=args.resume_from_path,
+            expected_resume_step=args.expected_resume_step,
         )
         result = _run(dry_command, local_run_dir / "dry_run.log")
         if result.returncode:

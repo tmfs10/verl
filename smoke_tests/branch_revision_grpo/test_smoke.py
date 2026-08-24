@@ -351,6 +351,70 @@ def test_rendered_smoke_can_split_actor_and_critique_policy_across_two_nodes(tmp
     assert "+branch_revision_smoke.separate_critique_model=true" in rendered
 
 
+def test_rendered_smoke_can_resume_both_policies_from_an_exact_step(tmp_path: Path) -> None:
+    resume_path = "/output/smoke_tests/branch_revision_grpo/source/checkpoints/global_step_2"
+    command, _ = build_command(
+        profile=CW_DFW_PROFILE,
+        run_tag="resume-separate-critique",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        model_path="/hf_models/Qwen/Qwen3-4B",
+        nodes=2,
+        separate_critique_model=True,
+        critique_warmup_steps=1,
+        training_steps=3,
+        critique_model_nnodes=1,
+        partition="interactive",
+        resume_from_path=resume_path,
+        expected_resume_step=2,
+    )
+    rendered = " ".join(command)
+    assert "trainer.resume_mode=resume_path" in rendered
+    assert f"trainer.resume_from_path={resume_path}" in rendered
+    assert "trainer.expected_resume_step=2" in rendered
+    assert "trainer.load_dataloader_state_on_resume=true" in rendered
+    assert "+branch_revision_smoke.resume_mode=resume_path" in rendered
+    assert f"+branch_revision_smoke.resume_from_path={resume_path}" in rendered
+    assert "+branch_revision_smoke.expected_resume_step=2" in rendered
+
+
+@pytest.mark.parametrize(
+    ("resume_from_path", "expected_resume_step", "training_steps", "match"),
+    [
+        (None, 1, 3, "fresh smoke"),
+        ("relative/global_step_2", 2, 3, "absolute mounted"),
+        ("/output/source/global_step_1", 2, 3, "must end"),
+        ("/output/source/global_step_2", 2, 2, "must exceed"),
+    ],
+)
+def test_rendered_smoke_rejects_inconsistent_resume_contract(
+    resume_from_path: str | None,
+    expected_resume_step: int,
+    training_steps: int,
+    match: str,
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        build_command(
+            run_tag="invalid-resume",
+            dry_run=False,
+            python=Path("/python"),
+            launcher=Path("/launcher"),
+            verl_root=Path("/verl"),
+            reward_file=Path("/reward.py"),
+            config_dir=tmp_path,
+            nodes=2,
+            separate_critique_model=True,
+            training_steps=training_steps,
+            resume_from_path=resume_from_path,
+            expected_resume_step=expected_resume_step,
+        )
+
+
 def test_rendered_smoke_supports_batch_grouped_recovery_only_critiques(tmp_path: Path) -> None:
     command, _ = build_command(
         run_tag="batch-recovery",
@@ -513,6 +577,9 @@ def _scaled_runtime_config(tmp_path: Path):
                 "save_freq": -1,
                 "test_freq": -1,
                 "resume_mode": "disable",
+                "resume_from_path": None,
+                "expected_resume_step": 0,
+                "load_dataloader_state_on_resume": True,
                 "logger": ["file"],
                 "rollout_data_dir": None,
             },
@@ -546,6 +613,9 @@ def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
         "critique_warmup_steps": 0,
         "critique_model_nnodes": 1,
         "critique_model_n_gpus_per_node": 8,
+        "resume_mode": "disable",
+        "resume_from_path": None,
+        "expected_resume_step": 0,
     }
 
 

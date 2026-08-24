@@ -41,7 +41,6 @@ EXPECTED = {
     "trainer.n_gpus_per_node": 8,
     "trainer.val_before_train": False,
     "trainer.test_freq": -1,
-    "trainer.resume_mode": "disable",
 }
 
 
@@ -61,6 +60,37 @@ def _configure_file_logger(config, path: Path) -> None:
         value,
         force_add=True,
     )
+
+
+def _policy_checkpoint_counts(path: Path) -> dict[str, int]:
+    return {
+        "model_files": len(list(path.glob("model_world_size_*_rank_*.pt"))),
+        "optimizer_files": len(list(path.glob("optim_world_size_*_rank_*.pt"))),
+        "extra_state_files": len(list(path.glob("extra_state_world_size_*_rank_*.pt"))),
+    }
+
+
+def _resume_source_manifest(config) -> dict[str, Any] | None:
+    if str(config.trainer.resume_mode) == "disable":
+        return None
+    source = Path(str(config.trainer.resume_from_path)).resolve()
+    actor = source / "actor"
+    critique_actor = source / "critique_actor_rollout"
+    dataloader = source / "data.pt"
+    missing = [str(path) for path in (actor, critique_actor, dataloader) if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"resume source is missing separate-policy state: {missing!r}")
+    manifest = {
+        "global_step": int(source.name.removeprefix("global_step_")),
+        "checkpoint_path": str(source),
+        "actor": _policy_checkpoint_counts(actor),
+        "critique_actor": _policy_checkpoint_counts(critique_actor),
+        "dataloader_bytes": dataloader.stat().st_size,
+    }
+    for role in ("actor", "critique_actor"):
+        if any(int(count) <= 0 for count in manifest[role].values()):
+            raise RuntimeError(f"resume source {role} omits model, optimizer, or extra state: {manifest[role]!r}")
+    return manifest
 
 
 def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any]) -> None:
@@ -89,6 +119,9 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "critique_warmup_steps",
         "critique_model_nnodes",
         "critique_model_n_gpus_per_node",
+        "resume_mode",
+        "resume_from_path",
+        "expected_resume_step",
     }
     if set(smoke_contract) != required_contract:
         raise ValueError(
@@ -135,6 +168,10 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "actor_rollout_ref.rollout.gpu_memory_utilization": smoke_contract["gpu_memory_utilization"],
         "trainer.total_training_steps": smoke_contract["training_steps"],
         "trainer.save_freq": (smoke_contract["training_steps"] if smoke_contract["separate_critique_model"] else -1),
+        "trainer.resume_mode": smoke_contract["resume_mode"],
+        "trainer.resume_from_path": smoke_contract["resume_from_path"],
+        "trainer.expected_resume_step": smoke_contract["expected_resume_step"],
+        "trainer.load_dataloader_state_on_resume": True,
     }
     for name in (
         "n_prompts",
@@ -155,6 +192,25 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
             raise ValueError(f"branch-revision smoke {name} must be a positive integer")
     if not isinstance(smoke_contract["separate_critique_model"], bool):
         raise ValueError("branch-revision smoke separate_critique_model must be boolean")
+    resume_mode = smoke_contract["resume_mode"]
+    resume_from_path = smoke_contract["resume_from_path"]
+    expected_resume_step = smoke_contract["expected_resume_step"]
+    if not isinstance(expected_resume_step, int) or isinstance(expected_resume_step, bool) or expected_resume_step < 0:
+        raise ValueError("branch-revision smoke expected_resume_step must be a nonnegative integer")
+    if resume_mode == "disable":
+        if resume_from_path is not None or expected_resume_step != 0:
+            raise ValueError("fresh branch-revision smoke requires a null path and expected resume step zero")
+    elif resume_mode == "resume_path":
+        if not isinstance(resume_from_path, str) or not resume_from_path.startswith("/output/"):
+            raise ValueError("resumed branch-revision smoke requires an absolute mounted /output checkpoint")
+        if Path(resume_from_path).name != f"global_step_{expected_resume_step}" or expected_resume_step <= 0:
+            raise ValueError("resume checkpoint suffix must agree with expected_resume_step")
+        if smoke_contract["training_steps"] <= expected_resume_step:
+            raise ValueError("resumed branch-revision smoke must execute at least one new step")
+        if not smoke_contract["separate_critique_model"]:
+            raise ValueError("this resume smoke contract is specifically for a separate critique policy")
+    else:
+        raise ValueError("branch-revision smoke resume_mode must be disable or resume_path")
     if smoke_contract["critique_grpo_grouping"] not in {"per_original", "batch"}:
         raise ValueError("branch-revision smoke critique_grpo_grouping must be per_original or batch")
     if smoke_contract["critique_advantage_mode"] not in {"grpo", "pass_at_1"}:
@@ -301,6 +357,9 @@ def main(config) -> None:
     _configure_file_logger(config, output_dir / "metrics.jsonl")
     OmegaConf.resolve(config)
     _validate_contract(config, output_dir, smoke_contract)
+    resume_source_manifest = _resume_source_manifest(config)
+    if resume_source_manifest is not None:
+        _write_json(output_dir / "resume_source_manifest.json", resume_source_manifest)
     _write_json(output_dir / "resolved_config.json", OmegaConf.to_container(config, resolve=True))
     _write_json(
         output_dir / "environment.json",
@@ -349,16 +408,24 @@ def main(config) -> None:
                 raise RuntimeError(
                     f"separate critique-policy checkpoint pointer mismatch: {latest_step} != {global_step}"
                 )
+            actor_counts = _policy_checkpoint_counts(required_paths["actor"])
+            critique_actor_counts = _policy_checkpoint_counts(required_paths["critique_actor"])
             checkpoint_manifest = {
                 "global_step": global_step,
                 "checkpoint_root": str(checkpoint_root),
                 "latest_step": latest_step,
                 "actor_files": sum(path.is_file() for path in required_paths["actor"].rglob("*")),
                 "critique_actor_files": sum(path.is_file() for path in required_paths["critique_actor"].rglob("*")),
+                "actor": actor_counts,
+                "critique_actor": critique_actor_counts,
                 "dataloader_bytes": required_paths["dataloader"].stat().st_size,
             }
-            if checkpoint_manifest["actor_files"] <= 0 or checkpoint_manifest["critique_actor_files"] <= 0:
-                raise RuntimeError("separate critique-policy checkpoint contains an empty policy directory")
+            if (
+                checkpoint_manifest["actor_files"] <= 0
+                or checkpoint_manifest["critique_actor_files"] <= 0
+                or any(int(count) <= 0 for count in (*actor_counts.values(), *critique_actor_counts.values()))
+            ):
+                raise RuntimeError("separate critique-policy checkpoint omits model, optimizer, or extra state")
             _write_json(output_dir / "checkpoint_manifest.json", checkpoint_manifest)
         completion = {
             "status": "completed",
@@ -366,6 +433,7 @@ def main(config) -> None:
             "audit_attempt_id": attempt_id,
             "wall_seconds": time.time() - started,
             "checkpoint_manifest": checkpoint_manifest,
+            "resume_source_manifest": resume_source_manifest,
         }
         _write_json(
             output_dir / "completed.json",

@@ -288,6 +288,30 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError("the current completed smoke invocation also has failure evidence")
     resolved_config = _read_json(root / "resolved_config.json")
     branch_config = resolved_config["algorithm"]["branch_revision_grpo"]
+    trainer_config = resolved_config["trainer"]
+    resume_mode = str(trainer_config.get("resume_mode", "disable"))
+    expected_resume_step = int(trainer_config.get("expected_resume_step", 0) or 0)
+    if resume_mode == "resume_path":
+        resume_source_manifest = _read_json(root / "resume_source_manifest.json")
+        if resume_source_manifest != completed.get("resume_source_manifest"):
+            raise ValueError("completed evidence does not retain the exact resume-source manifest")
+        if (
+            int(resume_source_manifest.get("global_step", -1)) != expected_resume_step
+            or str(resume_source_manifest.get("checkpoint_path", "")) != str(trainer_config.get("resume_from_path"))
+            or int(resume_source_manifest.get("dataloader_bytes", 0)) <= 0
+        ):
+            raise ValueError("resume-source path, step, or dataloader evidence is inconsistent")
+        for role in ("actor", "critique_actor"):
+            counts = resume_source_manifest.get(role)
+            if not isinstance(counts, dict) or any(
+                int(counts.get(kind, 0)) <= 0 for kind in ("model_files", "optimizer_files", "extra_state_files")
+            ):
+                raise ValueError(f"resume source omits native {role} model, optimizer, or extra state")
+    elif resume_mode == "disable":
+        if expected_resume_step != 0 or completed.get("resume_source_manifest") is not None:
+            raise ValueError("fresh smoke contains inconsistent resume evidence")
+    else:
+        raise ValueError(f"unsupported smoke resume mode: {resume_mode!r}")
     separate_critique_model = bool(branch_config.get("separate_critique_model", False))
     critique_warmup_steps = int(branch_config.get("critique_warmup_steps", 0))
     if separate_critique_model:
@@ -303,6 +327,13 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             or not str(checkpoint_manifest.get("checkpoint_root", "")).endswith("/checkpoints")
         ):
             raise ValueError("separate critique-policy checkpoint manifest is incomplete or inconsistent")
+        if resume_mode == "resume_path":
+            for role in ("actor", "critique_actor"):
+                counts = checkpoint_manifest.get(role)
+                if not isinstance(counts, dict) or any(
+                    int(counts.get(kind, 0)) <= 0 for kind in ("model_files", "optimizer_files", "extra_state_files")
+                ):
+                    raise ValueError(f"resumed smoke output omits native {role} checkpoint contents")
     num_critiques = int(branch_config["num_critiques"])
     positive_compression_enabled = bool(branch_config["enable_positive_compression"])
     num_positive_critiques = int(branch_config["num_positive_critiques"])
@@ -701,8 +732,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         prompt_counts = Counter(str(critique["prompt_group_id"]) for critique in critiques)
         unnormalized_weights = np.asarray(
             [
-                max(0.0, 1.0 - audited_prompt_pass_at_1[str(critique["prompt_group_id"])])
-                ** critique_headroom_exponent
+                max(0.0, 1.0 - audited_prompt_pass_at_1[str(critique["prompt_group_id"])]) ** critique_headroom_exponent
                 / prompt_counts[str(critique["prompt_group_id"])]
                 for critique in critiques
             ],
