@@ -998,6 +998,17 @@ def test_branch_revision_config_defaults_to_fifteen_stddevs() -> None:
     assert feature.max_seed_window_stddevs == 15.0
 
 
+@pytest.mark.parametrize("grouping", ["per_original", "batch"])
+def test_branch_revision_config_accepts_both_critique_grpo_groupings(grouping) -> None:
+    feature = BranchRevisionGRPOConfig(critique_grpo_grouping=grouping)
+    assert feature.critique_grpo_grouping == grouping
+
+
+def test_branch_revision_config_rejects_unknown_critique_grpo_grouping() -> None:
+    with pytest.raises(ValueError, match="must be per_original or batch"):
+        BranchRevisionGRPOConfig(critique_grpo_grouping="per_rank")
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -2020,6 +2031,110 @@ def test_recovery_critique_reward_applies_learnability_before_prompt_baseline() 
     another_correct = replace(correct, rollout_id="p:2")
     metrics = controller._metrics([wrong, correct, another_correct], None, 0)
     assert metrics["branch_revision/self_critique_reward/mean"] == pytest.approx(-1.0 / 6.0)
+
+
+def test_batch_critique_grouping_normalizes_all_iteration_critiques_together() -> None:
+    controller = _controller()
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        num_critiques=2,
+        critique_grpo_grouping="batch",
+    )
+    successful = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    invalid = _critique("invalid", valid=False)
+    first = _Bundle(
+        source_row=0,
+        rollout_id="p0:0",
+        prompt_group_id="p0",
+        prompt_ids=_ids("q0"),
+        solution_ids=_ids("first wrong"),
+        solution_log_probs=[-0.1] * len(_ids("first wrong")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord("p0:0", "recovery", (successful, invalid), tuple(_ids("prompt0"))),
+        learnability={0: _learnability()},
+        continuation_rewards={0: 1.0},
+    )
+    second = _Bundle(
+        source_row=1,
+        rollout_id="p1:0",
+        prompt_group_id="p1",
+        prompt_ids=_ids("q1"),
+        solution_ids=_ids("second wrong"),
+        solution_log_probs=[-0.1] * len(_ids("second wrong")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord("p1:0", "recovery", (successful, invalid), tuple(_ids("prompt1"))),
+        learnability={0: _learnability()},
+        continuation_rewards={0: 1.0},
+    )
+    correct_same_prompt = _Bundle(
+        source_row=2,
+        rollout_id="p1:1",
+        prompt_group_id="p1",
+        prompt_ids=_ids("q1"),
+        solution_ids=_ids("correct"),
+        solution_log_probs=[-0.1] * len(_ids("correct")),
+        original_reward=1.0,
+    )
+    bundles = [first, second, correct_same_prompt]
+
+    rows = controller._actor_rows(bundles)
+    critique_rows = [row for row in rows if row.kind == "critique"]
+    assert {row.group_id for row in critique_rows} == {"critique:batch"}
+    assert [row.reward for row in critique_rows] == pytest.approx([1.0, 0.0, 0.5, -0.5])
+
+    actor_batch, padding_rows = controller._make_actor_batch(bundles)
+    critique_indices = [
+        index
+        for index, kind in enumerate(actor_batch.non_tensor_batch["branch_revision_actor_kind"])
+        if kind == "critique"
+    ]
+    rewards = torch.tensor([1.0, 0.0, 0.5, -0.5])
+    expected = (rewards - rewards.mean()) / (rewards.std() + 1e-6)
+    actual = torch.stack(
+        [
+            actor_batch.batch["advantages"][index][actor_batch.batch["response_mask"][index].bool()][0]
+            for index in critique_indices
+        ]
+    )
+    assert actual == pytest.approx(expected)
+
+    metrics = controller._metrics(bundles, actor_batch, padding_rows)
+    assert metrics["branch_revision/critique_grpo_grouping_is_batch"] == 1.0
+    assert metrics["branch_revision/critique_grpo_group_count"] == 1.0
+    assert metrics["branch_revision/critique_grpo_group_size_mean"] == 4.0
+    assert metrics["branch_revision/critique_grpo_group_size_max"] == 4.0
+    assert metrics["branch_revision/critique_reward/mean"] == pytest.approx(0.25)
+    assert metrics["branch_revision/critique_advantage/mean"] == pytest.approx(0.0, abs=1e-7)
+
+
+def test_per_original_critique_grouping_remains_the_default() -> None:
+    controller = _controller()
+    invalid = _critique("invalid", valid=False)
+    bundles = [
+        _Bundle(
+            source_row=index,
+            rollout_id=f"p:{index}",
+            prompt_group_id=f"p{index}",
+            prompt_ids=_ids("q"),
+            solution_ids=_ids("wrong"),
+            solution_log_probs=[-0.1] * len(_ids("wrong")),
+            original_reward=0.0,
+            record=BranchRevisionGenerationRecord(
+                f"p:{index}",
+                "recovery",
+                (invalid, invalid),
+                tuple(_ids("prompt")),
+            ),
+        )
+        for index in range(2)
+    ]
+    rows = controller._actor_rows(bundles)
+    assert [row.group_id for row in rows if row.kind == "critique"] == [
+        "critique:p:0",
+        "critique:p:0",
+        "critique:p:1",
+        "critique:p:1",
+    ]
 
 
 def test_positive_continuation_credit_uses_completed_editable_length(monkeypatch) -> None:

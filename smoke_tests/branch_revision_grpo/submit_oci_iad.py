@@ -54,6 +54,8 @@ def _extra_args(
     n_prompts: int = 8,
     n_samples: int = 4,
     num_critiques: int = 4,
+    critique_grpo_grouping: str = "per_original",
+    enable_positive_compression: bool = True,
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
     learnability_logprob_statistic: str = "mean",
@@ -75,6 +77,10 @@ def _extra_args(
 ) -> str:
     if loss_mode not in {"dppo_tv", "vanilla"}:
         raise ValueError("loss_mode must be dppo_tv or vanilla")
+    if critique_grpo_grouping not in {"per_original", "batch"}:
+        raise ValueError("critique_grpo_grouping must be per_original or batch")
+    if not isinstance(enable_positive_compression, bool):
+        raise ValueError("enable_positive_compression must be boolean")
     if learnability_logprob_statistic not in {"mean", "min"}:
         raise ValueError("learnability_logprob_statistic must be mean or min")
     if learnability_threshold_mode not in {"stddev", "percentile"}:
@@ -95,7 +101,8 @@ def _extra_args(
         f"algorithm.branch_revision_grpo.critique_model_nnodes={critique_model_nnodes}",
         f"algorithm.branch_revision_grpo.critique_model_n_gpus_per_node={critique_model_n_gpus_per_node}",
         f"algorithm.branch_revision_grpo.num_critiques={num_critiques}",
-        "algorithm.branch_revision_grpo.enable_positive_compression=true",
+        f"algorithm.branch_revision_grpo.critique_grpo_grouping={critique_grpo_grouping}",
+        f"algorithm.branch_revision_grpo.enable_positive_compression={str(enable_positive_compression).lower()}",
         f"algorithm.branch_revision_grpo.num_positive_critiques={num_critiques}",
         "algorithm.branch_revision_grpo.positive_compression_target=0.25",
         f"algorithm.branch_revision_grpo.learnability_logprob_statistic={learnability_logprob_statistic}",
@@ -173,6 +180,8 @@ def _extra_args(
         f"+branch_revision_smoke.n_prompts={n_prompts}",
         f"+branch_revision_smoke.n_samples={n_samples}",
         f"+branch_revision_smoke.num_critiques={num_critiques}",
+        f"+branch_revision_smoke.critique_grpo_grouping={critique_grpo_grouping}",
+        f"+branch_revision_smoke.enable_positive_compression={str(enable_positive_compression).lower()}",
         f"+branch_revision_smoke.model_path={model_path}",
         f"+branch_revision_smoke.loss_mode={loss_mode}",
         f"+branch_revision_smoke.learnability_logprob_statistic={learnability_logprob_statistic}",
@@ -208,6 +217,8 @@ def build_command(
     n_prompts: int = 8,
     n_samples: int = 4,
     num_critiques: int = 4,
+    critique_grpo_grouping: str = "per_original",
+    enable_positive_compression: bool = True,
     seed: int = 43,
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
@@ -254,6 +265,10 @@ def build_command(
         raise ValueError("prompt_logprob_max_inflight_tokens must be null or a positive integer")
     if not isinstance(separate_critique_model, bool):
         raise ValueError("separate_critique_model must be boolean")
+    if critique_grpo_grouping not in {"per_original", "batch"}:
+        raise ValueError("critique_grpo_grouping must be per_original or batch")
+    if not isinstance(enable_positive_compression, bool):
+        raise ValueError("enable_positive_compression must be boolean")
     if (
         not isinstance(critique_warmup_steps, int)
         or isinstance(critique_warmup_steps, bool)
@@ -384,6 +399,8 @@ def build_command(
             n_prompts=n_prompts,
             n_samples=n_samples,
             num_critiques=num_critiques,
+            critique_grpo_grouping=critique_grpo_grouping,
+            enable_positive_compression=enable_positive_compression,
             model_path=model_path,
             loss_mode=loss_mode,
             learnability_logprob_statistic=learnability_logprob_statistic,
@@ -435,6 +452,8 @@ def main() -> None:
     parser.add_argument("--n-prompts", type=int, default=8)
     parser.add_argument("--n-samples", type=int, default=4)
     parser.add_argument("--num-critiques", type=int, default=4)
+    parser.add_argument("--critique-grpo-grouping", choices=("per_original", "batch"), default="per_original")
+    parser.add_argument("--disable-positive-compression", action="store_true")
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument("--model-path", choices=sorted(SUPPORTED_MODEL_PATHS), default=MODEL_PATH)
     parser.add_argument("--loss-mode", choices=("dppo_tv", "vanilla"), default="dppo_tv")
@@ -523,6 +542,8 @@ def main() -> None:
         n_prompts=args.n_prompts,
         n_samples=args.n_samples,
         num_critiques=args.num_critiques,
+        critique_grpo_grouping=args.critique_grpo_grouping,
+        enable_positive_compression=not args.disable_positive_compression,
         seed=args.seed,
         model_path=args.model_path,
         loss_mode=args.loss_mode,
@@ -568,6 +589,8 @@ def main() -> None:
             n_prompts=args.n_prompts,
             n_samples=args.n_samples,
             num_critiques=args.num_critiques,
+            critique_grpo_grouping=args.critique_grpo_grouping,
+            enable_positive_compression=not args.disable_positive_compression,
             seed=args.seed,
             model_path=args.model_path,
             loss_mode=args.loss_mode,

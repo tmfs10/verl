@@ -69,6 +69,8 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "n_prompts",
         "n_samples",
         "num_critiques",
+        "critique_grpo_grouping",
+        "enable_positive_compression",
         "loss_mode",
         "learnability_logprob_statistic",
         "learnability_threshold_mode",
@@ -98,6 +100,8 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "actor_rollout_ref.rollout.n": smoke_contract["n_samples"],
         "algorithm.branch_revision_grpo.num_critiques": smoke_contract["num_critiques"],
         "algorithm.branch_revision_grpo.num_positive_critiques": smoke_contract["num_critiques"],
+        "algorithm.branch_revision_grpo.critique_grpo_grouping": smoke_contract["critique_grpo_grouping"],
+        "algorithm.branch_revision_grpo.enable_positive_compression": smoke_contract["enable_positive_compression"],
         "actor_rollout_ref.model.path": smoke_contract["model_path"],
         "critic.model.path": smoke_contract["model_path"],
         "actor_rollout_ref.actor.policy_loss.loss_mode": smoke_contract["loss_mode"],
@@ -149,6 +153,10 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
             raise ValueError(f"branch-revision smoke {name} must be a positive integer")
     if not isinstance(smoke_contract["separate_critique_model"], bool):
         raise ValueError("branch-revision smoke separate_critique_model must be boolean")
+    if smoke_contract["critique_grpo_grouping"] not in {"per_original", "batch"}:
+        raise ValueError("branch-revision smoke critique_grpo_grouping must be per_original or batch")
+    if not isinstance(smoke_contract["enable_positive_compression"], bool):
+        raise ValueError("branch-revision smoke enable_positive_compression must be boolean")
     critique_warmup_steps = smoke_contract["critique_warmup_steps"]
     if (
         not isinstance(critique_warmup_steps, int)
@@ -216,8 +224,10 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
             raise ValueError(f"branch-revision smoke requires {key}={expected!r}, got {actual!r}")
     if not bool(OmegaConf.select(config, "algorithm.branch_revision_grpo.enable")):
         raise ValueError("branch-revision smoke requires the feature to be enabled")
-    if not bool(OmegaConf.select(config, "algorithm.branch_revision_grpo.enable_positive_compression")):
-        raise ValueError("branch-revision smoke must exercise positive-rollout compression")
+    if bool(OmegaConf.select(config, "algorithm.branch_revision_grpo.enable_positive_compression")) != bool(
+        smoke_contract["enable_positive_compression"]
+    ):
+        raise ValueError("branch-revision smoke positive-compression mode differs from its launch contract")
     if bool(OmegaConf.select(config, "algorithm.intermediate_mc_value.enable")):
         raise ValueError("branch-revision smoke must not enable intermediate MC")
     if bool(OmegaConf.select(config, "critic.enable")):

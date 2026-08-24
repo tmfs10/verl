@@ -185,6 +185,7 @@ class BranchRevisionGRPOConfig(BaseConfig):
     critique_warmup_steps: int = 0
     critique_model_nnodes: int = 1
     critique_model_n_gpus_per_node: int = 8
+    critique_grpo_grouping: str = "per_original"
     num_critiques: int = 4
     enable_positive_compression: bool = False
     num_positive_critiques: int = 4
@@ -219,6 +220,8 @@ class BranchRevisionGRPOConfig(BaseConfig):
         for name, value in critique_resources.items():
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError(f"algorithm.branch_revision_grpo.{name} must be a positive integer")
+        if self.critique_grpo_grouping not in {"per_original", "batch"}:
+            raise ValueError("algorithm.branch_revision_grpo.critique_grpo_grouping must be per_original or batch")
         positive_ints = {
             "num_critiques": self.num_critiques,
             "num_positive_critiques": self.num_positive_critiques,

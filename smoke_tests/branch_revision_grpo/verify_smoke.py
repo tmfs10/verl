@@ -304,9 +304,11 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         ):
             raise ValueError("separate critique-policy checkpoint manifest is incomplete or inconsistent")
     num_critiques = int(branch_config["num_critiques"])
-    if not bool(branch_config["enable_positive_compression"]):
-        raise ValueError("live smoke did not enable positive-rollout compression")
+    positive_compression_enabled = bool(branch_config["enable_positive_compression"])
     num_positive_critiques = int(branch_config["num_positive_critiques"])
+    critique_grpo_grouping = str(branch_config.get("critique_grpo_grouping", "per_original"))
+    if critique_grpo_grouping not in {"per_original", "batch"}:
+        raise ValueError(f"unsupported critique GRPO grouping in smoke evidence: {critique_grpo_grouping!r}")
     min_continuation_tokens = int(branch_config["min_continuation_tokens"])
     statistic = str(branch_config["learnability_logprob_statistic"])
     if statistic not in {"mean", "min"}:
@@ -377,6 +379,10 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         ):
             raise ValueError("selected audit step is incomplete")
         iteration_event = _only(step_events, "iteration")
+        if iteration_event.get("critique_grpo_grouping", "per_original") != critique_grpo_grouping:
+            raise ValueError(f"step {filename_step} used the wrong critique GRPO grouping")
+        if bool(iteration_event.get("positive_compression_enabled")) != positive_compression_enabled:
+            raise ValueError(f"step {filename_step} used the wrong positive-compression mode")
         actor_batch_events = [event for event in step_events if event.get("event") == "actor_batch"]
         warmup_active = filename_step <= critique_warmup_steps
         expected_policies = (
@@ -431,6 +437,8 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError(f"iteration audit must retain all {expected_originals} original binary rewards")
     if iteration.get("learnability_logprob_statistic") != statistic:
         raise ValueError("iteration audit used a different learnability statistic than the resolved config")
+    if iteration.get("critique_grpo_grouping", "per_original") != critique_grpo_grouping:
+        raise ValueError("iteration audit used a different critique GRPO grouping than the resolved config")
     if audit_schema_version >= 5 and (
         iteration.get("learnability_threshold_mode") != threshold_mode
         or not math.isclose(
@@ -475,7 +483,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     continuations = [event for event in events if event.get("event") == "continuation"]
     reference_events = [event for event in events if event.get("event") == "learnability_reference"]
     learnability_events = [event for event in events if event.get("event") == "learnability"]
-    expected_critiques = incorrect * num_critiques + correct * num_positive_critiques
+    expected_critiques = incorrect * num_critiques + (
+        correct * num_positive_critiques if positive_compression_enabled else 0
+    )
     if len(critiques) != expected_critiques:
         raise ValueError(f"expected {expected_critiques} IID critiques, got {len(critiques)}")
     if require_algorithm_signal and not continuations:
@@ -623,7 +633,10 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             raise ValueError(
                 f"rollout {rollout_id!r} must have critique indices {sorted(expected_indices)}; got {sorted(indices)}"
             )
-    if Counter(rollout_objectives.values()) != Counter(recovery=incorrect, compression=correct):
+    expected_objectives = Counter(recovery=incorrect)
+    if positive_compression_enabled:
+        expected_objectives["compression"] = correct
+    if Counter(rollout_objectives.values()) != expected_objectives:
         raise ValueError("critique objective counts do not match original correctness counts")
     if any(len(prompts) != 1 for prompts in critique_prompts.values()):
         raise ValueError("IID critiques for one original rollout used different behavior-policy prompt IDs")
@@ -948,7 +961,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         row_id = str(critique["actor_row_id"])
         expected_sources[row_id] = {
             "kind": "critique",
-            "group_id": f"critique:{key[0]}",
+            "group_id": "critique:batch" if critique_grpo_grouping == "batch" else f"critique:{key[0]}",
             "reward": float(critique["reward"]),
             "full_ids": [*critique["critique_prompt_ids"], *critique["critique_ids"]],
             "train_start": len(critique["critique_prompt_ids"]),
@@ -1122,24 +1135,37 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     if any(str(row["group_id"]) not in original_solution_groups for row in continuation_actor_rows):
         raise ValueError("revised solutions must join their original prompt's solution GRPO group")
     critique_groups = Counter(str(row["group_id"]) for row in critique_actor_rows)
-    if len(critique_groups) != incorrect + correct:
-        raise ValueError("every selected original must have one critique GRPO group")
-    for group_id, count in critique_groups.items():
-        rollout_id = group_id.removeprefix("critique:")
-        expected_count = num_critiques if rollout_objectives[rollout_id] == "recovery" else num_positive_critiques
-        if count != expected_count:
-            raise ValueError(f"critique group {group_id!r} must contain {expected_count} IID critiques, got {count}")
-    for objective in ("recovery", "compression"):
-        objective_groups = [
-            group_id
-            for group_id in critique_groups
-            if rollout_objectives[group_id.removeprefix("critique:")] == objective
-        ]
-        if require_algorithm_signal and not any(
-            len({float(row["reward"]) for row in critique_actor_rows if str(row["group_id"]) == group_id}) > 1
-            for group_id in objective_groups
-        ):
-            raise ValueError(f"smoke has no nonuniform {objective} critique GRPO reward group")
+    if critique_grpo_grouping == "batch":
+        if critique_groups != Counter({"critique:batch": expected_critiques}):
+            raise ValueError("batch grouping must put every critique row in one iteration-level GRPO group")
+        if require_algorithm_signal and len({float(row["reward"]) for row in critique_actor_rows}) <= 1:
+            raise ValueError("smoke has no nonuniform batch-level critique GRPO reward group")
+    else:
+        selected_originals = incorrect + (correct if positive_compression_enabled else 0)
+        if len(critique_groups) != selected_originals:
+            raise ValueError("every selected original must have one critique GRPO group")
+        for group_id, count in critique_groups.items():
+            rollout_id = group_id.removeprefix("critique:")
+            expected_count = num_critiques if rollout_objectives[rollout_id] == "recovery" else num_positive_critiques
+            if count != expected_count:
+                raise ValueError(
+                    f"critique group {group_id!r} must contain {expected_count} IID critiques, got {count}"
+                )
+        for objective in ("recovery", "compression"):
+            objective_groups = [
+                group_id
+                for group_id in critique_groups
+                if rollout_objectives[group_id.removeprefix("critique:")] == objective
+            ]
+            if (
+                objective_groups
+                and require_algorithm_signal
+                and not any(
+                    len({float(row["reward"]) for row in critique_actor_rows if str(row["group_id"]) == group_id}) > 1
+                    for group_id in objective_groups
+                )
+            ):
+                raise ValueError(f"smoke has no nonuniform {objective} critique GRPO reward group")
 
     metrics = _read_jsonl(root / "metrics.jsonl")
     step_rows = [row for row in metrics if int(row.get("step", -1)) == selected_step]
@@ -1154,11 +1180,19 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         "branch_revision/correct_originals": float(correct),
         "branch_revision/critiques": float(expected_critiques),
         "branch_revision/recovery_critiques": float(incorrect * num_critiques),
-        "branch_revision/compression_critiques": float(correct * num_positive_critiques),
+        "branch_revision/compression_critiques": float(
+            correct * num_positive_critiques if positive_compression_enabled else 0
+        ),
         "branch_revision/valid_edits": float(len(structurally_valid_keys)),
         "branch_revision/learnability_accepted_edits": float(len(accepted_keys)),
         "branch_revision/continuations": float(len(continuations)),
         "branch_revision/policy_loss_is_dppo_tv": float(loss_mode == "dppo_tv"),
+        "branch_revision/critique_grpo_grouping_is_batch": float(critique_grpo_grouping == "batch"),
+        "branch_revision/critique_grpo_group_count": float(len(critique_groups)),
+        "branch_revision/critique_grpo_group_size_mean": (
+            float(sum(critique_groups.values()) / len(critique_groups)) if critique_groups else 0.0
+        ),
+        "branch_revision/critique_grpo_group_size_max": float(max(critique_groups.values(), default=0)),
     }
     if separate_critique_model:
         required_metrics.update(
@@ -1222,7 +1256,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     )
     if require_algorithm_signal and successful_recoveries <= 0.0:
         raise ValueError("smoke has no successful recovery continuation")
-    if require_algorithm_signal and successful_compressions <= 0.0:
+    if require_algorithm_signal and positive_compression_enabled and successful_compressions <= 0.0:
         raise ValueError("smoke has no successful positive-rollout compression")
 
     return {
@@ -1241,6 +1275,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         "successful_revisions": successful_revisions,
         "successful_compression_credit": successful_compressions,
         "policy_loss_mode": loss_mode,
+        "critique_grpo_grouping": critique_grpo_grouping,
         "learnability_logprob_statistic": statistic,
         "learnability_threshold_mode": threshold_mode,
         "max_seed_window_stddevs": max_seed_window_stddevs,

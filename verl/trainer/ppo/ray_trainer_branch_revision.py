@@ -1233,6 +1233,9 @@ class BranchRevisionGRPOController:
         }
         for bundle in bundles:
             solution_group = f"solution:{bundle.prompt_group_id}"
+            critique_group = (
+                "critique:batch" if self.feature.critique_grpo_grouping == "batch" else f"critique:{bundle.rollout_id}"
+            )
             rows.append(
                 _ActorRow(
                     audit_row_id=f"original:{bundle.rollout_id}",
@@ -1268,7 +1271,7 @@ class BranchRevisionGRPOController:
                         train_start=len(critique_prompt),
                         behavior_log_probs=list(critique.log_probs),
                         reward=critique_reward,
-                        group_id=f"critique:{bundle.rollout_id}",
+                        group_id=critique_group,
                         kind="critique",
                     )
                 )
@@ -1615,6 +1618,44 @@ class BranchRevisionGRPOController:
         )
         actor_input_tokens = sum(int(batch.batch["attention_mask"].sum().item()) for batch in policy_batches)
         actor_train_tokens = sum(int(batch.batch["response_mask"].sum().item()) for batch in policy_batches)
+        critique_group_ids: list[str] = []
+        critique_rewards: list[float] = []
+        critique_advantages: list[float] = []
+        for batch in policy_batches:
+            kinds = batch.non_tensor_batch["branch_revision_actor_kind"]
+            group_ids = batch.non_tensor_batch["uid"]
+            rewards = batch.non_tensor_batch["branch_revision_reward"]
+            for row_index, kind in enumerate(kinds):
+                if kind != "critique":
+                    continue
+                mask = batch.batch["response_mask"][row_index].bool()
+                row_advantages = batch.batch["advantages"][row_index][mask]
+                if row_advantages.numel() == 0:
+                    raise RuntimeError("branch-revision critique row has no trained advantage tokens")
+                first_advantage = float(row_advantages[0].item())
+                if not torch.allclose(row_advantages, row_advantages.new_full(row_advantages.shape, first_advantage)):
+                    raise RuntimeError("branch-revision GRPO critique advantage is not constant across trained tokens")
+                critique_group_ids.append(str(group_ids[row_index]))
+                critique_rewards.append(float(rewards[row_index]))
+                critique_advantages.append(first_advantage)
+        critique_group_sizes = list(Counter(critique_group_ids).values())
+
+        def distribution_metrics(values: list[float], prefix: str) -> dict[str, float]:
+            if not values:
+                return {
+                    f"{prefix}/mean": 0.0,
+                    f"{prefix}/std": 0.0,
+                    f"{prefix}/min": 0.0,
+                    f"{prefix}/max": 0.0,
+                }
+            array = np.asarray(values, dtype=np.float64)
+            return {
+                f"{prefix}/mean": float(np.mean(array)),
+                f"{prefix}/std": float(np.std(array, ddof=0)),
+                f"{prefix}/min": float(np.min(array)),
+                f"{prefix}/max": float(np.max(array)),
+            }
+
         metrics = {
             "branch_revision/original/pass_at_1": float(sum(originals) / len(originals)),
             "branch_revision/self_critique_reward/mean": (
@@ -1686,10 +1727,33 @@ class BranchRevisionGRPOController:
             ),
             "branch_revision/critique_warmup_active": float(self._critique_warmup_active()),
             "branch_revision/separate_critique_model": float(self.feature.separate_critique_model),
+            "branch_revision/critique_grpo_grouping_is_batch": float(self.feature.critique_grpo_grouping == "batch"),
+            "branch_revision/critique_grpo_group_count": float(len(critique_group_sizes)),
+            "branch_revision/critique_grpo_group_size_mean": (
+                float(sum(critique_group_sizes) / len(critique_group_sizes)) if critique_group_sizes else 0.0
+            ),
+            "branch_revision/critique_grpo_group_size_max": float(max(critique_group_sizes, default=0)),
+            "branch_revision/critique_advantage/positive_fraction": (
+                float(sum(value > 0.0 for value in critique_advantages) / len(critique_advantages))
+                if critique_advantages
+                else 0.0
+            ),
+            "branch_revision/critique_advantage/negative_fraction": (
+                float(sum(value < 0.0 for value in critique_advantages) / len(critique_advantages))
+                if critique_advantages
+                else 0.0
+            ),
+            "branch_revision/critique_advantage/zero_fraction": (
+                float(sum(value == 0.0 for value in critique_advantages) / len(critique_advantages))
+                if critique_advantages
+                else 0.0
+            ),
             "branch_revision/policy_loss_is_dppo_tv": float(
                 str(self.config.actor_rollout_ref.actor.policy_loss.loss_mode) == "dppo_tv"
             ),
         }
+        metrics.update(distribution_metrics(critique_rewards, "branch_revision/critique_reward"))
+        metrics.update(distribution_metrics(critique_advantages, "branch_revision/critique_advantage"))
         denominator = len(critiques) or 1
         for reason, count in sorted(parse_counts.items()):
             metrics[f"branch_revision/parser/{reason}"] = float(count / denominator)
@@ -1870,6 +1934,7 @@ class BranchRevisionGRPOController:
             incorrect=sum(bundle.original_reward == 0.0 for bundle in bundles),
             correct=sum(bundle.original_reward == 1.0 for bundle in bundles),
             positive_compression_enabled=self.feature.enable_positive_compression,
+            critique_grpo_grouping=self.feature.critique_grpo_grouping,
             learnability_logprob_statistic=self.feature.learnability_logprob_statistic,
             learnability_threshold_mode=self.feature.learnability_threshold_mode,
             max_seed_window_stddevs=self.feature.max_seed_window_stddevs,

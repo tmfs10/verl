@@ -47,6 +47,7 @@ def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(t
     assert "actor_rollout_ref.rollout.val_kwargs.temperature=1.0" in rendered
     assert "actor_rollout_ref.actor.policy_loss.loss_mode=dppo_tv" in rendered
     assert "algorithm.branch_revision_grpo.num_critiques=4" in rendered
+    assert "algorithm.branch_revision_grpo.critique_grpo_grouping=per_original" in rendered
     assert "algorithm.branch_revision_grpo.enable_positive_compression=true" in rendered
     assert "algorithm.branch_revision_grpo.num_positive_critiques=4" in rendered
     assert "algorithm.branch_revision_grpo.min_seed_window_percentile=0.20" in rendered
@@ -270,6 +271,25 @@ def test_rendered_smoke_can_split_actor_and_critique_policy_across_two_nodes(tmp
     assert "+branch_revision_smoke.separate_critique_model=true" in rendered
 
 
+def test_rendered_smoke_supports_batch_grouped_recovery_only_critiques(tmp_path: Path) -> None:
+    command, _ = build_command(
+        run_tag="batch-recovery",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        critique_grpo_grouping="batch",
+        enable_positive_compression=False,
+    )
+    rendered = " ".join(command)
+    assert "algorithm.branch_revision_grpo.critique_grpo_grouping=batch" in rendered
+    assert "algorithm.branch_revision_grpo.enable_positive_compression=false" in rendered
+    assert "+branch_revision_smoke.critique_grpo_grouping=batch" in rendered
+    assert "+branch_revision_smoke.enable_positive_compression=false" in rendered
+
+
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
@@ -356,6 +376,7 @@ def _scaled_runtime_config(tmp_path: Path):
                     "critique_warmup_steps": 0,
                     "critique_model_nnodes": 1,
                     "critique_model_n_gpus_per_node": 8,
+                    "critique_grpo_grouping": "per_original",
                     "num_critiques": 6,
                     "enable_positive_compression": True,
                     "num_positive_critiques": 6,
@@ -389,6 +410,8 @@ def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
         "n_prompts": n_prompts,
         "n_samples": 4,
         "num_critiques": 6,
+        "critique_grpo_grouping": "per_original",
+        "enable_positive_compression": True,
         "loss_mode": "dppo_tv",
         "learnability_logprob_statistic": "mean",
         "learnability_threshold_mode": "stddev",
@@ -480,6 +503,8 @@ def _fixture(
     max_seed_window_stddevs: float = 15.0,
     nodes: int = 1,
     schema_version: int = 5,
+    critique_grpo_grouping: str = "per_original",
+    enable_positive_compression: bool = True,
 ) -> None:
     attempt_id = "fixture"
     invocation_id = "invocation"
@@ -493,7 +518,8 @@ def _fixture(
     _write_json(root / "completed.json", completion)
     branch_config = {
         "num_critiques": 2,
-        "enable_positive_compression": True,
+        "critique_grpo_grouping": critique_grpo_grouping,
+        "enable_positive_compression": enable_positive_compression,
         "num_positive_critiques": 2,
         "positive_compression_target": 0.25,
         "learnability_logprob_statistic": statistic,
@@ -623,6 +649,8 @@ def _fixture(
     successful_recoveries = 0.0
     self_critique_rewards: list[float] = []
     for original_index, original_reward in enumerate(original_rewards):
+        if original_reward == 1.0 and not enable_positive_compression:
+            continue
         rollout_id = f"p:{original_index}"
         original = originals[rollout_id]
         prompt_group_id = original["prompt_group_id"]
@@ -744,7 +772,7 @@ def _fixture(
                 {
                     "actor_row_id": critique["actor_row_id"],
                     "kind": "critique",
-                    "group_id": f"critique:{rollout_id}",
+                    "group_id": "critique:batch" if critique_grpo_grouping == "batch" else f"critique:{rollout_id}",
                     "reward": reward,
                     "full_ids": [*critique_prompt_ids, *critique_ids],
                     "train_start": len(critique_prompt_ids),
@@ -783,7 +811,8 @@ def _fixture(
                     }
                 )
 
-    critique_count = 16 * 2
+    selected_original_count = 2 + (14 if enable_positive_compression else 0)
+    critique_count = selected_original_count * 2
     rows = 16 + critique_count + continuation_count
     padding = (-rows) % (nodes * 8)
     actor_sources.extend(
@@ -821,7 +850,8 @@ def _fixture(
                 "originals": 16,
                 "incorrect": 2,
                 "correct": 14,
-                "positive_compression_enabled": True,
+                "positive_compression_enabled": enable_positive_compression,
+                "critique_grpo_grouping": critique_grpo_grouping,
                 "learnability_logprob_statistic": statistic,
                 **(
                     {
@@ -852,7 +882,17 @@ def _fixture(
                     "branch_revision/correct_originals": 14.0,
                     "branch_revision/critiques": float(critique_count),
                     "branch_revision/recovery_critiques": 4.0,
-                    "branch_revision/compression_critiques": 28.0,
+                    "branch_revision/compression_critiques": 28.0 if enable_positive_compression else 0.0,
+                    "branch_revision/critique_grpo_grouping_is_batch": float(critique_grpo_grouping == "batch"),
+                    "branch_revision/critique_grpo_group_count": float(
+                        1 if critique_grpo_grouping == "batch" else selected_original_count
+                    ),
+                    "branch_revision/critique_grpo_group_size_mean": float(
+                        critique_count if critique_grpo_grouping == "batch" else 2
+                    ),
+                    "branch_revision/critique_grpo_group_size_max": float(
+                        critique_count if critique_grpo_grouping == "batch" else 2
+                    ),
                     "branch_revision/valid_edits": float(structurally_valid_count),
                     "branch_revision/learnability_accepted_edits": float(continuation_count),
                     "branch_revision/continuations": float(continuation_count),
@@ -1068,6 +1108,26 @@ def test_verifier_accepts_complete_live_contract(tmp_path: Path) -> None:
     _fixture(tmp_path)
     result = verify(tmp_path)
     assert result["status"] == "verified"
+
+
+def test_verifier_accepts_one_iteration_level_critique_grpo_group(tmp_path: Path) -> None:
+    _fixture(
+        tmp_path,
+        critique_grpo_grouping="batch",
+        enable_positive_compression=False,
+    )
+    result = verify(tmp_path)
+    assert result["status"] == "verified"
+    assert result["critique_grpo_grouping"] == "batch"
+
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    actor_batch = next(event for event in events if event["event"] == "actor_batch")
+    critique_row = next(row for row in actor_batch["actor_rows"] if row["kind"] == "critique")
+    critique_row["group_id"] = "critique:per-rank-0"
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="does not match its source tensors"):
+        verify(tmp_path)
 
 
 def test_verifier_proves_separate_critique_policy_warmup_and_post_warmup_batches(tmp_path: Path) -> None:

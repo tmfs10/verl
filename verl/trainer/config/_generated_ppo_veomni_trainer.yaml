@@ -663,6 +663,7 @@ algorithm:
     critique_warmup_steps: 0
     critique_model_nnodes: 1
     critique_model_n_gpus_per_node: 8
+    critique_grpo_grouping: per_original
     num_critiques: 4
     enable_positive_compression: false
     num_positive_critiques: 4
