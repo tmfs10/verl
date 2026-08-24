@@ -17,6 +17,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -56,7 +57,7 @@ def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(t
     assert "algorithm.branch_revision_grpo.min_continuation_tokens=128" in rendered
     assert "data.max_response_length=2048" in rendered
     assert "actor_rollout_ref.rollout.max_model_len=8192" in rendered
-    assert "actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens=8192" in rendered
+    assert "actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens=null" in rendered
     assert "actor_rollout_ref.rollout.gpu_memory_utilization=0.6" in rendered
     assert "reward.reward_model.launch_reward_fn_async=false" in rendered
     assert "--enable_wandb" not in command
@@ -126,7 +127,7 @@ def test_rendered_smoke_supports_two_node_32k_context_and_8k_answers(tmp_path: P
     assert "data.max_response_length=8192" in rendered
     assert "actor_rollout_ref.rollout.n=8" in rendered
     assert "actor_rollout_ref.rollout.max_model_len=32768" in rendered
-    assert "actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens=8192" in rendered
+    assert "actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens=null" in rendered
     assert "actor_rollout_ref.rollout.gpu_memory_utilization=0.6" in rendered
     assert "algorithm.branch_revision_grpo.critique_max_response_length=8192" in rendered
     assert "algorithm.branch_revision_grpo.num_critiques=2" in rendered
@@ -238,6 +239,37 @@ def test_rendered_smoke_can_select_percentile_learnability(tmp_path: Path) -> No
     assert "algorithm.branch_revision_grpo.max_seed_window_stddevs=7.5" in rendered
 
 
+def test_rendered_smoke_can_split_actor_and_critique_policy_across_two_nodes(tmp_path: Path) -> None:
+    command, _ = build_command(
+        run_tag="separate-critique",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        nodes=2,
+        separate_critique_model=True,
+        critique_warmup_steps=1,
+        training_steps=2,
+        critique_model_nnodes=1,
+        critique_model_n_gpus_per_node=8,
+        partition="interactive",
+    )
+    rendered = " ".join(command)
+    assert "algorithm.branch_revision_grpo.separate_critique_model=true" in rendered
+    assert "algorithm.branch_revision_grpo.critique_warmup_steps=1" in rendered
+    assert "algorithm.branch_revision_grpo.critique_model_nnodes=1" in rendered
+    assert "algorithm.branch_revision_grpo.critique_model_n_gpus_per_node=8" in rendered
+    assert "trainer.nnodes=1" in rendered
+    assert "trainer.save_freq=2" in rendered
+    checkpoint_override = (
+        "trainer.default_local_dir=/output/smoke_tests/branch_revision_grpo/separate-critique/evidence/../checkpoints"
+    )
+    assert checkpoint_override in rendered
+    assert "+branch_revision_smoke.separate_critique_model=true" in rendered
+
+
 @pytest.mark.parametrize(
     ("overrides", "match"),
     [
@@ -254,6 +286,8 @@ def test_rendered_smoke_can_select_percentile_learnability(tmp_path: Path) -> No
         ({"prompt_logprob_max_inflight_tokens": 0}, "prompt_logprob_max_inflight_tokens"),
         ({"gpu_memory_utilization": 1.0}, "gpu_memory_utilization"),
         ({"training_steps": 0}, "training_steps"),
+        ({"critique_warmup_steps": -1}, "critique_warmup_steps"),
+        ({"nodes": 1, "separate_critique_model": True}, "one actor node"),
         ({"partition": "batch_block1"}, "partition must be interactive"),
         ({"nodes": 5}, "at most four nodes"),
         ({"max_model_len": 3072}, "must be smaller than max_model_len"),
@@ -318,6 +352,10 @@ def _scaled_runtime_config(tmp_path: Path):
                 "intermediate_mc_value": {"enable": False},
                 "branch_revision_grpo": {
                     "enable": True,
+                    "separate_critique_model": False,
+                    "critique_warmup_steps": 0,
+                    "critique_model_nnodes": 1,
+                    "critique_model_n_gpus_per_node": 8,
                     "num_critiques": 6,
                     "enable_positive_compression": True,
                     "num_positive_critiques": 6,
@@ -364,6 +402,10 @@ def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
         "prompt_logprob_max_inflight_tokens": 8192,
         "gpu_memory_utilization": 0.6,
         "training_steps": 1,
+        "separate_critique_model": False,
+        "critique_warmup_steps": 0,
+        "critique_model_nnodes": 1,
+        "critique_model_n_gpus_per_node": 8,
     }
 
 
@@ -908,10 +950,126 @@ def _duplicate_fixture_step(root: Path) -> None:
     _refresh_attempt_config_hash(root)
 
 
+def _policy_actor_batch(source: dict, *, policy: str, kinds: set[str], dp_size: int = 8) -> dict:
+    rows = [copy.deepcopy(row) for row in source["actor_rows"] if row["kind"] in kinds]
+    response_width = int(rows[0]["response_width"])
+    padding = (-len(rows)) % dp_size
+    for index in range(padding):
+        rows.append(
+            _actor_audit_row(
+                {
+                    "actor_row_id": f"padding:{index}",
+                    "kind": "padding",
+                    "group_id": f"padding:{index}",
+                    "reward": 0.0,
+                    "full_ids": [0],
+                    "train_start": None,
+                    "behavior_log_probs": [],
+                },
+                row_index=len(rows),
+                response_width=response_width,
+            )
+        )
+    for index, row in enumerate(rows):
+        row["balanced_row_index"] = index
+    counts = Counter(row["kind"] for row in rows)
+    return {
+        **{key: value for key, value in source.items() if key not in {"actor_rows", "padding"}},
+        "policy": policy,
+        "rows": len(rows) - padding,
+        "original": counts["original"],
+        "critiques": counts["critique"],
+        "continuations": counts["continuation"],
+        "padding": padding,
+        "actor_rows": rows,
+    }
+
+
+def _separate_critique_policy_fixture(root: Path) -> None:
+    _fixture(root)
+    config_path = root / "resolved_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["trainer"]["total_training_steps"] = 2
+    config["algorithm"]["branch_revision_grpo"].update(
+        separate_critique_model=True,
+        critique_warmup_steps=1,
+        critique_model_nnodes=1,
+        critique_model_n_gpus_per_node=8,
+    )
+    _write_json(config_path, config)
+    _refresh_attempt_config_hash(root)
+
+    base_events = [json.loads(line) for line in _audit_path(root).read_text(encoding="utf-8").splitlines()]
+    base_batch = next(event for event in base_events if event["event"] == "actor_batch")
+    base_iteration = next(event for event in base_events if event["event"] == "iteration")
+    source_events = [
+        event for event in base_events if event["event"] not in {"actor_batch", "iteration", "step_complete"}
+    ]
+    critique_batch = _policy_actor_batch(base_batch, policy="critique_actor", kinds={"critique"})
+    main_batch = _policy_actor_batch(base_batch, policy="actor", kinds={"original", "continuation"})
+    for step in (1, 2):
+        iteration = {
+            **base_iteration,
+            "separate_critique_model": True,
+            "critique_warmup_steps": 1,
+            "critique_warmup_active": step == 1,
+            "main_actor_updated": step == 2,
+            "critique_actor_updated": True,
+        }
+        policy_batches = [critique_batch] if step == 1 else [main_batch, critique_batch]
+        events = [*source_events, *policy_batches, iteration, {"event": "step_complete"}]
+        events = [
+            {
+                "schema_version": base_events[0]["schema_version"],
+                "attempt_id": base_events[0]["attempt_id"],
+                **event,
+                "global_step": step,
+            }
+            for event in events
+        ]
+        _write_jsonl(root / "audit" / "attempt_fixture" / f"step_{step:08d}.jsonl", events)
+
+    metric = json.loads((root / "metrics.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    metric["step"] = 2
+    metric["data"].update(
+        {
+            "branch_revision/separate_critique_model": 1.0,
+            "branch_revision/critique_warmup_active": 0.0,
+            "branch_revision/main_actor_updated": 1.0,
+            "branch_revision/critique_actor_updated": 1.0,
+            "branch_revision/main_actor_rows": float(main_batch["rows"]),
+            "branch_revision/critique_model_rows": float(critique_batch["rows"]),
+            "critique_actor/grad_norm": 1.0,
+            "critique_actor/pg_loss": 0.2,
+        }
+    )
+    _write_jsonl(root / "metrics.jsonl", [metric])
+    checkpoint_manifest = {
+        "global_step": 2,
+        "checkpoint_root": "/output/smoke_tests/branch_revision_grpo/fixture/checkpoints",
+        "latest_step": 2,
+        "actor_files": 25,
+        "critique_actor_files": 25,
+        "dataloader_bytes": 128,
+    }
+    completion = json.loads((root / "completed.json").read_text(encoding="utf-8"))
+    completion["checkpoint_manifest"] = checkpoint_manifest
+    _write_json(root / "completed.json", completion)
+    _write_json(root / "status.json", completion)
+    _write_json(root / "checkpoint_manifest.json", checkpoint_manifest)
+
+
 def test_verifier_accepts_complete_live_contract(tmp_path: Path) -> None:
     _fixture(tmp_path)
     result = verify(tmp_path)
     assert result["status"] == "verified"
+
+
+def test_verifier_proves_separate_critique_policy_warmup_and_post_warmup_batches(tmp_path: Path) -> None:
+    _separate_critique_policy_fixture(tmp_path)
+    result = verify(tmp_path)
+    assert result["status"] == "verified"
+    assert result["selected_global_step"] == 2
 
 
 def test_verifier_validates_prompt_logprob_admission_evidence(tmp_path: Path) -> None:
@@ -1319,5 +1477,5 @@ def test_extra_args_contains_no_async_or_critic_training() -> None:
     assert "learnability_windows_per_rollout" not in rendered
     assert "critique_max_response_length=2560" in rendered
     assert "min_continuation_tokens=128" in rendered
-    assert "prompt_logprob_max_inflight_tokens=8192" in rendered
+    assert "prompt_logprob_max_inflight_tokens=null" in rendered
     assert "gpu_memory_utilization=0.6" in rendered

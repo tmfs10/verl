@@ -198,6 +198,16 @@ algorithm:
     # Enable branch-analysis critiques and exact-prefix revised continuations.
     enable: false
 
+    # Train critique tokens with a separate policy initialized from actor_rollout_ref.model.path.
+    separate_critique_model: false
+
+    # For these first global steps, train critique rows but not original or revised-suffix rows.
+    critique_warmup_steps: 0
+
+    # Dedicated Ray resource pool for the separate critique policy and its rollout engine.
+    critique_model_nnodes: 1
+    critique_model_n_gpus_per_node: 8
+
     # Number of IID critiques sampled for every incorrect original rollout.
     num_critiques: 4
 

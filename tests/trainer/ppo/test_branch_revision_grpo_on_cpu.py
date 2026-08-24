@@ -977,6 +977,21 @@ def test_branch_revision_config_defaults_to_fifteen_stddevs() -> None:
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
+        ({"separate_critique_model": "true"}, "separate_critique_model must be boolean"),
+        ({"critique_warmup_steps": -1}, "critique_warmup_steps must be a non-negative integer"),
+        ({"critique_warmup_steps": True}, "critique_warmup_steps must be a non-negative integer"),
+        ({"critique_model_nnodes": 0}, "critique_model_nnodes must be a positive integer"),
+        ({"critique_model_n_gpus_per_node": False}, "critique_model_n_gpus_per_node must be a positive integer"),
+    ],
+)
+def test_branch_revision_config_rejects_invalid_critique_policy_settings(kwargs, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        BranchRevisionGRPOConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
         ({"learnability_threshold_mode": "rank"}, "must be stddev or percentile"),
         ({"max_seed_window_stddevs": -1.0}, "finite and nonnegative"),
         ({"max_seed_window_stddevs": float("nan")}, "finite and nonnegative"),
@@ -1838,6 +1853,88 @@ def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revis
     assert actor_batch.batch["advantages"][original_rows[0]].min().item() < 0
     assert actor_batch.batch["advantages"][original_rows[1]].max().item() > 0
     assert actor_batch.meta_info["use_global_loss_normalization"] is True
+
+
+@pytest.mark.parametrize(
+    ("separate", "global_step", "expected_actor_kinds", "expected_critique_kinds"),
+    [
+        (False, 1, ["critique", "critique"], []),
+        (False, 2, ["original", "critique", "continuation", "critique", "original"], []),
+        (True, 1, [], ["critique", "critique"]),
+        (True, 2, ["original", "continuation", "original"], ["critique", "critique"]),
+    ],
+)
+def test_critique_warmup_routes_only_requested_policy_rows(
+    separate, global_step, expected_actor_kinds, expected_critique_kinds
+) -> None:
+    controller = _controller()
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        num_critiques=2,
+        separate_critique_model=separate,
+        critique_warmup_steps=1,
+    )
+    controller.trainer.global_steps = global_step
+    valid = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    invalid = _critique("invalid", valid=False)
+    wrong = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord(
+            "p:0",
+            "recovery",
+            (valid, invalid),
+            tuple([*_ids("q"), *_ids("start dead and waste"), *_ids("<followup>")]),
+        ),
+        learnability={0: _learnability()},
+        continuation_rewards={0: 1.0},
+    )
+    correct = _Bundle(
+        source_row=1,
+        rollout_id="p:1",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("correct"),
+        solution_log_probs=[-0.1] * len(_ids("correct")),
+        original_reward=1.0,
+    )
+
+    actor_rows, critique_rows = controller._policy_rows([wrong, correct])
+
+    assert [row.kind for row in actor_rows] == expected_actor_kinds
+    assert [row.kind for row in critique_rows] == expected_critique_kinds
+
+
+def test_separate_critique_rollout_uses_its_own_checkpoint_lifecycle() -> None:
+    controller = _controller()
+    controller.feature = BranchRevisionGRPOConfig(enable=True, separate_critique_model=True)
+    events: list[str] = []
+    controller.trainer.critique_checkpoint_manager = SimpleNamespace(
+        update_weights=lambda step: events.append(f"critique_restore:{step}"),
+        sleep_replicas=lambda: events.append("critique_sleep"),
+    )
+    controller.trainer.critique_async_rollout_manager = SimpleNamespace(
+        start_profile=lambda: events.append("critique_profile_start"),
+        stop_profile=lambda: events.append("critique_profile_stop"),
+    )
+
+    controller._run_with_critique_rollout_lifecycle(
+        lambda: events.append("generate_critiques"),
+        profile_rollout=True,
+    )
+
+    assert events == [
+        "critique_restore:1",
+        "critique_profile_start",
+        "generate_critiques",
+        "critique_sleep",
+        "critique_profile_stop",
+    ]
 
 
 def test_positive_critique_reward_combines_compression_and_learnability_credit() -> None:

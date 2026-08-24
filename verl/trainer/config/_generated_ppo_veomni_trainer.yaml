@@ -659,6 +659,10 @@ algorithm:
   branch_revision_grpo:
     _target_: verl.trainer.config.BranchRevisionGRPOConfig
     enable: false
+    separate_critique_model: false
+    critique_warmup_steps: 0
+    critique_model_nnodes: 1
+    critique_model_n_gpus_per_node: 8
     num_critiques: 4
     enable_positive_compression: false
     num_positive_critiques: 4

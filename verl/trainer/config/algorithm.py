@@ -178,9 +178,13 @@ BRANCH_REVISION_CRITIQUE_PROMPT = BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT
 
 @dataclass
 class BranchRevisionGRPOConfig(BaseConfig):
-    """Synchronous actor-only GRPO over branch critiques and revised rollouts."""
+    """Synchronous policy-only GRPO over branch critiques and revised rollouts."""
 
     enable: bool = False
+    separate_critique_model: bool = False
+    critique_warmup_steps: int = 0
+    critique_model_nnodes: int = 1
+    critique_model_n_gpus_per_node: int = 8
     num_critiques: int = 4
     enable_positive_compression: bool = False
     num_positive_critiques: int = 4
@@ -200,6 +204,21 @@ class BranchRevisionGRPOConfig(BaseConfig):
     audit_output_dir: Optional[str] = None
 
     def __post_init__(self):
+        if not isinstance(self.separate_critique_model, bool):
+            raise ValueError("algorithm.branch_revision_grpo.separate_critique_model must be boolean")
+        if (
+            not isinstance(self.critique_warmup_steps, int)
+            or isinstance(self.critique_warmup_steps, bool)
+            or self.critique_warmup_steps < 0
+        ):
+            raise ValueError("algorithm.branch_revision_grpo.critique_warmup_steps must be a non-negative integer")
+        critique_resources = {
+            "critique_model_nnodes": self.critique_model_nnodes,
+            "critique_model_n_gpus_per_node": self.critique_model_n_gpus_per_node,
+        }
+        for name, value in critique_resources.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"algorithm.branch_revision_grpo.{name} must be a positive integer")
         positive_ints = {
             "num_critiques": self.num_critiques,
             "num_positive_critiques": self.num_positive_critiques,

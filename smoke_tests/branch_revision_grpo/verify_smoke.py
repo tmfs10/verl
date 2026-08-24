@@ -288,6 +288,21 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError("the current completed smoke invocation also has failure evidence")
     resolved_config = _read_json(root / "resolved_config.json")
     branch_config = resolved_config["algorithm"]["branch_revision_grpo"]
+    separate_critique_model = bool(branch_config.get("separate_critique_model", False))
+    critique_warmup_steps = int(branch_config.get("critique_warmup_steps", 0))
+    if separate_critique_model:
+        checkpoint_manifest = _read_json(root / "checkpoint_manifest.json")
+        expected_checkpoint_step = int(resolved_config["trainer"].get("total_training_steps", 0))
+        if (
+            checkpoint_manifest != completed.get("checkpoint_manifest")
+            or int(checkpoint_manifest.get("global_step", -1)) != expected_checkpoint_step
+            or int(checkpoint_manifest.get("latest_step", -1)) != expected_checkpoint_step
+            or int(checkpoint_manifest.get("actor_files", 0)) <= 0
+            or int(checkpoint_manifest.get("critique_actor_files", 0)) <= 0
+            or int(checkpoint_manifest.get("dataloader_bytes", 0)) <= 0
+            or not str(checkpoint_manifest.get("checkpoint_root", "")).endswith("/checkpoints")
+        ):
+            raise ValueError("separate critique-policy checkpoint manifest is incomplete or inconsistent")
     num_critiques = int(branch_config["num_critiques"])
     if not bool(branch_config["enable_positive_compression"]):
         raise ValueError("live smoke did not enable positive-rollout compression")
@@ -361,8 +376,28 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             or sum(event.get("event") == "step_complete" for event in step_events) != 1
         ):
             raise ValueError("selected audit step is incomplete")
-        _only(step_events, "iteration")
-        _only(step_events, "actor_batch")
+        iteration_event = _only(step_events, "iteration")
+        actor_batch_events = [event for event in step_events if event.get("event") == "actor_batch"]
+        warmup_active = filename_step <= critique_warmup_steps
+        expected_policies = (
+            ({"critique_actor"} if warmup_active else {"actor", "critique_actor"})
+            if separate_critique_model
+            else {"actor"}
+        )
+        actual_policies = [str(event.get("policy", "actor")) for event in actor_batch_events]
+        if len(actual_policies) != len(set(actual_policies)) or set(actual_policies) != expected_policies:
+            raise ValueError(
+                f"step {filename_step} policy batches mismatch: "
+                f"expected={sorted(expected_policies)!r} actual={sorted(actual_policies)!r}"
+            )
+        expected_main_update = not warmup_active or not separate_critique_model
+        if separate_critique_model and (
+            bool(iteration_event.get("separate_critique_model")) is not True
+            or bool(iteration_event.get("critique_warmup_active")) != warmup_active
+            or bool(iteration_event.get("main_actor_updated")) != expected_main_update
+            or bool(iteration_event.get("critique_actor_updated")) is not True
+        ):
+            raise ValueError(f"step {filename_step} does not satisfy the separate critique-policy warmup contract")
         pressure = _verify_prompt_logprob_admission_step(
             step_events,
             capacity=prompt_logprob_capacity,
@@ -377,14 +412,18 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     # Deeply validate the completed step with the heaviest prompt-logprob
     # workload. Every step's admission evidence was already validated above;
     # the selected step receives the more expensive end-to-end reconstruction.
+    deep_candidates = [item for item in audited_steps if int(item[1][0]["global_step"]) > critique_warmup_steps]
+    if not deep_candidates:
+        deep_candidates = audited_steps
     selected_audit_file, events, _ = max(
-        audited_steps,
+        deep_candidates,
         key=lambda item: item[2],
     )
     selected_step = int(events[0]["global_step"])
     event_counts = Counter(str(event.get("event")) for event in events)
     iteration = _only(events, "iteration")
-    actor_batch = _only(events, "actor_batch")
+    actor_batches = [event for event in events if event.get("event") == "actor_batch"]
+    actor_batch_by_policy = {str(event.get("policy", "actor")): event for event in actor_batches}
     if int(iteration["originals"]) != expected_originals:
         raise ValueError(f"expected {expected_originals} original rollouts, got {iteration['originals']!r}")
     original_rewards = [_require_binary(value, "original reward") for value in iteration["original_rewards"]]
@@ -895,36 +934,6 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     if continuation_keys != accepted_keys:
         raise ValueError("learnability-accepted critiques and rewarded continuation evidence must be one-to-one")
 
-    expected_actor_rows = expected_originals + expected_critiques + len(continuations)
-    expected_batch = {
-        "rows": expected_actor_rows,
-        "original": expected_originals,
-        "critiques": expected_critiques,
-        "continuations": len(continuations),
-        "policy_loss_mode": loss_mode,
-    }
-    for key, expected in expected_batch.items():
-        if actor_batch.get(key) != expected:
-            raise ValueError(f"actor batch {key} mismatch: {actor_batch.get(key)!r} != {expected!r}")
-    actor_rows = actor_batch.get("actor_rows")
-    padding = int(actor_batch["padding"])
-    trainer_config = resolved_config.get("trainer", {})
-    data_parallel_size = int(trainer_config.get("nnodes", 0)) * int(trainer_config.get("n_gpus_per_node", 0))
-    if data_parallel_size <= 0:
-        raise ValueError(f"invalid actor data-parallel size: {data_parallel_size}")
-    if not 0 <= padding < data_parallel_size or (expected_actor_rows + padding) % data_parallel_size:
-        raise ValueError(f"invalid data-parallel padding count: {padding}")
-    if not isinstance(actor_rows, list) or len(actor_rows) != expected_actor_rows + padding:
-        raise ValueError("actor-batch audit must retain every balanced row")
-    actor_kind_counts = Counter(str(row.get("kind")) for row in actor_rows)
-    if actor_kind_counts != Counter(
-        original=expected_originals,
-        critique=expected_critiques,
-        continuation=len(continuations),
-        padding=padding,
-    ):
-        raise ValueError(f"actor-row kind counts mismatch: {actor_kind_counts!r}")
-
     expected_sources: dict[str, dict[str, Any]] = {}
     for rollout_id, original in original_by_rollout.items():
         expected_sources[f"original:{rollout_id}"] = {
@@ -961,62 +970,120 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             "train_start": len(original["prompt_ids"]) + len(continuation["revised_prefix_ids"]),
             "behavior_log_probs": _float32_values(continuation["continuation_log_probs"]),
         }
-    if len(expected_sources) != expected_actor_rows:
+    if len(expected_sources) != expected_originals + expected_critiques + len(continuations):
         raise ValueError("source audit evidence does not map one-to-one onto non-padding actor rows")
 
-    seen_source_ids: set[str] = set()
-    balanced_indices: set[int] = set()
-    response_widths = {int(row["response_width"]) for row in actor_rows}
-    if len(response_widths) != 1:
-        raise ValueError("balanced actor rows disagree on response width")
-    response_width = response_widths.pop()
-    pad_token_id = int(actor_batch["pad_token_id"])
-    for row in actor_rows:
-        row_id = str(row.get("actor_row_id"))
-        balanced_indices.add(int(row.get("balanced_row_index", -1)))
-        if row_id.startswith("padding:"):
-            expected = {
-                "kind": "padding",
-                "group_id": row_id,
-                "reward": 0.0,
-                "full_ids": [pad_token_id],
-                "train_start": None,
-                "behavior_log_probs": [],
+    selected_warmup = selected_step <= critique_warmup_steps
+    if separate_critique_model:
+        expected_sources_by_policy = {
+            "critique_actor": {
+                row_id: value for row_id, value in expected_sources.items() if value["kind"] == "critique"
+            },
+        }
+        if not selected_warmup:
+            expected_sources_by_policy["actor"] = {
+                row_id: value for row_id, value in expected_sources.items() if value["kind"] != "critique"
             }
+    else:
+        expected_sources_by_policy = {
+            "actor": {
+                row_id: value
+                for row_id, value in expected_sources.items()
+                if not selected_warmup or value["kind"] == "critique"
+            }
+        }
+
+    actor_rows: list[dict[str, Any]] = []
+    expected_actor_rows = sum(len(rows) for rows in expected_sources_by_policy.values())
+    padding_rows = 0
+    for policy, expected_policy_sources in expected_sources_by_policy.items():
+        actor_batch = actor_batch_by_policy.get(policy)
+        if actor_batch is None:
+            raise ValueError(f"selected step omitted the {policy!r} policy batch")
+        expected_kind_counts = Counter(value["kind"] for value in expected_policy_sources.values())
+        expected_batch = {
+            "rows": len(expected_policy_sources),
+            "original": expected_kind_counts["original"],
+            "critiques": expected_kind_counts["critique"],
+            "continuations": expected_kind_counts["continuation"],
+            "policy_loss_mode": loss_mode,
+        }
+        for key, expected in expected_batch.items():
+            if actor_batch.get(key) != expected:
+                raise ValueError(f"{policy} batch {key} mismatch: {actor_batch.get(key)!r} != {expected!r}")
+        policy_rows = actor_batch.get("actor_rows")
+        padding = int(actor_batch["padding"])
+        padding_rows += padding
+        if policy == "critique_actor":
+            data_parallel_size = int(branch_config.get("critique_model_nnodes", 0)) * int(
+                branch_config.get("critique_model_n_gpus_per_node", 0)
+            )
         else:
-            expected = expected_sources.get(row_id)
-            if expected is None:
-                raise ValueError(f"balanced actor row {row_id!r} has no source evidence")
-            if row_id in seen_source_ids:
-                raise ValueError(f"balanced actor row {row_id!r} is duplicated")
-            seen_source_ids.add(row_id)
-        full_ids = [int(token) for token in expected["full_ids"]]
-        behavior = _float32_values(expected["behavior_log_probs"])
-        train_start = expected["train_start"]
-        if train_start is None:
-            train_stop = None
-            response_mask = [0] * response_width
-        else:
-            train_stop = int(train_start) + len(behavior)
-            if not 0 < int(train_start) < train_stop == len(full_ids) or len(full_ids) - 1 > response_width:
-                raise ValueError(f"source actor row {row_id!r} has an invalid train span")
-            response_mask = [0] * response_width
-            response_mask[int(train_start) - 1 : train_stop - 1] = [1] * len(behavior)
-        if (
-            str(row.get("kind")) != expected["kind"]
-            or str(row.get("group_id")) != expected["group_id"]
-            or not math.isclose(float(row.get("reward")), float(expected["reward"]), abs_tol=1e-6)
-            or int(row.get("sequence_length")) != len(full_ids)
-            or row.get("train_start") != train_start
-            or row.get("train_stop") != train_stop
-            or row.get("input_ids_sha256") != _canonical_sha256(full_ids, dtype="<i8")
-            or row.get("response_mask_sha256") != _canonical_sha256(response_mask, dtype="u1")
-            or row.get("old_log_probs_sha256") != _canonical_sha256(behavior, dtype="<f4")
-            or row.get("rollout_log_probs_sha256") != _canonical_sha256(behavior, dtype="<f4")
-        ):
-            raise ValueError(f"balanced actor row {row_id!r} does not match its source tensors")
-    if seen_source_ids != set(expected_sources) or balanced_indices != set(range(len(actor_rows))):
-        raise ValueError("balanced actor audit lost, duplicated, or misindexed source rows")
+            trainer_config = resolved_config.get("trainer", {})
+            data_parallel_size = int(trainer_config.get("nnodes", 0)) * int(trainer_config.get("n_gpus_per_node", 0))
+        if data_parallel_size <= 0:
+            raise ValueError(f"invalid {policy} data-parallel size: {data_parallel_size}")
+        if not 0 <= padding < data_parallel_size or (len(expected_policy_sources) + padding) % data_parallel_size:
+            raise ValueError(f"invalid {policy} data-parallel padding count: {padding}")
+        if not isinstance(policy_rows, list) or len(policy_rows) != len(expected_policy_sources) + padding:
+            raise ValueError(f"{policy} audit must retain every balanced row")
+        policy_kind_counts = Counter(str(row.get("kind")) for row in policy_rows)
+        if policy_kind_counts != Counter({**expected_kind_counts, "padding": padding}):
+            raise ValueError(f"{policy} row kind counts mismatch: {policy_kind_counts!r}")
+        response_widths = {int(row["response_width"]) for row in policy_rows}
+        if len(response_widths) != 1:
+            raise ValueError(f"balanced {policy} rows disagree on response width")
+        response_width = response_widths.pop()
+        pad_token_id = int(actor_batch["pad_token_id"])
+        seen_source_ids: set[str] = set()
+        balanced_indices: set[int] = set()
+        for row in policy_rows:
+            row_id = str(row.get("actor_row_id"))
+            balanced_indices.add(int(row.get("balanced_row_index", -1)))
+            if row_id.startswith("padding:"):
+                expected = {
+                    "kind": "padding",
+                    "group_id": row_id,
+                    "reward": 0.0,
+                    "full_ids": [pad_token_id],
+                    "train_start": None,
+                    "behavior_log_probs": [],
+                }
+            else:
+                expected = expected_policy_sources.get(row_id)
+                if expected is None:
+                    raise ValueError(f"balanced {policy} row {row_id!r} has no source evidence")
+                if row_id in seen_source_ids:
+                    raise ValueError(f"balanced {policy} row {row_id!r} is duplicated")
+                seen_source_ids.add(row_id)
+                actor_rows.append(row)
+            full_ids = [int(token) for token in expected["full_ids"]]
+            behavior = _float32_values(expected["behavior_log_probs"])
+            train_start = expected["train_start"]
+            if train_start is None:
+                train_stop = None
+                response_mask = [0] * response_width
+            else:
+                train_stop = int(train_start) + len(behavior)
+                if not 0 < int(train_start) < train_stop == len(full_ids) or len(full_ids) - 1 > response_width:
+                    raise ValueError(f"source {policy} row {row_id!r} has an invalid train span")
+                response_mask = [0] * response_width
+                response_mask[int(train_start) - 1 : train_stop - 1] = [1] * len(behavior)
+            if (
+                str(row.get("kind")) != expected["kind"]
+                or str(row.get("group_id")) != expected["group_id"]
+                or not math.isclose(float(row.get("reward")), float(expected["reward"]), abs_tol=1e-6)
+                or int(row.get("sequence_length")) != len(full_ids)
+                or row.get("train_start") != train_start
+                or row.get("train_stop") != train_stop
+                or row.get("input_ids_sha256") != _canonical_sha256(full_ids, dtype="<i8")
+                or row.get("response_mask_sha256") != _canonical_sha256(response_mask, dtype="u1")
+                or row.get("old_log_probs_sha256") != _canonical_sha256(behavior, dtype="<f4")
+                or row.get("rollout_log_probs_sha256") != _canonical_sha256(behavior, dtype="<f4")
+            ):
+                raise ValueError(f"balanced {policy} row {row_id!r} does not match its source tensors")
+        if seen_source_ids != set(expected_policy_sources) or balanced_indices != set(range(len(policy_rows))):
+            raise ValueError(f"balanced {policy} audit lost, duplicated, or misindexed source rows")
 
     original_actor_rows = [row for row in actor_rows if row["kind"] == "original"]
     critique_actor_rows = [row for row in actor_rows if row["kind"] == "critique"]
@@ -1093,6 +1160,19 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         "branch_revision/continuations": float(len(continuations)),
         "branch_revision/policy_loss_is_dppo_tv": float(loss_mode == "dppo_tv"),
     }
+    if separate_critique_model:
+        required_metrics.update(
+            {
+                "branch_revision/separate_critique_model": 1.0,
+                "branch_revision/critique_warmup_active": float(selected_warmup),
+                "branch_revision/main_actor_updated": float(not selected_warmup),
+                "branch_revision/critique_actor_updated": 1.0,
+                "branch_revision/main_actor_rows": float(
+                    0 if selected_warmup else expected_originals + len(continuations)
+                ),
+                "branch_revision/critique_model_rows": float(expected_critiques),
+            }
+        )
     for key, expected in required_metrics.items():
         actual = float(merged_metrics.get(key, float("nan")))
         if actual != expected:
@@ -1122,9 +1202,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError("optimizer-step grad_norm metrics contain no finite values")
     if require_algorithm_signal and not any(value > 0.0 for value in finite_grad_norms):
         raise ValueError("optimizer-step grad_norm metrics contain no finite positive learning signal")
-    pg_loss = float(merged_metrics.get("actor/pg_loss", float("nan")))
-    if not math.isfinite(pg_loss):
-        raise ValueError("optimizer-step actor/pg_loss metric is missing or non-finite")
+    pg_loss_keys = [key for key in merged_metrics if key.endswith("actor/pg_loss") or key == "actor/pg_loss"]
+    if not pg_loss_keys or not all(math.isfinite(float(merged_metrics[key])) for key in pg_loss_keys):
+        raise ValueError("optimizer-step policy pg_loss metrics are missing or non-finite")
     successful_revisions = sum(float(event["reward"]) for event in continuations)
     if require_algorithm_signal and successful_revisions <= 0.0:
         raise ValueError("smoke has no successful revised continuation")
@@ -1159,7 +1239,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         "learnability_threshold_mode": threshold_mode,
         "max_seed_window_stddevs": max_seed_window_stddevs,
         "actor_rows": expected_actor_rows,
-        "padding_rows": padding,
+        "padding_rows": padding_rows,
         "wall_seconds": float(completed["wall_seconds"]),
     }
 

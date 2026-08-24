@@ -488,14 +488,21 @@ class BranchRevisionGRPOController:
             meta_info={"global_steps": self.trainer.global_steps},
         )
 
-    def _run_with_rollout_lifecycle(self, callback, *, profile_rollout: bool):
+    def _run_with_manager_lifecycle(
+        self,
+        callback,
+        *,
+        checkpoint_manager,
+        rollout_manager,
+        profile_rollout: bool,
+    ):
         primary_error: BaseException | None = None
         profile_cleanup_required = False
         try:
-            self.trainer.checkpoint_manager.update_weights(self.trainer.global_steps)
+            checkpoint_manager.update_weights(self.trainer.global_steps)
             if profile_rollout:
                 profile_cleanup_required = True
-                self.trainer.async_rollout_manager.start_profile()
+                rollout_manager.start_profile()
             return callback()
         except BaseException as error:
             primary_error = error
@@ -503,12 +510,12 @@ class BranchRevisionGRPOController:
         finally:
             cleanup_errors: list[tuple[str, BaseException]] = []
             try:
-                self.trainer.checkpoint_manager.sleep_replicas()
+                checkpoint_manager.sleep_replicas()
             except BaseException as error:
                 cleanup_errors.append(("rollout sleep cleanup", error))
             if profile_cleanup_required:
                 try:
-                    self.trainer.async_rollout_manager.stop_profile()
+                    rollout_manager.stop_profile()
                 except BaseException as error:
                     cleanup_errors.append(("rollout profile cleanup", error))
             if cleanup_errors:
@@ -520,6 +527,28 @@ class BranchRevisionGRPOController:
                     for label, error in cleanup_errors[1:]:
                         _add_exception_note(first_error, f"{label} also failed: {error!r}")
                     raise first_error
+
+    def _run_with_rollout_lifecycle(self, callback, *, profile_rollout: bool):
+        return self._run_with_manager_lifecycle(
+            callback,
+            checkpoint_manager=self.trainer.checkpoint_manager,
+            rollout_manager=self.trainer.async_rollout_manager,
+            profile_rollout=profile_rollout,
+        )
+
+    def _run_with_critique_rollout_lifecycle(self, callback, *, profile_rollout: bool):
+        if not self.feature.separate_critique_model:
+            return self._run_with_rollout_lifecycle(callback, profile_rollout=profile_rollout)
+        required = ("critique_checkpoint_manager", "critique_async_rollout_manager")
+        missing = [name for name in required if not hasattr(self.trainer, name)]
+        if missing:
+            raise RuntimeError(f"separate critique policy rollout is not initialized: {missing}")
+        return self._run_with_manager_lifecycle(
+            callback,
+            checkpoint_manager=self.trainer.critique_checkpoint_manager,
+            rollout_manager=self.trainer.critique_async_rollout_manager,
+            profile_rollout=profile_rollout,
+        )
 
     @staticmethod
     def _coerce_critique(value: Any) -> BranchRevisionCritiqueGeneration:
@@ -1299,17 +1328,16 @@ class BranchRevisionGRPOController:
                 )
         return rows
 
-    def _make_actor_batch(self, bundles: list[_Bundle]) -> tuple[DataProto, int]:
-        rows = self._actor_rows(bundles)
+    def _make_policy_batch(self, rows: list[_ActorRow], *, worker_group) -> tuple[DataProto, int]:
         if not rows:
-            raise RuntimeError("branch-revision actor batch has no trainable rows")
+            raise RuntimeError("branch-revision policy batch has no trainable rows")
         max_sequence = max(len(row.full_ids) for row in rows)
         if max_sequence > int(self.config.actor_rollout_ref.rollout.max_model_len):
             raise ValueError("branch-revision packed actor sequence exceeds rollout.max_model_len")
         response_width = max_sequence - 1
         if response_width <= 0:
             raise ValueError("branch-revision actor sequence needs at least two context tokens")
-        dp_size = self.trainer._get_dp_size(self.trainer.actor_rollout_wg, "actor")
+        dp_size = self.trainer._get_dp_size(worker_group, "actor")
         padding_rows = (-len(rows)) % dp_size
         total_rows = len(rows) + padding_rows
         pad_id = self._pad_token_id()
@@ -1390,7 +1418,14 @@ class BranchRevisionGRPOController:
         )
         return actor_batch, padding_rows
 
-    def _audit_actor_batch(self, actor_batch: DataProto, *, padding_rows: int) -> None:
+    def _make_actor_batch(self, bundles: list[_Bundle]) -> tuple[DataProto, int]:
+        """Backwards-compatible packer for the shared-policy path and focused tests."""
+        return self._make_policy_batch(
+            self._actor_rows(bundles),
+            worker_group=self.trainer.actor_rollout_wg,
+        )
+
+    def _audit_actor_batch(self, actor_batch: DataProto, *, padding_rows: int, policy: str = "actor") -> None:
         kinds = actor_batch.non_tensor_batch["branch_revision_actor_kind"]
         group_ids = actor_batch.non_tensor_batch["uid"]
         audit_row_ids = actor_batch.non_tensor_batch["branch_revision_audit_row_id"]
@@ -1429,6 +1464,7 @@ class BranchRevisionGRPOController:
             )
         self._audit(
             "actor_batch",
+            policy=policy,
             rows=len(actor_batch) - padding_rows,
             original=int(np.sum(kinds == "original")),
             critiques=int(np.sum(kinds == "critique")),
@@ -1472,7 +1508,44 @@ class BranchRevisionGRPOController:
         source.batch["advantages"] = source_advantages
         source.batch["returns"] = source_returns
 
-    def _metrics(self, bundles: list[_Bundle], actor_batch: DataProto, padding_rows: int) -> dict[str, float]:
+    @staticmethod
+    def _set_zero_source_metric_advantages(source: DataProto) -> None:
+        source.batch["advantages"] = torch.zeros_like(source.batch["response_mask"], dtype=torch.float32)
+        source.batch["returns"] = torch.zeros_like(source.batch["response_mask"], dtype=torch.float32)
+
+    def _critique_warmup_active(self) -> bool:
+        return int(self.trainer.global_steps) <= self.feature.critique_warmup_steps
+
+    def _policy_rows(self, bundles: list[_Bundle]) -> tuple[list[_ActorRow], list[_ActorRow]]:
+        rows = self._actor_rows(bundles)
+        critique_rows = [row for row in rows if row.kind == "critique"]
+        if self.feature.separate_critique_model:
+            actor_rows = [] if self._critique_warmup_active() else [row for row in rows if row.kind != "critique"]
+            return actor_rows, critique_rows
+        if self._critique_warmup_active():
+            return critique_rows, []
+        return rows, []
+
+    @staticmethod
+    def _critique_policy_metrics(metrics: dict[str, Any]) -> dict[str, Any]:
+        renamed: dict[str, Any] = {}
+        for key, value in metrics.items():
+            if key.startswith("actor/"):
+                key = f"critique_actor/{key.removeprefix('actor/')}"
+            elif key == "perf/mfu/actor":
+                key = "perf/mfu/critique_actor"
+            renamed[key] = value
+        return renamed
+
+    def _metrics(
+        self,
+        bundles: list[_Bundle],
+        actor_batch: DataProto | None,
+        padding_rows: int,
+        *,
+        critique_batch: DataProto | None = None,
+        critique_padding_rows: int = 0,
+    ) -> dict[str, float]:
         originals = [bundle.original_reward for bundle in bundles]
         incorrect = [bundle for bundle in bundles if bundle.original_reward == 0.0]
         correct = [bundle for bundle in bundles if bundle.original_reward == 1.0]
@@ -1516,10 +1589,23 @@ class BranchRevisionGRPOController:
             for critique_index, critique in enumerate(bundle.record.critiques)
             if critique.valid and not bundle.learnability[critique_index].accepted
         ]
-        actor_kinds = actor_batch.non_tensor_batch["branch_revision_actor_kind"]
+        policy_batches = [batch for batch in (actor_batch, critique_batch) if batch is not None]
+        actor_kinds = (
+            np.concatenate([batch.non_tensor_batch["branch_revision_actor_kind"] for batch in policy_batches])
+            if policy_batches
+            else np.array([], dtype=object)
+        )
         global_minibatch = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * int(
             self.config.actor_rollout_ref.rollout.n
         )
+        total_padding_rows = padding_rows + critique_padding_rows
+        total_policy_rows = sum(len(batch) for batch in policy_batches)
+        optimizer_minibatches = sum(
+            math.ceil(len(batch) / global_minibatch) * int(self.config.actor_rollout_ref.actor.ppo_epochs)
+            for batch in policy_batches
+        )
+        actor_input_tokens = sum(int(batch.batch["attention_mask"].sum().item()) for batch in policy_batches)
+        actor_train_tokens = sum(int(batch.batch["response_mask"].sum().item()) for batch in policy_batches)
         metrics = {
             "branch_revision/original/pass_at_1": float(sum(originals) / len(originals)),
             "branch_revision/flip/success_per_all_critiques": (
@@ -1574,16 +1660,20 @@ class BranchRevisionGRPOController:
             ),
             "branch_revision/tokens/generated_continuations": float(sum(generated_continuation_tokens)),
             "branch_revision/tokens/learnability_rejected_continuations": float(sum(rejected_continuation_tokens)),
-            "branch_revision/actor_rows": float(len(actor_batch) - padding_rows),
-            "branch_revision/padding_rows": float(padding_rows),
-            "branch_revision/actor_optimizer_minibatches": float(
-                math.ceil(len(actor_batch) / global_minibatch) * int(self.config.actor_rollout_ref.actor.ppo_epochs)
-            ),
-            "branch_revision/tokens/actor_input": float(actor_batch.batch["attention_mask"].sum().item()),
-            "branch_revision/tokens/actor_train": float(actor_batch.batch["response_mask"].sum().item()),
+            "branch_revision/actor_rows": float(total_policy_rows - total_padding_rows),
+            "branch_revision/padding_rows": float(total_padding_rows),
+            "branch_revision/actor_optimizer_minibatches": float(optimizer_minibatches),
+            "branch_revision/tokens/actor_input": float(actor_input_tokens),
+            "branch_revision/tokens/actor_train": float(actor_train_tokens),
             "branch_revision/actor_original_rows": float(np.sum(actor_kinds == "original")),
             "branch_revision/actor_critique_rows": float(np.sum(actor_kinds == "critique")),
             "branch_revision/actor_continuation_rows": float(np.sum(actor_kinds == "continuation")),
+            "branch_revision/main_actor_rows": float(0.0 if actor_batch is None else len(actor_batch) - padding_rows),
+            "branch_revision/critique_model_rows": float(
+                0.0 if critique_batch is None else len(critique_batch) - critique_padding_rows
+            ),
+            "branch_revision/critique_warmup_active": float(self._critique_warmup_active()),
+            "branch_revision/separate_critique_model": float(self.feature.separate_critique_model),
             "branch_revision/policy_loss_is_dppo_tv": float(
                 str(self.config.actor_rollout_ref.actor.policy_loss.loss_mode) == "dppo_tv"
             ),
@@ -1607,9 +1697,14 @@ class BranchRevisionGRPOController:
         self._audit_originals(bundles)
         request = self._make_child_request(source, bundles)
         if request is not None:
+            critique_rollout_manager = (
+                self.trainer.critique_async_rollout_manager
+                if self.feature.separate_critique_model
+                else self.trainer.async_rollout_manager
+            )
 
-            def run_child_pipeline() -> None:
-                output = self.trainer.async_rollout_manager.generate_sequences(request)
+            def generate_critiques() -> None:
+                output = critique_rollout_manager.generate_sequences(request)
                 timing_raw.update(
                     {
                         f"branch_revision_critique/{key}": value
@@ -1618,6 +1713,7 @@ class BranchRevisionGRPOController:
                 )
                 self._attach_records(bundles, self._extract_records(output))
 
+            def generate_actor_followups() -> None:
                 score_request = self._make_score_request(source, bundles)
                 if score_request is None:
                     self._attach_scores(bundles, {})
@@ -1648,7 +1744,25 @@ class BranchRevisionGRPOController:
                     self._attach_continuations(bundles, self._extract_continuations(continuation_output))
 
             with marked_timer("branch_revision_children", timing_raw, color="red"):
-                self._run_with_rollout_lifecycle(run_child_pipeline, profile_rollout=profile_rollout)
+                if self.feature.separate_critique_model:
+                    self._run_with_critique_rollout_lifecycle(
+                        generate_critiques,
+                        profile_rollout=profile_rollout,
+                    )
+                    self._run_with_rollout_lifecycle(
+                        generate_actor_followups,
+                        profile_rollout=profile_rollout,
+                    )
+                else:
+
+                    def run_shared_child_pipeline() -> None:
+                        generate_critiques()
+                        generate_actor_followups()
+
+                    self._run_with_rollout_lifecycle(
+                        run_shared_child_pipeline,
+                        profile_rollout=profile_rollout,
+                    )
         else:
             self._attach_records(bundles, {})
             self._attach_scores(bundles, {})
@@ -1657,21 +1771,87 @@ class BranchRevisionGRPOController:
             self._attach_continuations(bundles, {})
         with marked_timer("branch_revision_rewards", timing_raw, color="yellow"):
             self._evaluate_continuations(source, bundles)
-        actor_batch, padding_rows = self._make_actor_batch(bundles)
-        self._set_source_metric_advantages(source, bundles, actor_batch)
-        if self.config.trainer.balance_batch:
-            self.trainer._balance_batch(
-                actor_batch,
-                metrics=metrics,
-                logging_prefix="branch_revision_actor_global_seqlen",
+
+        actor_rows, critique_rows = self._policy_rows(bundles)
+        actor_batch: DataProto | None = None
+        critique_batch: DataProto | None = None
+        padding_rows = 0
+        critique_padding_rows = 0
+        if actor_rows:
+            actor_batch, padding_rows = self._make_policy_batch(
+                actor_rows,
                 worker_group=self.trainer.actor_rollout_wg,
-                role="actor",
             )
-        self._audit_actor_batch(actor_batch, padding_rows=padding_rows)
-        with marked_timer("update_actor", timing_raw, color="red"):
-            actor_output = self.trainer._update_actor(actor_batch)
-        metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
-        metrics.update(self._metrics(bundles, actor_batch, padding_rows))
+        if critique_rows:
+            if not self.feature.separate_critique_model:
+                raise RuntimeError("shared critique rows must be routed through the main actor batch")
+            if not hasattr(self.trainer, "critique_actor_rollout_wg"):
+                raise RuntimeError("separate critique policy worker group is not initialized")
+            critique_batch, critique_padding_rows = self._make_policy_batch(
+                critique_rows,
+                worker_group=self.trainer.critique_actor_rollout_wg,
+            )
+
+        if actor_batch is not None and np.any(actor_batch.non_tensor_batch["branch_revision_actor_kind"] == "original"):
+            self._set_source_metric_advantages(source, bundles, actor_batch)
+        else:
+            self._set_zero_source_metric_advantages(source)
+
+        if self.config.trainer.balance_batch:
+            if actor_batch is not None:
+                self.trainer._balance_batch(
+                    actor_batch,
+                    metrics=metrics,
+                    logging_prefix="branch_revision_actor_global_seqlen",
+                    worker_group=self.trainer.actor_rollout_wg,
+                    role="actor",
+                )
+            if critique_batch is not None:
+                self.trainer._balance_batch(
+                    critique_batch,
+                    metrics=metrics,
+                    logging_prefix="branch_revision_critique_actor_global_seqlen",
+                    worker_group=self.trainer.critique_actor_rollout_wg,
+                    role="actor",
+                )
+        if actor_batch is not None:
+            self._audit_actor_batch(actor_batch, padding_rows=padding_rows, policy="actor")
+        if critique_batch is not None:
+            self._audit_actor_batch(
+                critique_batch,
+                padding_rows=critique_padding_rows,
+                policy="critique_actor",
+            )
+
+        critique_actor_updated = False
+        if critique_batch is not None:
+            with marked_timer("update_critique_actor", timing_raw, color="red"):
+                critique_output = self.trainer._update_actor(
+                    critique_batch,
+                    worker_group=self.trainer.critique_actor_rollout_wg,
+                )
+            critique_metrics = reduce_metrics(critique_output.meta_info["metrics"])
+            metrics.update(self._critique_policy_metrics(critique_metrics))
+            critique_actor_updated = True
+
+        actor_updated = False
+        if actor_batch is not None:
+            with marked_timer("update_actor", timing_raw, color="red"):
+                actor_output = self.trainer._update_actor(actor_batch)
+            metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+            actor_updated = True
+
+        metrics["branch_revision/main_actor_updated"] = float(actor_updated)
+        metrics["branch_revision/critique_actor_updated"] = float(critique_actor_updated)
+        metrics.update(
+            self._metrics(
+                bundles,
+                actor_batch,
+                padding_rows,
+                critique_batch=critique_batch,
+                critique_padding_rows=critique_padding_rows,
+            )
+        )
         self._audit(
             "iteration",
             originals=len(bundles),
@@ -1681,6 +1861,11 @@ class BranchRevisionGRPOController:
             learnability_logprob_statistic=self.feature.learnability_logprob_statistic,
             learnability_threshold_mode=self.feature.learnability_threshold_mode,
             max_seed_window_stddevs=self.feature.max_seed_window_stddevs,
+            separate_critique_model=self.feature.separate_critique_model,
+            critique_warmup_steps=self.feature.critique_warmup_steps,
+            critique_warmup_active=self._critique_warmup_active(),
+            main_actor_updated=actor_updated,
+            critique_actor_updated=critique_actor_updated,
             original_rewards=rewards,
             prompt_pass_at_1={
                 prompt_group_id: sum(group_rewards) / len(group_rewards)
@@ -1688,4 +1873,4 @@ class BranchRevisionGRPOController:
             },
         )
         self._audit("step_complete")
-        return True
+        return actor_updated

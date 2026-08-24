@@ -1265,6 +1265,19 @@ class RayPPOTrainer(OneLoggerInstrumented):
         else:
             raise NotImplementedError
 
+        critique_actor_resource_pool = None
+        if Role.CritiqueActorRollout in self.role_worker_mapping:
+            critique_actor_resource_pool = self.resource_pool_manager.get_resource_pool(Role.CritiqueActorRollout)
+            critique_actor_config = OmegaConf.create(
+                OmegaConf.to_container(self.config.actor_rollout_ref, resolve=True)
+            )
+            critique_actor_cls = RayClassWithInitArgs(
+                cls=self.role_worker_mapping[Role.CritiqueActorRollout],
+                config=critique_actor_config,
+                role=str(Role.ActorRollout),
+            )
+            self.resource_pool_to_cls[critique_actor_resource_pool][str(Role.CritiqueActorRollout)] = critique_actor_cls
+
         # create critic
         if self.use_critic:
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
@@ -1418,6 +1431,24 @@ class RayPPOTrainer(OneLoggerInstrumented):
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
 
+        if Role.CritiqueActorRollout in self.role_worker_mapping:
+            if critique_actor_resource_pool is None:
+                raise RuntimeError("separate critique policy resource pool was not initialized")
+            self.critique_actor_rollout_wg = all_wg[str(Role.CritiqueActorRollout)]
+            self.critique_actor_rollout_wg.init_model()
+            self.critique_async_rollout_manager = AgentLoopManager.create(
+                config=self.config,
+                worker_group=self.critique_actor_rollout_wg,
+                rollout_resource_pool=critique_actor_resource_pool,
+                reward_loop_worker_handles=None,
+            )
+            self.critique_checkpoint_manager = CheckpointEngineManager(
+                config=checkpoint_engine_config,
+                trainer=self.critique_actor_rollout_wg,
+                replicas=self.critique_async_rollout_manager.rollout_replicas,
+            )
+            self.critique_checkpoint_manager.sleep_replicas()
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
@@ -1451,6 +1482,24 @@ class RayPPOTrainer(OneLoggerInstrumented):
         self.actor_rollout_wg.save_checkpoint(
             actor_local_path, actor_remote_path, self.global_steps, max_ckpt_to_keep=max_actor_ckpt_to_keep
         )
+
+        if hasattr(self, "critique_actor_rollout_wg"):
+            critique_actor_local_path = os.path.join(local_global_step_folder, str(Role.CritiqueActorRollout))
+            critique_actor_remote_path = (
+                None
+                if self.config.trainer.default_hdfs_dir is None
+                else os.path.join(
+                    self.config.trainer.default_hdfs_dir,
+                    f"global_step_{self.global_steps}",
+                    str(Role.CritiqueActorRollout),
+                )
+            )
+            self.critique_actor_rollout_wg.save_checkpoint(
+                critique_actor_local_path,
+                critique_actor_remote_path,
+                self.global_steps,
+                max_ckpt_to_keep=max_actor_ckpt_to_keep,
+            )
 
         if self.use_critic:
             critic_local_path = os.path.join(local_global_step_folder, str(Role.Critic))
@@ -1561,11 +1610,21 @@ class RayPPOTrainer(OneLoggerInstrumented):
             )
 
         actor_path = os.path.join(global_step_folder, "actor")
+        critique_actor_path = os.path.join(global_step_folder, str(Role.CritiqueActorRollout))
         critic_path = os.path.join(global_step_folder, str(Role.Critic))
+        if hasattr(self, "critique_actor_rollout_wg") and not os.path.isdir(critique_actor_path):
+            raise FileNotFoundError(
+                f"separate critique policy resume requires its native checkpoint: {critique_actor_path}"
+            )
         # load actor
         self.actor_rollout_wg.load_checkpoint(
             actor_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
         )
+        if hasattr(self, "critique_actor_rollout_wg"):
+            self.critique_actor_rollout_wg.load_checkpoint(
+                critique_actor_path,
+                del_local_after_load=self.config.trainer.del_local_ckpt_after_load,
+            )
         # load critic
         if self.use_critic:
             self.critic_wg.load_checkpoint(
@@ -1588,6 +1647,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
         """Start profiling for all worker groups if profiling is enabled."""
         if do_profile:
             self.actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
+            if hasattr(self, "critique_actor_rollout_wg"):
+                self.critique_actor_rollout_wg.start_profile(role="e2e", profile_step=self.global_steps)
             if self.use_reference_policy:
                 self.ref_policy_wg.start_profile(profile_step=self.global_steps)
             if self.use_critic:
@@ -1597,6 +1658,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
         """Stop profiling for all worker groups if profiling is enabled."""
         if do_profile:
             self.actor_rollout_wg.stop_profile()
+            if hasattr(self, "critique_actor_rollout_wg"):
+                self.critique_actor_rollout_wg.stop_profile()
             if self.use_reference_policy:
                 self.ref_policy_wg.stop_profile()
             if self.use_critic:
@@ -1779,8 +1842,9 @@ class RayPPOTrainer(OneLoggerInstrumented):
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
-    def _update_actor(self, batch: DataProto) -> DataProto:
+    def _update_actor(self, batch: DataProto, *, worker_group=None) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
+        worker_group = self.actor_rollout_wg if worker_group is None else worker_group
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
         batch.meta_info["temperature"] = rollout_config.temperature
@@ -1805,14 +1869,14 @@ class RayPPOTrainer(OneLoggerInstrumented):
                 dataloader_kwargs={"shuffle": shuffle},
             )
 
-            actor_output = self.actor_rollout_wg.update_actor(batch_td)
+            actor_output = worker_group.update_actor(batch_td)
             actor_output = tu.get(actor_output, "metrics")
             actor_output = rename_dict(actor_output, "actor/")
             # modify key name
             actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
             actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
         else:
-            actor_output = self.actor_rollout_wg.update_actor(batch)
+            actor_output = worker_group.update_actor(batch)
 
         return actor_output
 

@@ -65,9 +65,13 @@ def _extra_args(
     max_model_len: int = 8192,
     critique_max_response_length: int = 2560,
     max_tokens_per_gpu: int = 8192,
-    prompt_logprob_max_inflight_tokens: int | None = 8192,
+    prompt_logprob_max_inflight_tokens: int | None = None,
     gpu_memory_utilization: float = 0.6,
     training_steps: int = 1,
+    separate_critique_model: bool = False,
+    critique_warmup_steps: int = 0,
+    critique_model_nnodes: int = 1,
+    critique_model_n_gpus_per_node: int = 8,
 ) -> str:
     if loss_mode not in {"dppo_tv", "vanilla"}:
         raise ValueError("loss_mode must be dppo_tv or vanilla")
@@ -79,12 +83,17 @@ def _extra_args(
         raise ValueError("max_seed_window_stddevs must be finite and nonnegative")
     if not math.isfinite(gpu_memory_utilization) or not 0.0 < gpu_memory_utilization < 1.0:
         raise ValueError("gpu_memory_utilization must be finite and inside (0, 1)")
+    actor_nodes = nodes - critique_model_nnodes if separate_critique_model else nodes
     overrides = [
         "~critic.append_solution_to_prompt",
         "algorithm.adv_estimator=grpo",
         "algorithm.use_kl_in_reward=false",
         "algorithm.intermediate_mc_value.enable=false",
         "algorithm.branch_revision_grpo.enable=true",
+        f"algorithm.branch_revision_grpo.separate_critique_model={str(separate_critique_model).lower()}",
+        f"algorithm.branch_revision_grpo.critique_warmup_steps={critique_warmup_steps}",
+        f"algorithm.branch_revision_grpo.critique_model_nnodes={critique_model_nnodes}",
+        f"algorithm.branch_revision_grpo.critique_model_n_gpus_per_node={critique_model_n_gpus_per_node}",
         f"algorithm.branch_revision_grpo.num_critiques={num_critiques}",
         "algorithm.branch_revision_grpo.enable_positive_compression=true",
         f"algorithm.branch_revision_grpo.num_positive_critiques={num_critiques}",
@@ -144,15 +153,16 @@ def _extra_args(
         "reward.reward_model.enable=false",
         "++reward.reward_model.launch_reward_fn_async=false",
         "trainer.use_legacy_worker_impl=enable",
+        f"trainer.nnodes={actor_nodes}",
         "trainer.critic_warmup=0",
         "trainer.logger=[file]",
         "trainer.project_name=branch_revision_grpo_smoke",
         f"trainer.experiment_name=branch_revision_{loss_mode}_{learnability_logprob_statistic}_{learnability_threshold_mode}",
-        f"trainer.default_local_dir={remote_evidence}/checkpoints",
+        f"trainer.default_local_dir={remote_evidence}/../checkpoints",
         f"trainer.total_training_steps={training_steps}",
         "trainer.total_epochs=1",
         "trainer.val_before_train=false",
-        "trainer.save_freq=-1",
+        f"trainer.save_freq={training_steps if separate_critique_model else -1}",
         "trainer.test_freq=-1",
         "trainer.log_val_generations=0",
         "trainer.rollout_data_dir=null",
@@ -178,6 +188,10 @@ def _extra_args(
         f"{'null' if prompt_logprob_max_inflight_tokens is None else prompt_logprob_max_inflight_tokens}",
         f"+branch_revision_smoke.gpu_memory_utilization={gpu_memory_utilization}",
         f"+branch_revision_smoke.training_steps={training_steps}",
+        f"+branch_revision_smoke.separate_critique_model={str(separate_critique_model).lower()}",
+        f"+branch_revision_smoke.critique_warmup_steps={critique_warmup_steps}",
+        f"+branch_revision_smoke.critique_model_nnodes={critique_model_nnodes}",
+        f"+branch_revision_smoke.critique_model_n_gpus_per_node={critique_model_n_gpus_per_node}",
     ]
     return " ".join(overrides)
 
@@ -206,10 +220,14 @@ def build_command(
     max_model_len: int = 8192,
     critique_max_response_length: int = 2560,
     max_tokens_per_gpu: int = 8192,
-    prompt_logprob_max_inflight_tokens: int | None = 8192,
+    prompt_logprob_max_inflight_tokens: int | None = None,
     gpu_memory_utilization: float = 0.6,
     training_steps: int = 1,
     partition: str | None = None,
+    separate_critique_model: bool = False,
+    critique_warmup_steps: int = 0,
+    critique_model_nnodes: int = 1,
+    critique_model_n_gpus_per_node: int = 8,
 ) -> tuple[list[str], str]:
     positive = {
         "n_prompts": n_prompts,
@@ -222,6 +240,8 @@ def build_command(
         "critique_max_response_length": critique_max_response_length,
         "max_tokens_per_gpu": max_tokens_per_gpu,
         "training_steps": training_steps,
+        "critique_model_nnodes": critique_model_nnodes,
+        "critique_model_n_gpus_per_node": critique_model_n_gpus_per_node,
     }
     for name, value in positive.items():
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -232,6 +252,18 @@ def build_command(
         or prompt_logprob_max_inflight_tokens <= 0
     ):
         raise ValueError("prompt_logprob_max_inflight_tokens must be null or a positive integer")
+    if not isinstance(separate_critique_model, bool):
+        raise ValueError("separate_critique_model must be boolean")
+    if (
+        not isinstance(critique_warmup_steps, int)
+        or isinstance(critique_warmup_steps, bool)
+        or critique_warmup_steps < 0
+    ):
+        raise ValueError("critique_warmup_steps must be a nonnegative integer")
+    if separate_critique_model and critique_model_nnodes >= nodes:
+        raise ValueError("separate critique policy requires at least one actor node and one critique node")
+    if separate_critique_model and training_steps <= critique_warmup_steps:
+        raise ValueError("separate critique-policy smoke must include at least one post-warmup training step")
     if n_samples < 2:
         raise ValueError("n_samples must be at least 2 for a GRPO acceptance group")
     if num_critiques < 2:
@@ -366,6 +398,10 @@ def build_command(
             prompt_logprob_max_inflight_tokens=prompt_logprob_max_inflight_tokens,
             gpu_memory_utilization=gpu_memory_utilization,
             training_steps=training_steps,
+            separate_critique_model=separate_critique_model,
+            critique_warmup_steps=critique_warmup_steps,
+            critique_model_nnodes=critique_model_nnodes,
+            critique_model_n_gpus_per_node=critique_model_n_gpus_per_node,
         ),
     ]
     if nodes <= 2:
@@ -412,14 +448,23 @@ def main() -> None:
     parser.add_argument("--critique-max-response-length", type=int, default=2560)
     parser.add_argument("--max-tokens-per-gpu", type=int, default=8192)
     admission_group = parser.add_mutually_exclusive_group()
-    admission_group.add_argument("--prompt-logprob-max-inflight-tokens", type=int, default=8192)
+    admission_group.add_argument(
+        "--prompt-logprob-max-inflight-tokens",
+        type=int,
+        default=None,
+        help="Optionally enable a per-server weighted prompt-logprob token cap; uncapped scoring is the default.",
+    )
     admission_group.add_argument(
         "--disable-prompt-logprob-admission",
         action="store_true",
-        help="Set prompt_logprob_max_inflight_tokens=null and issue score requests without weighted admission.",
+        help="Retained for command compatibility; uncapped prompt-logprob scoring is already the default.",
     )
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.6)
     parser.add_argument("--training-steps", type=int, default=1)
+    parser.add_argument("--separate-critique-model", action="store_true")
+    parser.add_argument("--critique-warmup-steps", type=int, default=0)
+    parser.add_argument("--critique-model-nnodes", type=int, default=1)
+    parser.add_argument("--critique-model-n-gpus-per-node", type=int, default=8)
     parser.add_argument("--partition", choices=("interactive",))
     args = parser.parse_args()
 
@@ -494,6 +539,10 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         training_steps=args.training_steps,
         partition=args.partition,
+        separate_critique_model=args.separate_critique_model,
+        critique_warmup_steps=args.critique_warmup_steps,
+        critique_model_nnodes=args.critique_model_nnodes,
+        critique_model_n_gpus_per_node=args.critique_model_n_gpus_per_node,
     )
     git = _git_provenance(repo_root)
     provenance = {
@@ -535,6 +584,10 @@ def main() -> None:
             gpu_memory_utilization=args.gpu_memory_utilization,
             training_steps=args.training_steps,
             partition=args.partition,
+            separate_critique_model=args.separate_critique_model,
+            critique_warmup_steps=args.critique_warmup_steps,
+            critique_model_nnodes=args.critique_model_nnodes,
+            critique_model_n_gpus_per_node=args.critique_model_n_gpus_per_node,
         )
         result = _run(dry_command, local_run_dir / "dry_run.log")
         if result.returncode:

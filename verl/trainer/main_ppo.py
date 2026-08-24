@@ -308,6 +308,23 @@ class TaskRunner:
         self.role_worker_mapping[Role.Critic] = ray.remote(CriticWorker)
         self.mapping[Role.Critic] = "global_pool"
 
+    def add_critique_actor_rollout_worker(self, config, actor_rollout_cls):
+        """Register the optional independent critique policy on a dedicated pool."""
+        from omegaconf import OmegaConf
+
+        from verl.trainer.ppo.ray_trainer import Role
+
+        if not bool(OmegaConf.select(config, "algorithm.branch_revision_grpo.enable", default=False)) or not bool(
+            OmegaConf.select(
+                config,
+                "algorithm.branch_revision_grpo.separate_critique_model",
+                default=False,
+            )
+        ):
+            return
+        self.role_worker_mapping[Role.CritiqueActorRollout] = ray.remote(actor_rollout_cls)
+        self.mapping[Role.CritiqueActorRollout] = "critique_pool"
+
     def init_resource_pool_mgr(self, config):
         """Initialize resource pool manager."""
 
@@ -315,6 +332,26 @@ class TaskRunner:
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
+
+        if bool(OmegaConf.select(config, "algorithm.branch_revision_grpo.enable", default=False)) and bool(
+            OmegaConf.select(
+                config,
+                "algorithm.branch_revision_grpo.separate_critique_model",
+                default=False,
+            )
+        ):
+            critique_pool = [int(config.algorithm.branch_revision_grpo.critique_model_n_gpus_per_node)] * int(
+                config.algorithm.branch_revision_grpo.critique_model_nnodes
+            )
+            resource_pool_spec["critique_pool"] = critique_pool
+            required_gpus = sum(sum(pool) for pool in resource_pool_spec.values())
+            available_gpus = int(ray.cluster_resources().get("GPU", 0))
+            if available_gpus < required_gpus:
+                raise RuntimeError(
+                    "separate critique policy requires disjoint actor and critique GPU pools: "
+                    f"required={required_gpus} available={available_gpus}. "
+                    "Allocate trainer.nnodes actor nodes plus critique_model_nnodes critique nodes."
+                )
 
         if config.reward.reward_model.enable_resource_pool:
             if config.reward.reward_model.n_gpus_per_node <= 0:
@@ -383,9 +420,7 @@ class TaskRunner:
         intermediate_mc_enabled = bool(
             OmegaConf.select(config, "algorithm.intermediate_mc_value.enable", default=False)
         )
-        branch_revision_enabled = bool(
-            OmegaConf.select(config, "algorithm.branch_revision_grpo.enable", default=False)
-        )
+        branch_revision_enabled = bool(OmegaConf.select(config, "algorithm.branch_revision_grpo.enable", default=False))
         if intermediate_mc_enabled:
             from verl.trainer.ppo.ray_trainer_intermediate_mc import validate_intermediate_mc_runtime_config
 
@@ -396,6 +431,7 @@ class TaskRunner:
             validate_branch_revision_runtime_config(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
+        self.add_critique_actor_rollout_worker(config, actor_rollout_cls)
         self.add_critic_worker(config)
 
         self.add_reward_model_resource_pool(config)

@@ -40,7 +40,6 @@ EXPECTED = {
     "algorithm.branch_revision_grpo.min_continuation_tokens": 128,
     "trainer.n_gpus_per_node": 8,
     "trainer.val_before_train": False,
-    "trainer.save_freq": -1,
     "trainer.test_freq": -1,
     "trainer.resume_mode": "disable",
 }
@@ -83,6 +82,10 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "prompt_logprob_max_inflight_tokens",
         "gpu_memory_utilization",
         "training_steps",
+        "separate_critique_model",
+        "critique_warmup_steps",
+        "critique_model_nnodes",
+        "critique_model_n_gpus_per_node",
     }
     if set(smoke_contract) != required_contract:
         raise ValueError(
@@ -103,7 +106,17 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         ],
         "algorithm.branch_revision_grpo.learnability_threshold_mode": smoke_contract["learnability_threshold_mode"],
         "algorithm.branch_revision_grpo.max_seed_window_stddevs": smoke_contract["max_seed_window_stddevs"],
-        "trainer.nnodes": smoke_contract["nodes"],
+        "trainer.nnodes": (
+            smoke_contract["nodes"] - smoke_contract["critique_model_nnodes"]
+            if smoke_contract["separate_critique_model"]
+            else smoke_contract["nodes"]
+        ),
+        "algorithm.branch_revision_grpo.separate_critique_model": smoke_contract["separate_critique_model"],
+        "algorithm.branch_revision_grpo.critique_warmup_steps": smoke_contract["critique_warmup_steps"],
+        "algorithm.branch_revision_grpo.critique_model_nnodes": smoke_contract["critique_model_nnodes"],
+        "algorithm.branch_revision_grpo.critique_model_n_gpus_per_node": smoke_contract[
+            "critique_model_n_gpus_per_node"
+        ],
         "data.max_prompt_length": smoke_contract["max_prompt_length"],
         "data.max_response_length": smoke_contract["max_response_length"],
         "actor_rollout_ref.rollout.max_model_len": smoke_contract["max_model_len"],
@@ -115,6 +128,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         ],
         "actor_rollout_ref.rollout.gpu_memory_utilization": smoke_contract["gpu_memory_utilization"],
         "trainer.total_training_steps": smoke_contract["training_steps"],
+        "trainer.save_freq": (smoke_contract["training_steps"] if smoke_contract["separate_critique_model"] else -1),
     }
     for name in (
         "n_prompts",
@@ -127,10 +141,28 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "critique_max_response_length",
         "max_tokens_per_gpu",
         "training_steps",
+        "critique_model_nnodes",
+        "critique_model_n_gpus_per_node",
     ):
         value = smoke_contract[name]
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"branch-revision smoke {name} must be a positive integer")
+    if not isinstance(smoke_contract["separate_critique_model"], bool):
+        raise ValueError("branch-revision smoke separate_critique_model must be boolean")
+    critique_warmup_steps = smoke_contract["critique_warmup_steps"]
+    if (
+        not isinstance(critique_warmup_steps, int)
+        or isinstance(critique_warmup_steps, bool)
+        or critique_warmup_steps < 0
+    ):
+        raise ValueError("branch-revision smoke critique_warmup_steps must be a nonnegative integer")
+    if smoke_contract["separate_critique_model"] and smoke_contract["critique_model_nnodes"] >= smoke_contract["nodes"]:
+        raise ValueError("branch-revision smoke needs at least one actor node and one critique node")
+    if (
+        smoke_contract["separate_critique_model"]
+        and smoke_contract["training_steps"] <= smoke_contract["critique_warmup_steps"]
+    ):
+        raise ValueError("branch-revision smoke must include a post-warmup training step")
     prompt_logprob_capacity = smoke_contract["prompt_logprob_max_inflight_tokens"]
     if prompt_logprob_capacity is not None and (
         isinstance(prompt_logprob_capacity, bool)
@@ -282,11 +314,42 @@ def main(config) -> None:
         if len(new_attempts) != 1:
             raise RuntimeError(f"smoke invocation must create exactly one audit attempt, got {new_attempts!r}")
         attempt_id = new_attempts[0].removeprefix("attempt_")
+        checkpoint_manifest = None
+        if bool(smoke_contract["separate_critique_model"]):
+            checkpoint_root = Path(str(config.trainer.default_local_dir)).resolve()
+            global_step = int(smoke_contract["training_steps"])
+            step_root = checkpoint_root / f"global_step_{global_step}"
+            required_paths = {
+                "actor": step_root / "actor",
+                "critique_actor": step_root / "critique_actor_rollout",
+                "dataloader": step_root / "data.pt",
+                "latest_step": checkpoint_root / "latest_checkpointed_iteration.txt",
+            }
+            missing = [name for name, path in required_paths.items() if not path.exists()]
+            if missing:
+                raise RuntimeError(f"separate critique-policy checkpoint is incomplete: {missing!r}")
+            latest_step = int(required_paths["latest_step"].read_text(encoding="utf-8").strip())
+            if latest_step != global_step:
+                raise RuntimeError(
+                    f"separate critique-policy checkpoint pointer mismatch: {latest_step} != {global_step}"
+                )
+            checkpoint_manifest = {
+                "global_step": global_step,
+                "checkpoint_root": str(checkpoint_root),
+                "latest_step": latest_step,
+                "actor_files": sum(path.is_file() for path in required_paths["actor"].rglob("*")),
+                "critique_actor_files": sum(path.is_file() for path in required_paths["critique_actor"].rglob("*")),
+                "dataloader_bytes": required_paths["dataloader"].stat().st_size,
+            }
+            if checkpoint_manifest["actor_files"] <= 0 or checkpoint_manifest["critique_actor_files"] <= 0:
+                raise RuntimeError("separate critique-policy checkpoint contains an empty policy directory")
+            _write_json(output_dir / "checkpoint_manifest.json", checkpoint_manifest)
         completion = {
             "status": "completed",
             "invocation_id": invocation_id,
             "audit_attempt_id": attempt_id,
             "wall_seconds": time.time() - started,
+            "checkpoint_manifest": checkpoint_manifest,
         }
         _write_json(
             output_dir / "completed.json",
