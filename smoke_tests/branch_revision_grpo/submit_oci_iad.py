@@ -277,6 +277,7 @@ def build_command(
         raise ValueError("critique_warmup_steps must be a nonnegative integer")
     if separate_critique_model and critique_model_nnodes >= nodes:
         raise ValueError("separate critique policy requires at least one actor node and one critique node")
+    actor_nodes = nodes - critique_model_nnodes if separate_critique_model else nodes
     if separate_critique_model and training_steps <= critique_warmup_steps:
         raise ValueError("separate critique-policy smoke must include at least one post-warmup training step")
     if n_samples < 2:
@@ -336,6 +337,8 @@ def build_command(
         "02:00:00",
         "--nodes",
         str(nodes),
+        "--trainer_nodes",
+        str(actor_nodes),
         "--gpus",
         "8",
         "--actor_model",

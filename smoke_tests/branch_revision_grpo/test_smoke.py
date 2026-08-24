@@ -263,6 +263,7 @@ def test_rendered_smoke_can_split_actor_and_critique_policy_across_two_nodes(tmp
     assert "algorithm.branch_revision_grpo.critique_model_nnodes=1" in rendered
     assert "algorithm.branch_revision_grpo.critique_model_n_gpus_per_node=8" in rendered
     assert "trainer.nnodes=1" in rendered
+    assert "--trainer_nodes 1" in rendered
     assert "trainer.save_freq=2" in rendered
     checkpoint_override = (
         "trainer.default_local_dir=/output/smoke_tests/branch_revision_grpo/separate-critique/evidence/../checkpoints"
