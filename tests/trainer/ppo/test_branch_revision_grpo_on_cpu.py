@@ -2017,6 +2017,9 @@ def test_recovery_critique_reward_applies_learnability_before_prompt_baseline() 
     )
     rows = controller._actor_rows([wrong, correct])
     assert [row.reward for row in rows if row.kind == "critique"] == pytest.approx([0.0, -0.5])
+    another_correct = replace(correct, rollout_id="p:2")
+    metrics = controller._metrics([wrong, correct, another_correct], None, 0)
+    assert metrics["branch_revision/self_critique_reward/mean"] == pytest.approx(-1.0 / 6.0)
 
 
 def test_positive_continuation_credit_uses_completed_editable_length(monkeypatch) -> None:

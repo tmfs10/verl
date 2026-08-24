@@ -1547,6 +1547,10 @@ class BranchRevisionGRPOController:
         critique_padding_rows: int = 0,
     ) -> dict[str, float]:
         originals = [bundle.original_reward for bundle in bundles]
+        prompt_rewards = self._prompt_rewards(bundles)
+        prompt_pass_at_1 = {
+            prompt_group_id: sum(rewards) / len(rewards) for prompt_group_id, rewards in prompt_rewards.items()
+        }
         incorrect = [bundle for bundle in bundles if bundle.original_reward == 0.0]
         correct = [bundle for bundle in bundles if bundle.original_reward == 1.0]
         selected = [bundle for bundle in bundles if bundle.record is not None]
@@ -1577,6 +1581,11 @@ class BranchRevisionGRPOController:
         ]
         compression_fractions = [value for bundle in correct for value in bundle.compression_fractions.values()]
         compression_credits = [value for bundle in correct for value in bundle.compression_credits.values()]
+        self_critique_rewards = [
+            bundle.continuation_rewards.get(critique_index, 0.0) - prompt_pass_at_1[bundle.prompt_group_id]
+            for bundle in selected
+            for critique_index, _critique in enumerate(bundle.record.critiques)
+        ]
         generated_continuation_tokens = [
             len(critique.continuation_ids)
             for bundle in selected
@@ -1608,6 +1617,9 @@ class BranchRevisionGRPOController:
         actor_train_tokens = sum(int(batch.batch["response_mask"].sum().item()) for batch in policy_batches)
         metrics = {
             "branch_revision/original/pass_at_1": float(sum(originals) / len(originals)),
+            "branch_revision/self_critique_reward/mean": (
+                float(sum(self_critique_rewards) / len(self_critique_rewards)) if self_critique_rewards else 0.0
+            ),
             "branch_revision/flip/success_per_all_critiques": (
                 float(successes / len(incorrect_critiques)) if incorrect_critiques else 0.0
             ),

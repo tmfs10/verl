@@ -1183,6 +1183,12 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     accepted_recovery_count = sum(rollout_objectives[key[0]] == "recovery" for key in accepted_keys)
     valid_recovery_count = sum(rollout_objectives[key[0]] == "recovery" for key in structurally_valid_keys)
     expected_rates = {
+        "branch_revision/self_critique_reward/mean": (
+            sum(float(critique["continuation_outcome"]) - float(critique["prompt_pass_at_1"]) for critique in critiques)
+            / len(critiques)
+            if critiques
+            else 0.0
+        ),
         "branch_revision/flip/success_per_valid_continuation": (
             successful_recovery_count / accepted_recovery_count if accepted_recovery_count else 0.0
         ),

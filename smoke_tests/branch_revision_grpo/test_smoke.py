@@ -621,6 +621,7 @@ def _fixture(
     valid_recovery_count = 0
     accepted_recovery_count = 0
     successful_recoveries = 0.0
+    self_critique_rewards: list[float] = []
     for original_index, original_reward in enumerate(original_rewards):
         rollout_id = f"p:{original_index}"
         original = originals[rollout_id]
@@ -634,6 +635,7 @@ def _fixture(
             )
             accepted = valid and critique_index == 0
             outcome = 1.0 if accepted else 0.0
+            self_critique_rewards.append(outcome - baseline)
             objective_credit = 0.4026955278742087 if accepted and objective == "compression" else outcome
             reward = outcome - baseline if objective == "recovery" else objective_credit
             critique_ids = [700 + original_index, 800 + critique_index]
@@ -854,6 +856,9 @@ def _fixture(
                     "branch_revision/valid_edits": float(structurally_valid_count),
                     "branch_revision/learnability_accepted_edits": float(continuation_count),
                     "branch_revision/continuations": float(continuation_count),
+                    "branch_revision/self_critique_reward/mean": (
+                        sum(self_critique_rewards) / len(self_critique_rewards) if self_critique_rewards else 0.0
+                    ),
                     "branch_revision/flip/success_per_valid_continuation": (
                         successful_recoveries / accepted_recovery_count if accepted_recovery_count else 0.0
                     ),
