@@ -50,7 +50,12 @@ from verl.workers.rollout.replica import (
     TokenOutput,
     extract_chosen_prompt_log_probs,
 )
-from verl.workers.rollout.utils import get_max_position_embeddings, qwen2_5_vl_dedup_image_tokens, run_uvicorn
+from verl.workers.rollout.utils import (
+    get_max_position_embeddings,
+    get_rollout_server_name_prefix,
+    qwen2_5_vl_dedup_image_tokens,
+    run_uvicorn,
+)
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
     VLLM_LORA_NAME,
@@ -1023,7 +1028,8 @@ class vLLMReplica(RolloutReplica):
                         ]
                     )
                     node_id = worker_node_ids[node_rank * gpus_per_replica_node]
-                    name = (
+                    name_prefix = get_rollout_server_name_prefix(self.config)
+                    name = name_prefix + (
                         f"vllm_server_{self.replica_rank}_{node_rank}"
                         if not self.is_reward_model
                         else f"vllm_server_reward_{self.replica_rank}_{node_rank}"

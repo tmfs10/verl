@@ -41,6 +41,7 @@ from verl.third_party.vllm import VLLM_SLEEP_LEVEL, get_version
 from verl.utils.device import get_device_id, is_support_ipc
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
+from verl.workers.rollout.utils import get_rollout_server_name_prefix
 from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
 from verl.workers.rollout.vllm_rollout.utils import get_device_uuid
 
@@ -107,9 +108,10 @@ class ServerAdapter(BaseRollout):
             )
 
     def _server_actor_name_candidates(self) -> list[str]:
+        name_prefix = get_rollout_server_name_prefix(self.config)
         base_names = [
-            f"vllm_server_{self.replica_rank}_{self.node_rank}",
-            f"vllm_server_reward_{self.replica_rank}_{self.node_rank}",
+            f"{name_prefix}vllm_server_{self.replica_rank}_{self.node_rank}",
+            f"{name_prefix}vllm_server_reward_{self.replica_rank}_{self.node_rank}",
         ]
         candidates: list[str] = []
         max_retry_suffix = 2
@@ -153,10 +155,7 @@ class ServerAdapter(BaseRollout):
                 except ValueError as exc:
                     lookup_errors.append(f"{actor_name}: {exc}")
             if self.server_handle is None:
-                raise ValueError(
-                    "Failed to attach vLLM server handle. Tried named actors: "
-                    + "; ".join(lookup_errors)
-                )
+                raise ValueError("Failed to attach vLLM server handle. Tried named actors: " + "; ".join(lookup_errors))
 
         future = self.server_handle.collective_rpc.remote(method, timeout=timeout, args=args, kwargs=kwargs)
         return future if non_block else await future

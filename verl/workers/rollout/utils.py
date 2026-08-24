@@ -13,12 +13,27 @@
 # limitations under the License.
 import asyncio
 import logging
+import re
 
 import numpy as np
 import uvicorn
 from fastapi import FastAPI
 
 logger = logging.getLogger(__file__)
+
+
+def get_rollout_server_name_prefix(config) -> str:
+    """Return the optional Ray actor-name prefix for one rollout policy."""
+
+    custom = getattr(config, "custom", None)
+    if not custom:
+        return ""
+    prefix = custom.get("server_name_prefix")
+    if prefix is None or prefix == "":
+        return ""
+    if not isinstance(prefix, str) or re.fullmatch(r"[A-Za-z0-9_-]+", prefix) is None:
+        raise ValueError("rollout.custom.server_name_prefix must contain only letters, digits, '_' or '-'")
+    return prefix if prefix.endswith("_") else f"{prefix}_"
 
 
 def get_max_position_embeddings(hf_config) -> int:

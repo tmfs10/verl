@@ -1268,9 +1268,15 @@ class RayPPOTrainer(OneLoggerInstrumented):
         critique_actor_resource_pool = None
         if Role.CritiqueActorRollout in self.role_worker_mapping:
             critique_actor_resource_pool = self.resource_pool_manager.get_resource_pool(Role.CritiqueActorRollout)
-            critique_actor_config = OmegaConf.create(
-                OmegaConf.to_container(self.config.actor_rollout_ref, resolve=True)
+            self.critique_manager_config = OmegaConf.create(OmegaConf.to_container(self.config, resolve=True))
+            critique_actor_config = self.critique_manager_config.actor_rollout_ref
+            critique_rollout_custom = (
+                OmegaConf.to_container(critique_actor_config.rollout.custom, resolve=True)
+                if critique_actor_config.rollout.custom is not None
+                else {}
             )
+            critique_rollout_custom["server_name_prefix"] = "critique_actor"
+            critique_actor_config.rollout.custom = critique_rollout_custom
             critique_actor_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.CritiqueActorRollout],
                 config=critique_actor_config,
@@ -1437,7 +1443,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
             self.critique_actor_rollout_wg = all_wg[str(Role.CritiqueActorRollout)]
             self.critique_actor_rollout_wg.init_model()
             self.critique_async_rollout_manager = AgentLoopManager.create(
-                config=self.config,
+                config=self.critique_manager_config,
                 worker_group=self.critique_actor_rollout_wg,
                 rollout_resource_pool=critique_actor_resource_pool,
                 reward_loop_worker_handles=None,

@@ -71,6 +71,7 @@ from verl.workers.rollout.replica import (
     TokenOutput,
     extract_chosen_prompt_log_probs,
 )
+from verl.workers.rollout.utils import get_rollout_server_name_prefix
 
 
 class _CharTokenizer:
@@ -102,6 +103,19 @@ class _CharTokenizer:
 
 
 TOKENIZER = _CharTokenizer()
+
+
+def test_rollout_server_name_prefix_is_empty_by_default_and_namespaces_critique_policy() -> None:
+    assert get_rollout_server_name_prefix(SimpleNamespace(custom=None)) == ""
+    assert (
+        get_rollout_server_name_prefix(SimpleNamespace(custom={"server_name_prefix": "critique_actor"}))
+        == "critique_actor_"
+    )
+
+
+def test_rollout_server_name_prefix_rejects_unsafe_ray_actor_names() -> None:
+    with pytest.raises(ValueError, match="server_name_prefix"):
+        get_rollout_server_name_prefix(SimpleNamespace(custom={"server_name_prefix": "critique actor"}))
 
 
 def _ids(text: str) -> list[int]:
