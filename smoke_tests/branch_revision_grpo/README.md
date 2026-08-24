@@ -127,7 +127,7 @@ RUN_DIR=/home/siddjain/data/intermediate_mc_value_model/verl/cw_dfw_external_pas
 
 COMMON_ARGS=(
   --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
-  --model-path /hf_models/Qwen3-4B
+  --model-path /hf_models/Qwen/Qwen3-4B
   --n-prompts 32 --n-samples 8 --num-critiques 2 --seed 43
   --nodes 2 --partition interactive --training-steps 2
   --max-prompt-length 2048 --max-response-length 8192
