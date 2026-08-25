@@ -58,6 +58,9 @@ class BranchRevisionCritiqueGeneration:
     continuation_log_probs: tuple[float, ...] = ()
     continuation_finish_reason: str | None = None
     continuation_max_tokens: int = 0
+    critique_prompt_ids: tuple[int, ...] = ()
+    reference_rollout_id: str | None = None
+    reference_solution_ids: tuple[int, ...] = ()
 
     @property
     def valid(self) -> bool:
@@ -413,38 +416,69 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         if len(solution_ids) != len(solution_log_probs):
             raise ValueError("parent solution tokens and behavior log probabilities must have equal lengths")
 
+        reference_rollout_ids = [str(value) for value in kwargs.get("branch_revision_reference_rollout_ids", ())]
+        raw_reference_solution_ids = list(kwargs.get("branch_revision_reference_solution_ids", ()))
+        if self.feature.recovery_reference_mode == "successful_original" and objective == "recovery":
+            if len(reference_rollout_ids) != num_critiques or len(raw_reference_solution_ids) != num_critiques:
+                raise ValueError("successful-original recovery requires one reference per critique")
+            reference_solution_ids = [
+                _as_int_list(value, f"successful reference[{index}]")
+                for index, value in enumerate(raw_reference_solution_ids)
+            ]
+            if any(reference_id == rollout_id for reference_id in reference_rollout_ids):
+                raise ValueError("an incorrect rollout cannot be its own successful reference")
+        else:
+            if reference_rollout_ids or raw_reference_solution_ids:
+                raise ValueError("reference-free branch revision unexpectedly received successful references")
+            reference_solution_ids = []
+
         editable_solution_ids = strip_terminal_eos(solution_ids, self.tokenizer)
         if not editable_solution_ids:
             raise ValueError("branch-revision solution is empty after removing its terminal EOS boundary")
         raw_prompt = kwargs.get("raw_prompt")
         if raw_prompt is None:
             raise ValueError("branch-revision child generation requires the original raw_prompt messages")
-        critique_instruction = (
-            self.feature.critique_prompt if objective == "recovery" else self.feature.positive_critique_prompt
-        )
-        critique_instruction_ids = encode_followup_user_turn(
-            critique_instruction,
-            self.tokenizer,
-            prior_messages=list(raw_prompt),
-            assistant_content=decode_exact(editable_solution_ids, self.tokenizer),
-            chat_template_kwargs=kwargs.get("chat_template_kwargs"),
-        )
-        critique_prompt = [*prompt_ids, *editable_solution_ids, *critique_instruction_ids]
         requested_cap = int(self.feature.critique_max_response_length or self.response_length)
-        critique_cap = min(requested_cap, self.max_model_len - len(critique_prompt))
-        if critique_cap <= 0:
-            raise ValueError(
-                "branch-revision critique has no context capacity: "
-                f"prompt={len(critique_prompt)} limit={self.max_model_len}"
+        critique_prompts: list[list[int]] = []
+        critique_caps: list[int] = []
+        for index in range(num_critiques):
+            if self.feature.recovery_reference_mode == "successful_original" and objective == "recovery":
+                editable_reference = strip_terminal_eos(reference_solution_ids[index], self.tokenizer)
+                if not editable_reference:
+                    raise ValueError(f"successful reference[{index}] is empty after removing terminal EOS")
+                reference_text = decode_exact(editable_reference, self.tokenizer)
+                critique_instruction = self.feature.successful_reference_critique_prompt.replace(
+                    "{successful_rollout}",
+                    reference_text,
+                )
+            else:
+                critique_instruction = (
+                    self.feature.critique_prompt if objective == "recovery" else self.feature.positive_critique_prompt
+                )
+            critique_instruction_ids = encode_followup_user_turn(
+                critique_instruction,
+                self.tokenizer,
+                prior_messages=list(raw_prompt),
+                assistant_content=decode_exact(editable_solution_ids, self.tokenizer),
+                chat_template_kwargs=kwargs.get("chat_template_kwargs"),
             )
+            critique_prompt = [*prompt_ids, *editable_solution_ids, *critique_instruction_ids]
+            critique_cap = min(requested_cap, self.max_model_len - len(critique_prompt))
+            if critique_cap <= 0:
+                raise ValueError(
+                    f"branch-revision critique[{index}] has no context capacity: "
+                    f"prompt={len(critique_prompt)} limit={self.max_model_len}"
+                )
+            critique_prompts.append(critique_prompt)
+            critique_caps.append(critique_cap)
 
         critique_tasks = [
             asyncio.create_task(
                 self._generate(
                     f"{rollout_id}:critique:{index}",
-                    critique_prompt,
+                    critique_prompts[index],
                     sampling_params,
-                    max_tokens=critique_cap,
+                    max_tokens=critique_caps[index],
                     kind=f"critique[{index}]",
                 )
             )
@@ -466,7 +500,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 num_preempted += int(raw_output.num_preempted or 0)
                 critique_ids, critique_log_probs = self._validated_output(
                     raw_output,
-                    cap=critique_cap,
+                    cap=critique_caps[index],
                     kind=f"critique[{index}]",
                 )
                 parsed = parse_branch_revision(
@@ -510,6 +544,9 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                     "new_continuation_ids": new_continuation_ids,
                     "revised_prefix_ids": revised_prefix_ids,
                     "continuation_max_tokens": continuation_max_tokens,
+                    "critique_prompt_ids": critique_prompts[index],
+                    "reference_rollout_id": reference_rollout_ids[index] if reference_rollout_ids else None,
+                    "reference_solution_ids": reference_solution_ids[index] if reference_solution_ids else [],
                 }
                 if parse_reason == "valid" and continuation_max_tokens < self.feature.min_continuation_tokens:
                     raise RuntimeError("valid branch revision unexpectedly lacks its minimum continuation capacity")
@@ -542,6 +579,9 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 continuation_log_probs=tuple(record.get("continuation_log_probs", ())),
                 continuation_finish_reason=record.get("continuation_finish_reason"),
                 continuation_max_tokens=int(record["continuation_max_tokens"]),
+                critique_prompt_ids=tuple(record["critique_prompt_ids"]),
+                reference_rollout_id=record["reference_rollout_id"],
+                reference_solution_ids=tuple(record["reference_solution_ids"]),
             )
             for record in complete_records
         )
@@ -549,7 +589,9 @@ class BranchRevisionAgentLoop(AgentLoopBase):
             rollout_id=rollout_id,
             objective=objective,
             critiques=critiques,
-            critique_prompt_ids=tuple(critique_prompt),
+            critique_prompt_ids=(
+                tuple(critique_prompts[0]) if all(prompt == critique_prompts[0] for prompt in critique_prompts) else ()
+            ),
         )
         extra_fields = {
             BRANCH_REVISION_CHILD_FIELD: record,

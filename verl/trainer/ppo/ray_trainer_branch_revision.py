@@ -60,7 +60,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import marked_timer
 
-_AUDIT_SCHEMA_VERSION = 5
+_AUDIT_SCHEMA_VERSION = 6
 
 
 def _add_exception_note(error: BaseException, note: str) -> None:
@@ -204,11 +204,21 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
             template_kwargs = raw_template_kwargs
         if template_kwargs is not None and not isinstance(template_kwargs, dict):
             raise ValueError("branch-revision training chat-template kwargs must be a mapping or null")
-        instructions = [("recovery", feature.critique_prompt)]
+        instructions = [
+            (
+                "recovery",
+                (
+                    feature.successful_reference_critique_prompt.replace("{successful_rollout}", "")
+                    if feature.recovery_reference_mode == "successful_original"
+                    else feature.critique_prompt
+                ),
+                int(config.data.max_response_length) if feature.recovery_reference_mode == "successful_original" else 0,
+            )
+        ]
         if feature.enable_positive_compression:
-            instructions.append(("compression", feature.positive_critique_prompt))
+            instructions.append(("compression", feature.positive_critique_prompt, 0))
         critique_cap = int(feature.critique_max_response_length or config.data.max_response_length)
-        for objective, instruction in instructions:
+        for objective, instruction, reference_cap in instructions:
             followup_tokens = len(
                 encode_followup_user_turn(
                     instruction,
@@ -219,6 +229,7 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
             components = {
                 "max_prompt": int(config.data.max_prompt_length),
                 "max_response": int(config.data.max_response_length),
+                "max_reference_response": reference_cap,
                 "followup": followup_tokens,
                 "critique_cap": critique_cap,
             }
@@ -251,6 +262,12 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
 
 
 @dataclass
+class _RecoveryReference:
+    rollout_id: str
+    solution_ids: list[int]
+
+
+@dataclass
 class _Bundle:
     source_row: int
     rollout_id: str
@@ -265,6 +282,7 @@ class _Bundle:
     continuation_rewards: dict[int, float] = field(default_factory=dict)
     compression_fractions: dict[int, float] = field(default_factory=dict)
     compression_credits: dict[int, float] = field(default_factory=dict)
+    recovery_references: dict[int, _RecoveryReference] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -454,13 +472,70 @@ class BranchRevisionGRPOController:
                 reward=bundle.original_reward,
             )
 
+    def _assign_recovery_references(self, bundles: list[_Bundle]) -> None:
+        if self.feature.recovery_reference_mode == "none":
+            return
+        successes_by_prompt: defaultdict[str, list[_Bundle]] = defaultdict(list)
+        for bundle in bundles:
+            if bundle.original_reward == 1.0:
+                successes_by_prompt[bundle.prompt_group_id].append(bundle)
+        for candidates in successes_by_prompt.values():
+            candidates.sort(key=lambda bundle: bundle.rollout_id)
+
+        for bundle in bundles:
+            if bundle.original_reward != 0.0:
+                continue
+            candidates = successes_by_prompt.get(bundle.prompt_group_id, [])
+            if not candidates:
+                self._audit(
+                    "recovery_reference_skip",
+                    rollout_id=bundle.rollout_id,
+                    prompt_group_id=bundle.prompt_group_id,
+                    reason="no_successful_original",
+                )
+                continue
+            candidate_ids = [candidate.rollout_id for candidate in candidates]
+            for critique_index in range(self.feature.num_critiques):
+                material = "\0".join(
+                    (
+                        str(self.feature.recovery_reference_selection_seed),
+                        str(self.trainer.global_steps),
+                        bundle.prompt_group_id,
+                        bundle.rollout_id,
+                        str(critique_index),
+                    )
+                ).encode("utf-8")
+                selection_digest = hashlib.sha256(material).digest()
+                selected_index = int.from_bytes(selection_digest[:8], "big") % len(candidates)
+                selected = candidates[selected_index]
+                reference = _RecoveryReference(
+                    rollout_id=selected.rollout_id,
+                    solution_ids=list(selected.solution_ids),
+                )
+                bundle.recovery_references[critique_index] = reference
+                self._audit(
+                    "recovery_reference",
+                    rollout_id=bundle.rollout_id,
+                    prompt_group_id=bundle.prompt_group_id,
+                    critique_index=critique_index,
+                    reference_rollout_id=reference.rollout_id,
+                    reference_solution_ids=reference.solution_ids,
+                    candidate_rollout_ids=candidate_ids,
+                    selection_seed=self.feature.recovery_reference_selection_seed,
+                    selection_digest_sha256=hashlib.sha256(material).hexdigest(),
+                )
+
+    def _bundle_needs_critiques(self, bundle: _Bundle) -> bool:
+        if bundle.original_reward == 1.0:
+            return self.feature.enable_positive_compression
+        if self.feature.recovery_reference_mode == "none":
+            return True
+        if bundle.recovery_references and len(bundle.recovery_references) != self.feature.num_critiques:
+            raise RuntimeError("successful-original recovery has an incomplete reference assignment")
+        return len(bundle.recovery_references) == self.feature.num_critiques
+
     def _make_child_request(self, source: DataProto, bundles: list[_Bundle]) -> DataProto | None:
-        selected = [
-            bundle
-            for bundle in bundles
-            if bundle.original_reward == 0.0
-            or (self.feature.enable_positive_compression and bundle.original_reward == 1.0)
-        ]
+        selected = [bundle for bundle in bundles if self._bundle_needs_critiques(bundle)]
         if not selected:
             return None
         rows = [bundle.source_row for bundle in selected]
@@ -480,6 +555,22 @@ class BranchRevisionGRPOController:
         )
         non_tensors["branch_revision_parent_solution_log_probs"] = self._object_array(
             [bundle.solution_log_probs for bundle in selected]
+        )
+        non_tensors["branch_revision_reference_rollout_ids"] = self._object_array(
+            [
+                [bundle.recovery_references[index].rollout_id for index in range(self.feature.num_critiques)]
+                if bundle.original_reward == 0.0 and bundle.recovery_references
+                else []
+                for bundle in selected
+            ]
+        )
+        non_tensors["branch_revision_reference_solution_ids"] = self._object_array(
+            [
+                [bundle.recovery_references[index].solution_ids for index in range(self.feature.num_critiques)]
+                if bundle.original_reward == 0.0 and bundle.recovery_references
+                else []
+                for bundle in selected
+            ]
         )
         objectives = ["recovery" if bundle.original_reward == 0.0 else "compression" for bundle in selected]
         non_tensors["branch_revision_parent_objective"] = np.array(objectives, dtype=object)
@@ -582,6 +673,11 @@ class BranchRevisionGRPOController:
             continuation_log_probs=tuple(float(item) for item in value.get("continuation_log_probs", ())),
             continuation_finish_reason=value.get("continuation_finish_reason"),
             continuation_max_tokens=int(value.get("continuation_max_tokens", 0)),
+            critique_prompt_ids=tuple(int(token) for token in value.get("critique_prompt_ids", ())),
+            reference_rollout_id=(
+                None if value.get("reference_rollout_id") is None else str(value["reference_rollout_id"])
+            ),
+            reference_solution_ids=tuple(int(token) for token in value.get("reference_solution_ids", ())),
         )
 
     @classmethod
@@ -624,12 +720,7 @@ class BranchRevisionGRPOController:
         return records
 
     def _attach_records(self, bundles: list[_Bundle], records: dict[str, BranchRevisionGenerationRecord]) -> None:
-        expected = {
-            bundle.rollout_id
-            for bundle in bundles
-            if bundle.original_reward == 0.0
-            or (self.feature.enable_positive_compression and bundle.original_reward == 1.0)
-        }
+        expected = {bundle.rollout_id for bundle in bundles if self._bundle_needs_critiques(bundle)}
         if set(records) != expected:
             raise RuntimeError("branch-revision child stage returned an unexpected rollout-id set")
         for bundle in bundles:
@@ -643,15 +734,31 @@ class BranchRevisionGRPOController:
                     )
                 editable_solution = strip_terminal_eos(bundle.solution_ids, self.tokenizer)
                 expected_prefix = [*bundle.prompt_ids, *editable_solution]
-                critique_prompt = list(bundle.record.critique_prompt_ids)
-                if (
-                    len(critique_prompt) <= len(expected_prefix)
-                    or critique_prompt[: len(expected_prefix)] != expected_prefix
-                ):
-                    raise RuntimeError(
-                        "branch-revision worker critique prompt does not preserve the exact "
-                        "original prompt/solution prefix"
-                    )
+                for critique_index, critique in enumerate(bundle.record.critiques):
+                    critique_prompt = list(critique.critique_prompt_ids or bundle.record.critique_prompt_ids)
+                    if (
+                        len(critique_prompt) <= len(expected_prefix)
+                        or critique_prompt[: len(expected_prefix)] != expected_prefix
+                    ):
+                        raise RuntimeError(
+                            "branch-revision worker critique prompt does not preserve the exact "
+                            "original prompt/solution prefix"
+                        )
+                    if (
+                        expected_objective == "recovery"
+                        and self.feature.recovery_reference_mode == "successful_original"
+                    ):
+                        expected_reference = bundle.recovery_references[critique_index]
+                        if (
+                            critique.reference_rollout_id != expected_reference.rollout_id
+                            or list(critique.reference_solution_ids) != expected_reference.solution_ids
+                            or not critique.critique_prompt_ids
+                        ):
+                            raise RuntimeError("worker critique changed its assigned successful-original reference")
+                    elif critique.reference_rollout_id is not None or critique.reference_solution_ids:
+                        raise RuntimeError(
+                            "reference-free critique unexpectedly retained successful-reference evidence"
+                        )
             elif bundle.rollout_id in records:
                 raise RuntimeError("unselected original solution unexpectedly received branch critiques")
 
@@ -1257,8 +1364,10 @@ class BranchRevisionGRPOController:
             )
             if bundle.record is None:
                 continue
-            critique_prompt = list(bundle.record.critique_prompt_ids)
             for critique_index, critique in enumerate(bundle.record.critiques):
+                critique_prompt = list(critique.critique_prompt_ids or bundle.record.critique_prompt_ids)
+                if not critique_prompt:
+                    raise RuntimeError("branch-revision critique omitted its exact behavior-policy prompt")
                 continuation_outcome = bundle.continuation_rewards.get(critique_index, 0.0)
                 baseline = prompt_pass_at_1[bundle.prompt_group_id]
                 learnability = bundle.learnability.get(critique_index)
@@ -1272,14 +1381,11 @@ class BranchRevisionGRPOController:
                     objective_credit = continuation_outcome
                     if self.feature.critique_advantage_mode == "pass_at_1":
                         invalid_penalty = self.feature.critique_invalid_penalty * float(structurally_invalid)
-                        learnability_rejection_penalty = (
-                            self.feature.critique_learnability_rejection_penalty * float(learnability_rejected)
+                        learnability_rejection_penalty = self.feature.critique_learnability_rejection_penalty * float(
+                            learnability_rejected
                         )
                         critique_reward = (
-                            continuation_outcome
-                            - baseline
-                            - invalid_penalty
-                            - learnability_rejection_penalty
+                            continuation_outcome - baseline - invalid_penalty - learnability_rejection_penalty
                         )
                     else:
                         critique_reward = objective_credit * learnability_weight - baseline
@@ -1363,6 +1469,8 @@ class BranchRevisionGRPOController:
                     critique_ids=list(critique.token_ids),
                     critique_log_probs=_float32_list(critique.log_probs),
                     critique_prompt_ids=critique_prompt,
+                    reference_rollout_id=critique.reference_rollout_id,
+                    reference_solution_ids=list(critique.reference_solution_ids),
                     finish_reason=critique.finish_reason,
                 )
         if self.feature.critique_advantage_mode == "pass_at_1":
@@ -1392,8 +1500,13 @@ class BranchRevisionGRPOController:
             row = rows[index]
             if row.prompt_group_id not in prompt_pass_at_1:
                 raise RuntimeError("external critique advantage lost its prompt pass@1 baseline")
-            headroom = max(0.0, 1.0 - prompt_pass_at_1[row.prompt_group_id])
-            weight = headroom**self.feature.critique_prompt_headroom_exponent / prompt_counts[row.prompt_group_id]
+            if self.feature.critique_prompt_weighting == "equal_prompt":
+                weight = 1.0 / prompt_counts[row.prompt_group_id]
+            elif self.feature.critique_prompt_weighting == "headroom":
+                headroom = max(0.0, 1.0 - prompt_pass_at_1[row.prompt_group_id])
+                weight = headroom**self.feature.critique_prompt_headroom_exponent / prompt_counts[row.prompt_group_id]
+            else:
+                raise RuntimeError("unknown critique prompt weighting mode")
             unnormalized_weights.append(weight)
         weight_mean = float(np.mean(np.asarray(unnormalized_weights, dtype=np.float64)))
         if not math.isfinite(weight_mean) or weight_mean <= 0.0:
@@ -1415,6 +1528,7 @@ class BranchRevisionGRPOController:
                 actor_row_id=row.audit_row_id,
                 prompt_group_id=row.prompt_group_id,
                 mode=self.feature.critique_advantage_mode,
+                prompt_weighting=self.feature.critique_prompt_weighting,
                 raw_advantage=float(raw[position]),
                 rms_scale=scale,
                 scaled_advantage=float(scaled[position]),
@@ -1597,9 +1711,7 @@ class BranchRevisionGRPOController:
                     "rollout_log_probs_sha256": _canonical_sha256(
                         rollout_log_probs.detach().cpu().tolist(), dtype="<f4"
                     ),
-                    "advantages_sha256": _canonical_sha256(
-                        row_advantages.detach().cpu().tolist(), dtype="<f4"
-                    ),
+                    "advantages_sha256": _canonical_sha256(row_advantages.detach().cpu().tolist(), dtype="<f4"),
                 }
             )
         self._audit(
@@ -1617,6 +1729,7 @@ class BranchRevisionGRPOController:
             clip_ratio_high=self.config.actor_rollout_ref.actor.clip_ratio_high,
             clip_ratio_c=float(self.config.actor_rollout_ref.actor.clip_ratio_c),
             critique_advantage_mode=self.feature.critique_advantage_mode,
+            critique_prompt_weighting=self.feature.critique_prompt_weighting,
             actor_rows=actor_rows,
         )
 
@@ -1696,7 +1809,9 @@ class BranchRevisionGRPOController:
         correct = [bundle for bundle in bundles if bundle.original_reward == 1.0]
         selected = [bundle for bundle in bundles if bundle.record is not None]
         critiques = [critique for bundle in selected for critique in bundle.record.critiques]
-        incorrect_critiques = [critique for bundle in incorrect for critique in bundle.record.critiques]
+        incorrect_critiques = [
+            critique for bundle in incorrect if bundle.record is not None for critique in bundle.record.critiques
+        ]
         correct_critiques = [critique for bundle in correct if bundle.record for critique in bundle.record.critiques]
         valid_count = sum(critique.valid for critique in critiques)
         accepted_count = sum(score.accepted for bundle in selected for score in bundle.learnability.values())
@@ -1714,6 +1829,15 @@ class BranchRevisionGRPOController:
         }
         all_prompts = {bundle.prompt_group_id for bundle in bundles}
         parse_counts = Counter(critique.parse_reason for critique in critiques)
+        referenced_incorrect = [bundle for bundle in incorrect if bundle.recovery_references]
+        skipped_incorrect = [
+            bundle
+            for bundle in incorrect
+            if self.feature.recovery_reference_mode == "successful_original" and not bundle.recovery_references
+        ]
+        reference_ids = [
+            reference.rollout_id for bundle in referenced_incorrect for reference in bundle.recovery_references.values()
+        ]
         learnability_scores = [score for bundle in selected for score in bundle.learnability.values()]
         finite_stddev_distances = [
             score.stddevs_below_mean
@@ -1880,6 +2004,13 @@ class BranchRevisionGRPOController:
             ),
             "branch_revision/critique_warmup_active": float(self._critique_warmup_active()),
             "branch_revision/separate_critique_model": float(self.feature.separate_critique_model),
+            "branch_revision/recovery_reference_mode_is_successful_original": float(
+                self.feature.recovery_reference_mode == "successful_original"
+            ),
+            "branch_revision/recovery_reference/eligible_incorrect": float(len(referenced_incorrect)),
+            "branch_revision/recovery_reference/skipped_incorrect": float(len(skipped_incorrect)),
+            "branch_revision/recovery_reference/assignments": float(len(reference_ids)),
+            "branch_revision/recovery_reference/distinct_successful_originals": float(len(set(reference_ids))),
             "branch_revision/critique_grpo_grouping_is_batch": float(self.feature.critique_grpo_grouping == "batch"),
             "branch_revision/critique_advantage_mode_is_pass_at_1": float(
                 self.feature.critique_advantage_mode == "pass_at_1"
@@ -1947,6 +2078,7 @@ class BranchRevisionGRPOController:
         rewards = self._original_rewards(reward_tensor)
         bundles = self._build_bundles(source, rewards)
         self._audit_originals(bundles)
+        self._assign_recovery_references(bundles)
         request = self._make_child_request(source, bundles)
         if request is not None:
             critique_rollout_manager = (
@@ -2112,11 +2244,14 @@ class BranchRevisionGRPOController:
             positive_compression_enabled=self.feature.enable_positive_compression,
             critique_grpo_grouping=self.feature.critique_grpo_grouping,
             critique_advantage_mode=self.feature.critique_advantage_mode,
+            critique_prompt_weighting=self.feature.critique_prompt_weighting,
             critique_invalid_penalty=self.feature.critique_invalid_penalty,
             critique_learnability_rejection_penalty=self.feature.critique_learnability_rejection_penalty,
             critique_advantage_rms_floor=self.feature.critique_advantage_rms_floor,
             critique_advantage_clip=self.feature.critique_advantage_clip,
             critique_prompt_headroom_exponent=self.feature.critique_prompt_headroom_exponent,
+            recovery_reference_mode=self.feature.recovery_reference_mode,
+            recovery_reference_selection_seed=self.feature.recovery_reference_selection_seed,
             learnability_logprob_statistic=self.feature.learnability_logprob_statistic,
             learnability_threshold_mode=self.feature.learnability_threshold_mode,
             max_seed_window_stddevs=self.feature.max_seed_window_stddevs,

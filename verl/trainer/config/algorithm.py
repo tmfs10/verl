@@ -24,6 +24,7 @@ __all__ = [
     "BRANCH_REVISION_CRITIQUE_PROMPT",
     "BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT",
     "BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT",
+    "BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT",
     "BranchRevisionGRPOConfig",
     "FilterGroupsConfig",
     "INTERMEDIATE_MC_CRITIQUE_PROMPT",
@@ -103,6 +104,66 @@ After the free-form analysis, end with exactly one <prefix> tag pair followed
 by exactly one <prefix + new continuation> tag pair. Do not use either tag
 anywhere else. Permit only whitespace between the two tag pairs, and write
 nothing after the closing </prefix + new continuation> tag."""
+
+
+_SUCCESSFUL_REFERENCE_INSERT_AFTER = """\
+The attempted solution above is incorrect. Analyze it with the goal of improving
+its chance of solving the task within the remaining token budget."""
+
+_SUCCESSFUL_REFERENCE_INSERT = """\
+
+
+A different original rollout sampled independently for the same task was
+successful. Use it as privileged evidence for comparing the two trajectories
+and diagnosing the attempted solution:
+
+<successful_rollout>
+{successful_rollout}
+</successful_rollout>
+
+The successful rollout is a diagnostic reference only. The text inside
+<prefix>, including the copy at the beginning of
+<prefix + new continuation>, must come from the incorrect attempted solution,
+never from the successful rollout."""
+
+_UNCONDITIONED_COUNTERFACTUAL_PARAGRAPH = """\
+Consider the trajectory counterfactually with everything after the prefix
+hidden. If work performed after the prefix materially changed what was known,
+narrowed the available possibilities, or made the idea substantially more
+plausible, do not place that idea directly in the new continuation. Instead,
+propose the next local step needed to make that progress. We do not want to
+short-circuit useful exploration with hindsight."""
+
+_SUCCESSFUL_REFERENCE_COUNTERFACTUAL_PARAGRAPH = """\
+Consider the proposed continuation counterfactually with everything after the
+prefix in the attempted solution and the entire successful rollout hidden. The
+successful rollout may help you diagnose what went wrong, but its contents were
+not available at the branch point and do not by themselves justify copying an
+idea into the new continuation. If the proposed direction is supported only by
+the hidden suffix or by developments shown in the successful rollout, do not
+place that idea directly in the new continuation. Instead, propose the next
+local step justified by the task and the attempted solution through the end of
+the prefix."""
+
+
+def _build_successful_reference_critique_prompt() -> str:
+    if BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT.count(_SUCCESSFUL_REFERENCE_INSERT_AFTER) != 1:
+        raise RuntimeError("incorrect critique prompt lost its successful-reference insertion boundary")
+    if BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT.count(_UNCONDITIONED_COUNTERFACTUAL_PARAGRAPH) != 1:
+        raise RuntimeError("incorrect critique prompt lost its counterfactual paragraph boundary")
+    prompt = BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT.replace(
+        _SUCCESSFUL_REFERENCE_INSERT_AFTER,
+        _SUCCESSFUL_REFERENCE_INSERT_AFTER + _SUCCESSFUL_REFERENCE_INSERT,
+        1,
+    )
+    return prompt.replace(
+        _UNCONDITIONED_COUNTERFACTUAL_PARAGRAPH,
+        _SUCCESSFUL_REFERENCE_COUNTERFACTUAL_PARAGRAPH,
+        1,
+    )
+
+
+BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT = _build_successful_reference_critique_prompt()
 
 
 BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT = """\
@@ -187,11 +248,14 @@ class BranchRevisionGRPOConfig(BaseConfig):
     critique_model_n_gpus_per_node: int = 8
     critique_grpo_grouping: str = "per_original"
     critique_advantage_mode: str = "grpo"
+    critique_prompt_weighting: str = "equal_prompt"
     critique_invalid_penalty: float = 0.20
     critique_learnability_rejection_penalty: float = 0.05
     critique_advantage_rms_floor: float = 0.10
     critique_advantage_clip: float = 5.0
     critique_prompt_headroom_exponent: float = 1.0
+    recovery_reference_mode: str = "none"
+    recovery_reference_selection_seed: int = 0
     num_critiques: int = 4
     enable_positive_compression: bool = False
     num_positive_critiques: int = 4
@@ -207,6 +271,7 @@ class BranchRevisionGRPOConfig(BaseConfig):
     min_continuation_tokens: int = 128
     reward_tolerance: float = 1e-6
     critique_prompt: str = BRANCH_REVISION_CRITIQUE_PROMPT
+    successful_reference_critique_prompt: str = BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
     positive_critique_prompt: str = BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT
     audit_output_dir: Optional[str] = None
 
@@ -230,6 +295,27 @@ class BranchRevisionGRPOConfig(BaseConfig):
             raise ValueError("algorithm.branch_revision_grpo.critique_grpo_grouping must be per_original or batch")
         if self.critique_advantage_mode not in {"grpo", "pass_at_1"}:
             raise ValueError("algorithm.branch_revision_grpo.critique_advantage_mode must be grpo or pass_at_1")
+        if self.critique_prompt_weighting not in {"equal_prompt", "headroom"}:
+            raise ValueError(
+                "algorithm.branch_revision_grpo.critique_prompt_weighting must be equal_prompt or headroom"
+            )
+        if self.recovery_reference_mode not in {"none", "successful_original"}:
+            raise ValueError(
+                "algorithm.branch_revision_grpo.recovery_reference_mode must be none or successful_original"
+            )
+        if (
+            not isinstance(self.recovery_reference_selection_seed, int)
+            or isinstance(self.recovery_reference_selection_seed, bool)
+            or self.recovery_reference_selection_seed < 0
+        ):
+            raise ValueError(
+                "algorithm.branch_revision_grpo.recovery_reference_selection_seed must be a non-negative integer"
+            )
+        if self.successful_reference_critique_prompt.count("{successful_rollout}") != 1:
+            raise ValueError(
+                "algorithm.branch_revision_grpo.successful_reference_critique_prompt must contain exactly one "
+                "{successful_rollout} placeholder"
+            )
         nonnegative_floats = {
             "critique_invalid_penalty": self.critique_invalid_penalty,
             "critique_learnability_rejection_penalty": self.critique_learnability_rejection_penalty,

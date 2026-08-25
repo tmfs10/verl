@@ -101,6 +101,9 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "num_critiques",
         "critique_grpo_grouping",
         "critique_advantage_mode",
+        "critique_prompt_weighting",
+        "recovery_reference_mode",
+        "recovery_reference_selection_seed",
         "enable_positive_compression",
         "loss_mode",
         "learnability_logprob_statistic",
@@ -136,6 +139,11 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "algorithm.branch_revision_grpo.num_positive_critiques": smoke_contract["num_critiques"],
         "algorithm.branch_revision_grpo.critique_grpo_grouping": smoke_contract["critique_grpo_grouping"],
         "algorithm.branch_revision_grpo.critique_advantage_mode": smoke_contract["critique_advantage_mode"],
+        "algorithm.branch_revision_grpo.critique_prompt_weighting": smoke_contract["critique_prompt_weighting"],
+        "algorithm.branch_revision_grpo.recovery_reference_mode": smoke_contract["recovery_reference_mode"],
+        "algorithm.branch_revision_grpo.recovery_reference_selection_seed": smoke_contract[
+            "recovery_reference_selection_seed"
+        ],
         "algorithm.branch_revision_grpo.enable_positive_compression": smoke_contract["enable_positive_compression"],
         "actor_rollout_ref.model.path": smoke_contract["model_path"],
         "critic.model.path": smoke_contract["model_path"],
@@ -215,6 +223,13 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("branch-revision smoke critique_grpo_grouping must be per_original or batch")
     if smoke_contract["critique_advantage_mode"] not in {"grpo", "pass_at_1"}:
         raise ValueError("branch-revision smoke critique_advantage_mode must be grpo or pass_at_1")
+    if smoke_contract["critique_prompt_weighting"] not in {"equal_prompt", "headroom"}:
+        raise ValueError("branch-revision smoke critique_prompt_weighting must be equal_prompt or headroom")
+    if smoke_contract["recovery_reference_mode"] not in {"none", "successful_original"}:
+        raise ValueError("branch-revision smoke recovery_reference_mode must be none or successful_original")
+    reference_seed = smoke_contract["recovery_reference_selection_seed"]
+    if not isinstance(reference_seed, int) or isinstance(reference_seed, bool) or reference_seed < 0:
+        raise ValueError("branch-revision smoke recovery_reference_selection_seed must be nonnegative")
     if smoke_contract["critique_advantage_mode"] == "pass_at_1" and smoke_contract["enable_positive_compression"]:
         raise ValueError("branch-revision pass_at_1 smoke must disable positive compression")
     if not isinstance(smoke_contract["enable_positive_compression"], bool):

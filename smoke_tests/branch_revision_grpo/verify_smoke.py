@@ -27,8 +27,8 @@ from typing import Any
 
 import numpy as np
 
-_AUDIT_SCHEMA_VERSION = 5
-_SUPPORTED_AUDIT_SCHEMA_VERSIONS = {2, 3, 4, _AUDIT_SCHEMA_VERSION}
+_AUDIT_SCHEMA_VERSION = 6
+_SUPPORTED_AUDIT_SCHEMA_VERSIONS = {2, 3, 4, 5, _AUDIT_SCHEMA_VERSION}
 
 
 def _read_json(path: Path) -> Any:
@@ -343,6 +343,15 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     critique_advantage_mode = str(branch_config.get("critique_advantage_mode", "grpo"))
     if critique_advantage_mode not in {"grpo", "pass_at_1"}:
         raise ValueError(f"unsupported critique advantage mode in smoke evidence: {critique_advantage_mode!r}")
+    critique_prompt_weighting = str(branch_config.get("critique_prompt_weighting", "headroom"))
+    if critique_prompt_weighting not in {"equal_prompt", "headroom"}:
+        raise ValueError(f"unsupported critique prompt weighting in smoke evidence: {critique_prompt_weighting!r}")
+    recovery_reference_mode = str(branch_config.get("recovery_reference_mode", "none"))
+    if recovery_reference_mode not in {"none", "successful_original"}:
+        raise ValueError(f"unsupported recovery reference mode in smoke evidence: {recovery_reference_mode!r}")
+    recovery_reference_selection_seed = int(branch_config.get("recovery_reference_selection_seed", 0))
+    if recovery_reference_selection_seed < 0:
+        raise ValueError("smoke evidence has a negative recovery-reference selection seed")
     critique_invalid_penalty = float(branch_config.get("critique_invalid_penalty", 0.20))
     critique_rejection_penalty = float(branch_config.get("critique_learnability_rejection_penalty", 0.05))
     critique_rms_floor = float(branch_config.get("critique_advantage_rms_floor", 0.10))
@@ -374,6 +383,10 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     audit_schema_version = int(attempt.get("schema_version", -1))
     if audit_schema_version not in _SUPPORTED_AUDIT_SCHEMA_VERSIONS or attempt.get("attempt_id") != attempt_id:
         raise ValueError("audit attempt metadata has the wrong schema or attempt ID")
+    if audit_schema_version < 6:
+        critique_prompt_weighting = "headroom"
+        recovery_reference_mode = "none"
+        recovery_reference_selection_seed = 0
     threshold_mode = (
         str(branch_config.get("learnability_threshold_mode", "percentile"))
         if audit_schema_version >= 5
@@ -424,6 +437,12 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             raise ValueError(f"step {filename_step} used the wrong critique GRPO grouping")
         if iteration_event.get("critique_advantage_mode", "grpo") != critique_advantage_mode:
             raise ValueError(f"step {filename_step} used the wrong critique advantage mode")
+        if iteration_event.get("critique_prompt_weighting", "headroom") != critique_prompt_weighting:
+            raise ValueError(f"step {filename_step} used the wrong critique prompt weighting")
+        if iteration_event.get("recovery_reference_mode", "none") != recovery_reference_mode:
+            raise ValueError(f"step {filename_step} used the wrong recovery reference mode")
+        if int(iteration_event.get("recovery_reference_selection_seed", 0)) != recovery_reference_selection_seed:
+            raise ValueError(f"step {filename_step} used the wrong recovery reference seed")
         if bool(iteration_event.get("positive_compression_enabled")) != positive_compression_enabled:
             raise ValueError(f"step {filename_step} used the wrong positive-compression mode")
         actor_batch_events = [event for event in step_events if event.get("event") == "actor_batch"]
@@ -484,6 +503,12 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError("iteration audit used a different critique GRPO grouping than the resolved config")
     if iteration.get("critique_advantage_mode", "grpo") != critique_advantage_mode:
         raise ValueError("iteration audit used a different critique advantage mode than the resolved config")
+    if iteration.get("critique_prompt_weighting", "headroom") != critique_prompt_weighting:
+        raise ValueError("iteration audit used a different critique prompt weighting than the resolved config")
+    if iteration.get("recovery_reference_mode", "none") != recovery_reference_mode:
+        raise ValueError("iteration audit used a different recovery reference mode than the resolved config")
+    if int(iteration.get("recovery_reference_selection_seed", 0)) != recovery_reference_selection_seed:
+        raise ValueError("iteration audit used a different recovery reference seed than the resolved config")
     if critique_advantage_mode == "pass_at_1" and any(
         not math.isclose(float(iteration.get(field, float("nan"))), expected, rel_tol=0.0, abs_tol=1e-12)
         for field, expected in (
@@ -535,12 +560,80 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             raise ValueError("original audit has an invalid editable solution length")
         _require_binary(original.get("reward"), "audited original reward")
 
+    successful_by_prompt: defaultdict[str, list[str]] = defaultdict(list)
+    for original in originals:
+        if float(original["reward"]) == 1.0:
+            successful_by_prompt[str(original["prompt_group_id"])].append(str(original["rollout_id"]))
+    for rollout_ids in successful_by_prompt.values():
+        rollout_ids.sort()
+    incorrect_rollout_ids = {str(original["rollout_id"]) for original in originals if float(original["reward"]) == 0.0}
+    if recovery_reference_mode == "successful_original":
+        eligible_recovery_ids = {
+            str(original["rollout_id"])
+            for original in originals
+            if float(original["reward"]) == 0.0 and successful_by_prompt[str(original["prompt_group_id"])]
+        }
+    else:
+        eligible_recovery_ids = set(incorrect_rollout_ids)
+    skipped_recovery_ids = incorrect_rollout_ids - eligible_recovery_ids
+
+    recovery_reference_events = [event for event in events if event.get("event") == "recovery_reference"]
+    recovery_reference_skip_events = [event for event in events if event.get("event") == "recovery_reference_skip"]
+    recovery_reference_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    if recovery_reference_mode == "successful_original":
+        if len(recovery_reference_events) != len(eligible_recovery_ids) * num_critiques:
+            raise ValueError("successful-original mode has the wrong number of reference assignments")
+        for event in recovery_reference_events:
+            key = (str(event.get("rollout_id")), int(event.get("critique_index", -1)))
+            if (
+                key in recovery_reference_by_key
+                or key[0] not in eligible_recovery_ids
+                or not 0 <= key[1] < num_critiques
+            ):
+                raise ValueError(f"invalid or duplicate recovery-reference assignment {key!r}")
+            parent = original_by_rollout[key[0]]
+            prompt_group_id = str(parent["prompt_group_id"])
+            candidates = successful_by_prompt[prompt_group_id]
+            if event.get("candidate_rollout_ids") != candidates:
+                raise ValueError(f"recovery-reference assignment {key!r} has the wrong candidate set")
+            material = "\0".join(
+                (
+                    str(recovery_reference_selection_seed),
+                    str(selected_step),
+                    prompt_group_id,
+                    key[0],
+                    str(key[1]),
+                )
+            ).encode("utf-8")
+            digest = hashlib.sha256(material).digest()
+            expected_reference_id = candidates[int.from_bytes(digest[:8], "big") % len(candidates)]
+            reference_id = str(event.get("reference_rollout_id"))
+            reference = original_by_rollout.get(reference_id)
+            if (
+                int(event.get("selection_seed", -1)) != recovery_reference_selection_seed
+                or event.get("selection_digest_sha256") != hashlib.sha256(material).hexdigest()
+                or reference_id != expected_reference_id
+                or reference is None
+                or float(reference["reward"]) != 1.0
+                or str(reference["prompt_group_id"]) != prompt_group_id
+                or event.get("reference_solution_ids") != reference["solution_ids"]
+            ):
+                raise ValueError(f"recovery-reference assignment {key!r} is inconsistent")
+            recovery_reference_by_key[key] = event
+        skipped_events_by_rollout = {str(event.get("rollout_id")): event for event in recovery_reference_skip_events}
+        if set(skipped_events_by_rollout) != skipped_recovery_ids or any(
+            event.get("reason") != "no_successful_original" for event in skipped_events_by_rollout.values()
+        ):
+            raise ValueError("all-failure prompt skips do not match the original outcomes")
+    elif recovery_reference_events or recovery_reference_skip_events:
+        raise ValueError("reference-free recovery unexpectedly emitted successful-reference evidence")
+
     critiques = [event for event in events if event.get("event") == "critique"]
     continuations = [event for event in events if event.get("event") == "continuation"]
     reference_events = [event for event in events if event.get("event") == "learnability_reference"]
     learnability_events = [event for event in events if event.get("event") == "learnability"]
     critique_advantage_events = [event for event in events if event.get("event") == "critique_advantage"]
-    expected_critiques = incorrect * num_critiques + (
+    expected_critiques = len(eligible_recovery_ids) * num_critiques + (
         correct * num_positive_critiques if positive_compression_enabled else 0
     )
     if len(critiques) != expected_critiques:
@@ -590,6 +683,17 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             or critique_prompt_ids[: len(original_prefix)] != original_prefix
         ):
             raise ValueError(f"critique {key!r} prompt does not preserve the exact original prompt/solution")
+        if objective == "recovery" and recovery_reference_mode == "successful_original":
+            assignment = recovery_reference_by_key.get(key)
+            if assignment is None:
+                raise ValueError(f"critique {key!r} lacks its successful-reference assignment")
+            if (
+                critique.get("reference_rollout_id") != assignment["reference_rollout_id"]
+                or critique.get("reference_solution_ids") != assignment["reference_solution_ids"]
+            ):
+                raise ValueError(f"critique {key!r} changed its assigned successful reference")
+        elif critique.get("reference_rollout_id") is not None or critique.get("reference_solution_ids"):
+            raise ValueError(f"reference-free critique {key!r} retained successful-reference evidence")
         outcome = _require_binary(critique["continuation_outcome"], "critique continuation outcome")
         prompt_group_id = str(critique.get("prompt_group_id"))
         baseline = float(critique["prompt_pass_at_1"])
@@ -713,13 +817,13 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             raise ValueError(
                 f"rollout {rollout_id!r} must have critique indices {sorted(expected_indices)}; got {sorted(indices)}"
             )
-    expected_objectives = Counter(recovery=incorrect)
+    expected_objectives = Counter(recovery=len(eligible_recovery_ids))
     if positive_compression_enabled:
         expected_objectives["compression"] = correct
     if Counter(rollout_objectives.values()) != expected_objectives:
         raise ValueError("critique objective counts do not match original correctness counts")
-    if any(len(prompts) != 1 for prompts in critique_prompts.values()):
-        raise ValueError("IID critiques for one original rollout used different behavior-policy prompt IDs")
+    if recovery_reference_mode == "none" and any(len(prompts) != 1 for prompts in critique_prompts.values()):
+        raise ValueError("reference-free IID critiques for one original used different behavior-policy prompt IDs")
 
     expected_external_advantages: dict[str, dict[str, float]] = {}
     if critique_advantage_mode == "pass_at_1":
@@ -730,14 +834,21 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         rms_scale = max(raw_rms, critique_rms_floor)
         scaled_values = np.clip(raw_values / rms_scale, -critique_advantage_clip, critique_advantage_clip)
         prompt_counts = Counter(str(critique["prompt_group_id"]) for critique in critiques)
-        unnormalized_weights = np.asarray(
-            [
-                max(0.0, 1.0 - audited_prompt_pass_at_1[str(critique["prompt_group_id"])]) ** critique_headroom_exponent
-                / prompt_counts[str(critique["prompt_group_id"])]
-                for critique in critiques
-            ],
-            dtype=np.float64,
-        )
+        if critique_prompt_weighting == "equal_prompt":
+            unnormalized_weights = np.asarray(
+                [1.0 / prompt_counts[str(critique["prompt_group_id"])] for critique in critiques],
+                dtype=np.float64,
+            )
+        else:
+            unnormalized_weights = np.asarray(
+                [
+                    max(0.0, 1.0 - audited_prompt_pass_at_1[str(critique["prompt_group_id"])])
+                    ** critique_headroom_exponent
+                    / prompt_counts[str(critique["prompt_group_id"])]
+                    for critique in critiques
+                ],
+                dtype=np.float64,
+            )
         weight_mean = float(np.mean(unnormalized_weights, dtype=np.float64))
         if not math.isfinite(weight_mean) or weight_mean <= 0.0:
             raise ValueError("external critique prompt weights have no positive finite mass")
@@ -759,14 +870,18 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             raise ValueError("external critique advantage events do not map one-to-one onto critique rows")
         for row_id, expected in expected_by_actor_row.items():
             event = audited_advantages[row_id]
-            if event.get("mode") != "pass_at_1" or any(
-                not math.isclose(
-                    float(event.get(field, float("nan"))),
-                    value,
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
+            if (
+                event.get("mode") != "pass_at_1"
+                or event.get("prompt_weighting", "headroom") != critique_prompt_weighting
+                or any(
+                    not math.isclose(
+                        float(event.get(field, float("nan"))),
+                        value,
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    )
+                    for field, value in expected.items()
                 )
-                for field, value in expected.items()
             ):
                 raise ValueError(f"external critique advantage event {row_id!r} is inconsistent")
         expected_external_advantages = expected_by_actor_row
@@ -1298,7 +1413,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         if require_algorithm_signal and len({float(row["reward"]) for row in critique_actor_rows}) <= 1:
             raise ValueError("smoke has no nonuniform batch-level critique GRPO reward group")
     else:
-        selected_originals = incorrect + (correct if positive_compression_enabled else 0)
+        selected_originals = len(eligible_recovery_ids) + (correct if positive_compression_enabled else 0)
         if len(critique_groups) != selected_originals:
             raise ValueError("every selected original must have one critique GRPO group")
         for group_id, count in critique_groups.items():
@@ -1336,7 +1451,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         "branch_revision/incorrect_originals": float(incorrect),
         "branch_revision/correct_originals": float(correct),
         "branch_revision/critiques": float(expected_critiques),
-        "branch_revision/recovery_critiques": float(incorrect * num_critiques),
+        "branch_revision/recovery_critiques": float(len(eligible_recovery_ids) * num_critiques),
         "branch_revision/compression_critiques": float(
             correct * num_positive_critiques if positive_compression_enabled else 0
         ),
@@ -1352,6 +1467,22 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         ),
         "branch_revision/critique_grpo_group_size_max": float(max(critique_groups.values(), default=0)),
     }
+    if audit_schema_version >= 6:
+        required_metrics.update(
+            {
+                "branch_revision/recovery_reference_mode_is_successful_original": float(
+                    recovery_reference_mode == "successful_original"
+                ),
+                "branch_revision/recovery_reference/eligible_incorrect": float(
+                    len(eligible_recovery_ids) if recovery_reference_mode == "successful_original" else 0
+                ),
+                "branch_revision/recovery_reference/skipped_incorrect": float(len(skipped_recovery_ids)),
+                "branch_revision/recovery_reference/assignments": float(len(recovery_reference_events)),
+                "branch_revision/recovery_reference/distinct_successful_originals": float(
+                    len({str(event["reference_rollout_id"]) for event in recovery_reference_events})
+                ),
+            }
+        )
     if separate_critique_model:
         required_metrics.update(
             {
@@ -1448,6 +1579,10 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         "policy_loss_mode": loss_mode,
         "critique_grpo_grouping": critique_grpo_grouping,
         "critique_advantage_mode": critique_advantage_mode,
+        "critique_prompt_weighting": critique_prompt_weighting,
+        "recovery_reference_mode": recovery_reference_mode,
+        "recovery_reference_eligible_incorrect_originals": len(eligible_recovery_ids),
+        "recovery_reference_skipped_incorrect_originals": len(skipped_recovery_ids),
         "learnability_logprob_statistic": statistic,
         "learnability_threshold_mode": threshold_mode,
         "max_seed_window_stddevs": max_seed_window_stddevs,
@@ -1464,7 +1599,7 @@ def main() -> None:
     parser.add_argument(
         "--integrity-only",
         action="store_true",
-        help="verify complete schema-v2/v3/v4/v5 evidence without requiring nonzero revision learning signal",
+        help="verify complete schema-v2 through schema-v6 evidence without requiring nonzero revision learning signal",
     )
     args = parser.parse_args()
     result = verify(args.root, require_algorithm_signal=not args.integrity_only)

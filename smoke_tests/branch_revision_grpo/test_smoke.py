@@ -557,6 +557,9 @@ def _scaled_runtime_config(tmp_path: Path):
                     "critique_model_n_gpus_per_node": 8,
                     "critique_grpo_grouping": "per_original",
                     "critique_advantage_mode": "grpo",
+                    "critique_prompt_weighting": "equal_prompt",
+                    "recovery_reference_mode": "successful_original",
+                    "recovery_reference_selection_seed": 0,
                     "num_critiques": 6,
                     "enable_positive_compression": True,
                     "num_positive_critiques": 6,
@@ -595,6 +598,9 @@ def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
         "num_critiques": 6,
         "critique_grpo_grouping": "per_original",
         "critique_advantage_mode": "grpo",
+        "critique_prompt_weighting": "equal_prompt",
+        "recovery_reference_mode": "successful_original",
+        "recovery_reference_selection_seed": 0,
         "enable_positive_compression": True,
         "loss_mode": "dppo_tv",
         "learnability_logprob_statistic": "mean",
@@ -701,10 +707,14 @@ def _fixture(
     schema_version: int = 5,
     critique_grpo_grouping: str = "per_original",
     critique_advantage_mode: str = "grpo",
+    critique_prompt_weighting: str = "headroom",
+    recovery_reference_mode: str = "none",
     enable_positive_compression: bool = True,
 ) -> None:
     if critique_advantage_mode == "pass_at_1" and enable_positive_compression:
         raise ValueError("pass_at_1 fixture must disable positive compression")
+    if recovery_reference_mode == "successful_original" and schema_version < 6:
+        raise ValueError("successful-original fixture requires schema v6")
     attempt_id = "fixture"
     invocation_id = "invocation"
     completion = {
@@ -736,6 +746,12 @@ def _fixture(
         branch_config.update(
             learnability_threshold_mode=threshold_mode,
             max_seed_window_stddevs=max_seed_window_stddevs,
+        )
+    if schema_version >= 6:
+        branch_config.update(
+            critique_prompt_weighting=critique_prompt_weighting,
+            recovery_reference_mode=recovery_reference_mode,
+            recovery_reference_selection_seed=0,
         )
     _write_json(
         root / "resolved_config.json",
@@ -804,6 +820,36 @@ def _fixture(
                 "behavior_log_probs": solution_log_probs,
             }
         )
+
+    recovery_references: dict[tuple[str, int], str] = {}
+    if recovery_reference_mode == "successful_original":
+        successful_by_prompt = {
+            "prompt-0": ["p:1"],
+            "prompt-1": ["p:3"],
+            **{f"prompt-{index}": [f"p:{index * 2}", f"p:{index * 2 + 1}"] for index in range(2, 8)},
+        }
+        for original_index in (0, 2):
+            rollout_id = f"p:{original_index}"
+            prompt_group_id = f"prompt-{original_index // 2}"
+            candidates = successful_by_prompt[prompt_group_id]
+            for critique_index in range(2):
+                material = "\0".join(("0", "1", prompt_group_id, rollout_id, str(critique_index))).encode("utf-8")
+                digest = hashlib.sha256(material).digest()
+                reference_id = candidates[int.from_bytes(digest[:8], "big") % len(candidates)]
+                recovery_references[(rollout_id, critique_index)] = reference_id
+                events.append(
+                    {
+                        "event": "recovery_reference",
+                        "rollout_id": rollout_id,
+                        "prompt_group_id": prompt_group_id,
+                        "critique_index": critique_index,
+                        "reference_rollout_id": reference_id,
+                        "reference_solution_ids": originals[reference_id]["solution_ids"],
+                        "candidate_rollout_ids": candidates,
+                        "selection_seed": 0,
+                        "selection_digest_sha256": hashlib.sha256(material).hexdigest(),
+                    }
+                )
 
     if include_continuation:
         reference_scores = np.asarray(
@@ -987,6 +1033,12 @@ def _fixture(
                 "critique_ids": critique_ids,
                 "critique_log_probs": [-0.2, -0.3],
             }
+            reference_id = recovery_references.get((rollout_id, critique_index))
+            if schema_version >= 6:
+                critique.update(
+                    reference_rollout_id=reference_id,
+                    reference_solution_ids=(originals[reference_id]["solution_ids"] if reference_id else []),
+                )
             events.append(critique)
             actor_sources.append(
                 {
@@ -1040,13 +1092,19 @@ def _fixture(
         external_scale = max(external_raw_rms, 0.10)
         scaled_values = np.clip(raw_values / external_scale, -5.0, 5.0)
         prompt_counts = Counter(event["prompt_group_id"] for event in critique_events)
-        unnormalized = np.asarray(
-            [
-                (1.0 - prompt_pass_at_1[event["prompt_group_id"]]) / prompt_counts[event["prompt_group_id"]]
-                for event in critique_events
-            ],
-            dtype=np.float64,
-        )
+        if critique_prompt_weighting == "equal_prompt":
+            unnormalized = np.asarray(
+                [1.0 / prompt_counts[event["prompt_group_id"]] for event in critique_events],
+                dtype=np.float64,
+            )
+        else:
+            unnormalized = np.asarray(
+                [
+                    (1.0 - prompt_pass_at_1[event["prompt_group_id"]]) / prompt_counts[event["prompt_group_id"]]
+                    for event in critique_events
+                ],
+                dtype=np.float64,
+            )
         normalized = unnormalized / float(np.mean(unnormalized, dtype=np.float64))
         actor_source_by_id = {source["actor_row_id"]: source for source in actor_sources}
         for position, critique in enumerate(critique_events):
@@ -1056,6 +1114,7 @@ def _fixture(
                 "actor_row_id": critique["actor_row_id"],
                 "prompt_group_id": critique["prompt_group_id"],
                 "mode": "pass_at_1",
+                **({"prompt_weighting": critique_prompt_weighting} if schema_version >= 6 else {}),
                 "raw_advantage": float(raw_values[position]),
                 "rms_scale": external_scale,
                 "scaled_advantage": float(scaled_values[position]),
@@ -1104,6 +1163,7 @@ def _fixture(
                 "pad_token_id": 0,
                 "policy_loss_mode": "dppo_tv",
                 "critique_advantage_mode": critique_advantage_mode,
+                **({"critique_prompt_weighting": critique_prompt_weighting} if schema_version >= 6 else {}),
                 "actor_rows": [
                     _actor_audit_row(source, row_index=index, response_width=response_width)
                     for index, source in enumerate(balanced_sources)
@@ -1123,6 +1183,15 @@ def _fixture(
                 "critique_advantage_clip": 5.0,
                 "critique_prompt_headroom_exponent": 1.0,
                 "learnability_logprob_statistic": statistic,
+                **(
+                    {
+                        "critique_prompt_weighting": critique_prompt_weighting,
+                        "recovery_reference_mode": recovery_reference_mode,
+                        "recovery_reference_selection_seed": 0,
+                    }
+                    if schema_version >= 6
+                    else {}
+                ),
                 **(
                     {
                         "learnability_threshold_mode": threshold_mode,
@@ -1156,6 +1225,25 @@ def _fixture(
                     "branch_revision/critique_grpo_grouping_is_batch": float(critique_grpo_grouping == "batch"),
                     "branch_revision/critique_advantage_mode_is_pass_at_1": float(
                         critique_advantage_mode == "pass_at_1"
+                    ),
+                    **(
+                        {
+                            "branch_revision/recovery_reference_mode_is_successful_original": float(
+                                recovery_reference_mode == "successful_original"
+                            ),
+                            "branch_revision/recovery_reference/eligible_incorrect": (
+                                2.0 if recovery_reference_mode == "successful_original" else 0.0
+                            ),
+                            "branch_revision/recovery_reference/skipped_incorrect": 0.0,
+                            "branch_revision/recovery_reference/assignments": (
+                                4.0 if recovery_reference_mode == "successful_original" else 0.0
+                            ),
+                            "branch_revision/recovery_reference/distinct_successful_originals": (
+                                2.0 if recovery_reference_mode == "successful_original" else 0.0
+                            ),
+                        }
+                        if schema_version >= 6
+                        else {}
                     ),
                     "branch_revision/critique_advantage/raw_rms": external_raw_rms,
                     "branch_revision/critique_advantage/rms_scale": external_scale,
@@ -1394,6 +1482,38 @@ def test_verifier_accepts_one_iteration_level_critique_grpo_group(tmp_path: Path
     result = verify(tmp_path)
     assert result["status"] == "verified"
     assert result["critique_grpo_grouping"] == "batch"
+
+
+def test_verifier_accepts_successful_original_references_with_equal_prompt_weighting(tmp_path: Path) -> None:
+    _fixture(
+        tmp_path,
+        schema_version=6,
+        critique_grpo_grouping="batch",
+        critique_advantage_mode="pass_at_1",
+        critique_prompt_weighting="equal_prompt",
+        recovery_reference_mode="successful_original",
+        enable_positive_compression=False,
+    )
+    result = verify(tmp_path)
+    assert result["status"] == "verified"
+    assert result["audit_schema_version"] == 6
+    assert result["critique_prompt_weighting"] == "equal_prompt"
+    assert result["recovery_reference_mode"] == "successful_original"
+
+
+def test_verifier_rejects_corrupted_successful_original_reference(tmp_path: Path) -> None:
+    _fixture(
+        tmp_path,
+        schema_version=6,
+        recovery_reference_mode="successful_original",
+    )
+    path = _audit_path(tmp_path)
+    events = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assignment = next(event for event in events if event["event"] == "recovery_reference")
+    assignment["reference_rollout_id"] = "p:3"
+    _write_jsonl(path, events)
+    with pytest.raises(ValueError, match="recovery-reference assignment .* is inconsistent"):
+        verify(tmp_path)
 
 
 def test_verifier_accepts_external_pass_at_1_critique_advantages(tmp_path: Path) -> None:

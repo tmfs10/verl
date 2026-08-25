@@ -43,6 +43,7 @@ from verl.trainer.config import (
     BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT,
     BRANCH_REVISION_CRITIQUE_PROMPT,
     BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT,
+    BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT,
     BranchRevisionGRPOConfig,
 )
 from verl.trainer.ppo import ray_trainer_branch_revision as branch_controller_module
@@ -174,6 +175,9 @@ def test_objective_prompts_share_the_causal_and_exact_edit_contract() -> None:
         assert "After the free-form analysis" in prompt
         assert "nothing after the closing" in prompt
         assert "1. PRUNING:" not in prompt
+    assert BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT.count("{successful_rollout}") == 1
+    assert "entire successful rollout hidden" in BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
+    assert "never from the successful rollout" in BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
 
 
 def test_critique_instruction_is_a_new_user_turn_with_visible_assistant_output() -> None:
@@ -996,6 +1000,7 @@ def test_branch_revision_config_defaults_to_fifteen_stddevs() -> None:
     feature = BranchRevisionGRPOConfig()
     assert feature.learnability_threshold_mode == "stddev"
     assert feature.max_seed_window_stddevs == 15.0
+    assert feature.critique_prompt_weighting == "equal_prompt"
 
 
 @pytest.mark.parametrize("grouping", ["per_original", "batch"])
@@ -1007,6 +1012,31 @@ def test_branch_revision_config_accepts_both_critique_grpo_groupings(grouping) -
 def test_branch_revision_config_rejects_unknown_critique_grpo_grouping() -> None:
     with pytest.raises(ValueError, match="must be per_original or batch"):
         BranchRevisionGRPOConfig(critique_grpo_grouping="per_rank")
+
+
+@pytest.mark.parametrize("mode", ["none", "successful_original"])
+def test_branch_revision_config_accepts_both_recovery_reference_modes(mode) -> None:
+    feature = BranchRevisionGRPOConfig(recovery_reference_mode=mode)
+    assert feature.recovery_reference_mode == mode
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"critique_prompt_weighting": "rows"}, "must be equal_prompt or headroom"),
+        ({"recovery_reference_mode": "teacher"}, "must be none or successful_original"),
+        ({"recovery_reference_selection_seed": -1}, "must be a non-negative integer"),
+        ({"recovery_reference_selection_seed": True}, "must be a non-negative integer"),
+        ({"successful_reference_critique_prompt": "no placeholder"}, "exactly one"),
+        (
+            {"successful_reference_critique_prompt": "{successful_rollout} {successful_rollout}"},
+            "exactly one",
+        ),
+    ],
+)
+def test_branch_revision_config_rejects_invalid_recovery_reference_settings(kwargs, message) -> None:
+    with pytest.raises(ValueError, match=message):
+        BranchRevisionGRPOConfig(**kwargs)
 
 
 @pytest.mark.parametrize(
@@ -1111,6 +1141,31 @@ def test_tokenizer_aware_context_headroom_accepts_exact_fit_and_rejects_one_toke
     validate_branch_revision_runtime_config(config, actor_tokenizer=tokenizer)
     config.actor_rollout_ref.rollout.max_model_len = required - 1
     with pytest.raises(ValueError, match=r"max_prompt=.*followup=.*critique_cap=.*required=.*limit="):
+        validate_branch_revision_runtime_config(config, actor_tokenizer=tokenizer)
+
+
+def test_tokenizer_aware_context_headroom_includes_the_successful_reference_response() -> None:
+    config = _runtime_config()
+    config.algorithm.branch_revision_grpo.recovery_reference_mode = "successful_original"
+    config.algorithm.branch_revision_grpo.enable_positive_compression = False
+    config.algorithm.branch_revision_grpo.critique_max_response_length = 16
+    tokenizer = _HeadroomTokenizer()
+    followup = len(
+        encode_followup_user_turn(
+            BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT.replace("{successful_rollout}", ""),
+            tokenizer,
+        )
+    )
+    required = (
+        int(config.data.max_prompt_length)
+        + 2 * int(config.data.max_response_length)
+        + followup
+        + int(config.algorithm.branch_revision_grpo.critique_max_response_length)
+    )
+    config.actor_rollout_ref.rollout.max_model_len = required
+    validate_branch_revision_runtime_config(config, actor_tokenizer=tokenizer)
+    config.actor_rollout_ref.rollout.max_model_len = required - 1
+    with pytest.raises(ValueError, match="max_reference_response"):
         validate_branch_revision_runtime_config(config, actor_tokenizer=tokenizer)
 
 
@@ -1496,6 +1551,45 @@ def test_agent_loop_uses_the_positive_compression_prompt_for_correct_parents() -
     record = output.extra_fields[BRANCH_REVISION_CHILD_FIELD]
     assert record.objective == "compression"
     assert len(record.critiques) == 2
+
+
+def test_agent_loop_uses_one_exact_successful_original_reference_per_critique() -> None:
+    loop = _loop()
+    loop.feature = replace(loop.feature, recovery_reference_mode="successful_original")
+    decoded_prompts: dict[str, str] = {}
+
+    async def fake_generate(_route, prompt, _params, *, max_tokens, kind, prompt_logprob_start=None):
+        del max_tokens
+        assert prompt_logprob_start is None
+        decoded_prompts[kind] = decode_exact(prompt, TOKENIZER)
+        text = _structured("dead", "better")
+        return TokenOutput(token_ids=_ids(text), log_probs=[-0.2] * len(_ids(text)))
+
+    loop._generate = fake_generate
+    solution_ids = _ids("start dead and waste")
+    references = [_ids("successful route A"), _ids("successful route B")]
+    output = asyncio.run(
+        loop.run(
+            {},
+            branch_revision_rollout_id="p:0",
+            branch_revision_parent_objective="recovery",
+            branch_revision_num_critiques=2,
+            branch_revision_parent_prompt_ids=_ids("q"),
+            branch_revision_parent_solution_ids=solution_ids,
+            branch_revision_parent_solution_log_probs=[-0.1] * len(solution_ids),
+            branch_revision_reference_rollout_ids=["p:1", "p:2"],
+            branch_revision_reference_solution_ids=references,
+            raw_prompt=[{"role": "user", "content": "q"}],
+        )
+    )
+    record = output.extra_fields[BRANCH_REVISION_CHILD_FIELD]
+    assert not record.critique_prompt_ids
+    assert "successful route A" in decoded_prompts["critique[0]"]
+    assert "successful route B" in decoded_prompts["critique[1]"]
+    assert "entire successful rollout hidden" in decoded_prompts["critique[0]"]
+    assert [critique.reference_rollout_id for critique in record.critiques] == ["p:1", "p:2"]
+    assert [list(critique.reference_solution_ids) for critique in record.critiques] == references
+    assert record.critiques[0].critique_prompt_ids != record.critiques[1].critique_prompt_ids
 
 
 def test_agent_loop_drains_all_sibling_failures_before_raising() -> None:
@@ -2177,6 +2271,7 @@ def test_pass_at_1_prompt_weights_downweight_easier_prompts_without_recentering(
         num_critiques=2,
         critique_grpo_grouping="batch",
         critique_advantage_mode="pass_at_1",
+        critique_prompt_weighting="headroom",
     )
     successful = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
     invalid = _critique("invalid", valid=False)
@@ -2188,9 +2283,7 @@ def test_pass_at_1_prompt_weights_downweight_easier_prompts_without_recentering(
         solution_ids=_ids("wrong"),
         solution_log_probs=[-0.1] * len(_ids("wrong")),
         original_reward=0.0,
-        record=BranchRevisionGenerationRecord(
-            "hard:0", "recovery", (successful, invalid), tuple(_ids("hard prompt"))
-        ),
+        record=BranchRevisionGenerationRecord("hard:0", "recovery", (successful, invalid), tuple(_ids("hard prompt"))),
         learnability={0: _learnability()},
         continuation_rewards={0: 1.0},
     )
@@ -2209,6 +2302,62 @@ def test_pass_at_1_prompt_weights_downweight_easier_prompts_without_recentering(
     assert [row.reward for row in critiques] == pytest.approx([1.0, -0.2, 0.5, -0.7])
     assert [row.prompt_weight for row in critiques] == pytest.approx([4 / 3, 4 / 3, 2 / 3, 2 / 3])
     assert sum(row.advantage_override for row in critiques) != pytest.approx(0.0)
+
+
+def test_pass_at_1_equal_prompt_weighting_gives_each_prompt_equal_total_mass() -> None:
+    controller = _controller()
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        num_critiques=2,
+        critique_grpo_grouping="batch",
+        critique_advantage_mode="pass_at_1",
+    )
+    critique = _critique("invalid", valid=False)
+    bundles = [
+        _Bundle(
+            source_row=index,
+            rollout_id=f"hard:{index}",
+            prompt_group_id="hard",
+            prompt_ids=_ids("hard"),
+            solution_ids=_ids("wrong"),
+            solution_log_probs=[-0.1] * len(_ids("wrong")),
+            original_reward=0.0,
+            record=BranchRevisionGenerationRecord(
+                f"hard:{index}", "recovery", (critique, critique), tuple(_ids("hard prompt"))
+            ),
+        )
+        for index in range(2)
+    ]
+    bundles.append(
+        _Bundle(
+            source_row=2,
+            rollout_id="easy:0",
+            prompt_group_id="easy",
+            prompt_ids=_ids("easy"),
+            solution_ids=_ids("wrong"),
+            solution_log_probs=[-0.1] * len(_ids("wrong")),
+            original_reward=0.0,
+            record=BranchRevisionGenerationRecord("easy:0", "recovery", (critique, critique), tuple(_ids("easy"))),
+        )
+    )
+    bundles.append(
+        _Bundle(
+            source_row=3,
+            rollout_id="easy:1",
+            prompt_group_id="easy",
+            prompt_ids=_ids("easy"),
+            solution_ids=_ids("correct"),
+            solution_log_probs=[-0.1] * len(_ids("correct")),
+            original_reward=1.0,
+        )
+    )
+    critiques = [row for row in controller._actor_rows(bundles) if row.kind == "critique"]
+    weight_by_prompt: dict[str, float] = {}
+    for row in critiques:
+        weight_by_prompt[row.prompt_group_id] = weight_by_prompt.get(row.prompt_group_id, 0.0) + float(
+            row.prompt_weight
+        )
+    assert weight_by_prompt["hard"] == pytest.approx(weight_by_prompt["easy"])
 
 
 def test_pass_at_1_critique_advantages_reject_positive_compression() -> None:
@@ -2415,6 +2564,30 @@ def test_child_request_selects_correct_rollouts_only_when_positive_compression_i
     assert len(both) == 2
     assert both.non_tensor_batch["branch_revision_parent_objective"].tolist() == ["recovery", "compression"]
     assert both.non_tensor_batch["branch_revision_num_critiques"].tolist() == [2, 3]
+
+
+def test_successful_original_mode_reuses_a_same_prompt_success_and_skips_all_failure_prompts() -> None:
+    controller = _controller()
+    controller.feature = replace(
+        controller.feature,
+        recovery_reference_mode="successful_original",
+        recovery_reference_selection_seed=17,
+    )
+    source, reward_tensor = _source_batch()
+    rewards = controller._original_rewards(reward_tensor)
+    bundles = controller._build_bundles(source, rewards)
+    controller._assign_recovery_references(bundles)
+    request = controller._make_child_request(source, bundles)
+    assert len(request) == 1
+    assert request.non_tensor_batch["branch_revision_reference_rollout_ids"][0] == ["p:1", "p:1"]
+    assert request.non_tensor_batch["branch_revision_reference_solution_ids"][0] == [
+        bundles[1].solution_ids,
+        bundles[1].solution_ids,
+    ]
+
+    all_failed = [replace(bundle, original_reward=0.0, recovery_references={}) for bundle in bundles]
+    controller._assign_recovery_references(all_failed)
+    assert controller._make_child_request(source, all_failed) is None
 
 
 def test_low_learnability_edit_is_not_rewarded_or_solution_trained(monkeypatch) -> None:

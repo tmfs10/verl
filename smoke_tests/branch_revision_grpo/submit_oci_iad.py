@@ -147,6 +147,9 @@ def _extra_args(
     num_critiques: int = 4,
     critique_grpo_grouping: str = "per_original",
     critique_advantage_mode: str = "grpo",
+    critique_prompt_weighting: str = "equal_prompt",
+    recovery_reference_mode: str = "successful_original",
+    recovery_reference_selection_seed: int = 0,
     enable_positive_compression: bool = True,
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
@@ -175,6 +178,16 @@ def _extra_args(
         raise ValueError("critique_grpo_grouping must be per_original or batch")
     if critique_advantage_mode not in {"grpo", "pass_at_1"}:
         raise ValueError("critique_advantage_mode must be grpo or pass_at_1")
+    if critique_prompt_weighting not in {"equal_prompt", "headroom"}:
+        raise ValueError("critique_prompt_weighting must be equal_prompt or headroom")
+    if recovery_reference_mode not in {"none", "successful_original"}:
+        raise ValueError("recovery_reference_mode must be none or successful_original")
+    if (
+        not isinstance(recovery_reference_selection_seed, int)
+        or isinstance(recovery_reference_selection_seed, bool)
+        or recovery_reference_selection_seed < 0
+    ):
+        raise ValueError("recovery_reference_selection_seed must be a nonnegative integer")
     if critique_advantage_mode == "pass_at_1" and enable_positive_compression:
         raise ValueError("pass_at_1 critique advantages require recovery-only generation")
     if not isinstance(enable_positive_compression, bool):
@@ -202,6 +215,9 @@ def _extra_args(
         f"algorithm.branch_revision_grpo.num_critiques={num_critiques}",
         f"algorithm.branch_revision_grpo.critique_grpo_grouping={critique_grpo_grouping}",
         f"algorithm.branch_revision_grpo.critique_advantage_mode={critique_advantage_mode}",
+        f"algorithm.branch_revision_grpo.critique_prompt_weighting={critique_prompt_weighting}",
+        f"algorithm.branch_revision_grpo.recovery_reference_mode={recovery_reference_mode}",
+        f"algorithm.branch_revision_grpo.recovery_reference_selection_seed={recovery_reference_selection_seed}",
         "algorithm.branch_revision_grpo.critique_invalid_penalty=0.20",
         "algorithm.branch_revision_grpo.critique_learnability_rejection_penalty=0.05",
         "algorithm.branch_revision_grpo.critique_advantage_rms_floor=0.10",
@@ -290,6 +306,9 @@ def _extra_args(
         f"+branch_revision_smoke.num_critiques={num_critiques}",
         f"+branch_revision_smoke.critique_grpo_grouping={critique_grpo_grouping}",
         f"+branch_revision_smoke.critique_advantage_mode={critique_advantage_mode}",
+        f"+branch_revision_smoke.critique_prompt_weighting={critique_prompt_weighting}",
+        f"+branch_revision_smoke.recovery_reference_mode={recovery_reference_mode}",
+        f"+branch_revision_smoke.recovery_reference_selection_seed={recovery_reference_selection_seed}",
         f"+branch_revision_smoke.enable_positive_compression={str(enable_positive_compression).lower()}",
         f"+branch_revision_smoke.model_path={model_path}",
         f"+branch_revision_smoke.loss_mode={loss_mode}",
@@ -332,6 +351,9 @@ def build_command(
     num_critiques: int = 4,
     critique_grpo_grouping: str = "per_original",
     critique_advantage_mode: str = "grpo",
+    critique_prompt_weighting: str = "equal_prompt",
+    recovery_reference_mode: str = "successful_original",
+    recovery_reference_selection_seed: int = 0,
     enable_positive_compression: bool = True,
     seed: int = 43,
     model_path: str = MODEL_PATH,
@@ -385,6 +407,16 @@ def build_command(
         raise ValueError("critique_grpo_grouping must be per_original or batch")
     if critique_advantage_mode not in {"grpo", "pass_at_1"}:
         raise ValueError("critique_advantage_mode must be grpo or pass_at_1")
+    if critique_prompt_weighting not in {"equal_prompt", "headroom"}:
+        raise ValueError("critique_prompt_weighting must be equal_prompt or headroom")
+    if recovery_reference_mode not in {"none", "successful_original"}:
+        raise ValueError("recovery_reference_mode must be none or successful_original")
+    if (
+        not isinstance(recovery_reference_selection_seed, int)
+        or isinstance(recovery_reference_selection_seed, bool)
+        or recovery_reference_selection_seed < 0
+    ):
+        raise ValueError("recovery_reference_selection_seed must be a nonnegative integer")
     if critique_advantage_mode == "pass_at_1" and enable_positive_compression:
         raise ValueError("pass_at_1 critique advantages require recovery-only generation")
     if not isinstance(enable_positive_compression, bool):
@@ -545,6 +577,9 @@ def build_command(
             num_critiques=num_critiques,
             critique_grpo_grouping=critique_grpo_grouping,
             critique_advantage_mode=critique_advantage_mode,
+            critique_prompt_weighting=critique_prompt_weighting,
+            recovery_reference_mode=recovery_reference_mode,
+            recovery_reference_selection_seed=recovery_reference_selection_seed,
             enable_positive_compression=enable_positive_compression,
             model_path=model_path,
             loss_mode=loss_mode,
@@ -601,6 +636,13 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
     parser.add_argument("--num-critiques", type=int, default=4)
     parser.add_argument("--critique-grpo-grouping", choices=("per_original", "batch"), default="per_original")
     parser.add_argument("--critique-advantage-mode", choices=("grpo", "pass_at_1"), default="grpo")
+    parser.add_argument("--critique-prompt-weighting", choices=("equal_prompt", "headroom"), default="equal_prompt")
+    parser.add_argument(
+        "--recovery-reference-mode",
+        choices=("none", "successful_original"),
+        default="successful_original",
+    )
+    parser.add_argument("--recovery-reference-selection-seed", type=int, default=0)
     parser.add_argument("--disable-positive-compression", action="store_true")
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument(
@@ -700,6 +742,9 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
         num_critiques=args.num_critiques,
         critique_grpo_grouping=args.critique_grpo_grouping,
         critique_advantage_mode=args.critique_advantage_mode,
+        critique_prompt_weighting=args.critique_prompt_weighting,
+        recovery_reference_mode=args.recovery_reference_mode,
+        recovery_reference_selection_seed=args.recovery_reference_selection_seed,
         enable_positive_compression=not args.disable_positive_compression,
         seed=args.seed,
         model_path=args.model_path,
@@ -752,6 +797,9 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
             num_critiques=args.num_critiques,
             critique_grpo_grouping=args.critique_grpo_grouping,
             critique_advantage_mode=args.critique_advantage_mode,
+            critique_prompt_weighting=args.critique_prompt_weighting,
+            recovery_reference_mode=args.recovery_reference_mode,
+            recovery_reference_selection_seed=args.recovery_reference_selection_seed,
             enable_positive_compression=not args.disable_positive_compression,
             seed=args.seed,
             model_path=args.model_path,
