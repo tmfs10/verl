@@ -508,7 +508,7 @@ def test_rendered_smoke_rejects_external_pass_at_1_with_compression(tmp_path: Pa
     [
         ({"n_prompts": 0}, "n_prompts"),
         ({"n_samples": 0}, "n_samples"),
-        ({"n_samples": 1}, "at least 2"),
+        ({"n_samples": 1}, "warmup-only"),
         ({"num_critiques": 1}, "at least 2"),
         ({"seed": -1}, "nonnegative"),
         ({"model_path": "/hf_models/not-supported"}, "model_path"),
@@ -543,6 +543,26 @@ def test_rendered_smoke_rejects_invalid_scale(
     }
     with pytest.raises(ValueError, match=match):
         build_command(**kwargs)
+
+
+def test_rendered_smoke_supports_singleton_originals_during_separate_policy_warmup(tmp_path: Path) -> None:
+    command, _ = build_command(
+        run_tag="n1-warmup-only",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        nodes=2,
+        n_samples=1,
+        separate_critique_model=True,
+        critique_warmup_steps=200,
+        training_steps=1,
+    )
+    rendered = " ".join(command)
+    assert "actor_rollout_ref.rollout.n=1" in rendered
+    assert "algorithm.branch_revision_grpo.critique_warmup_steps=200" in rendered
 
 
 def _scaled_runtime_config(tmp_path: Path):

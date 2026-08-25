@@ -446,10 +446,10 @@ def build_command(
     if separate_critique_model and critique_model_nnodes >= nodes:
         raise ValueError("separate critique policy requires at least one actor node and one critique node")
     actor_nodes = nodes - critique_model_nnodes if separate_critique_model else nodes
-    if separate_critique_model and training_steps <= critique_warmup_steps:
-        raise ValueError("separate critique-policy smoke must include at least one post-warmup training step")
-    if n_samples < 2:
-        raise ValueError("n_samples must be at least 2 for a GRPO acceptance group")
+    if n_samples < 2 and not (
+        separate_critique_model and training_steps > 0 and training_steps <= critique_warmup_steps
+    ):
+        raise ValueError("n_samples=1 requires a separate critique-policy warmup-only smoke")
     if num_critiques < 2:
         raise ValueError("num_critiques must be at least 2 for GRPO")
     if not isinstance(seed, int) or isinstance(seed, bool) or seed < 0:

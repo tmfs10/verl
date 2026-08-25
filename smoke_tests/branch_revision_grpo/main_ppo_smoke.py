@@ -251,11 +251,6 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("branch-revision smoke critique_warmup_steps must be a nonnegative integer")
     if smoke_contract["separate_critique_model"] and smoke_contract["critique_model_nnodes"] >= smoke_contract["nodes"]:
         raise ValueError("branch-revision smoke needs at least one actor node and one critique node")
-    if (
-        smoke_contract["separate_critique_model"]
-        and smoke_contract["training_steps"] <= smoke_contract["critique_warmup_steps"]
-    ):
-        raise ValueError("branch-revision smoke must include a post-warmup training step")
     prompt_logprob_capacity = smoke_contract["prompt_logprob_max_inflight_tokens"]
     if prompt_logprob_capacity is not None and (
         isinstance(prompt_logprob_capacity, bool)
@@ -287,8 +282,11 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         or not 0.0 < float(gpu_memory_utilization) < 1.0
     ):
         raise ValueError("branch-revision smoke gpu_memory_utilization must be finite and inside (0, 1)")
-    if smoke_contract["n_samples"] < 2:
-        raise ValueError("branch-revision smoke n_samples must be at least 2 for a GRPO acceptance group")
+    if smoke_contract["n_samples"] < 2 and not (
+        smoke_contract["separate_critique_model"]
+        and smoke_contract["training_steps"] <= smoke_contract["critique_warmup_steps"]
+    ):
+        raise ValueError("branch-revision smoke n_samples=1 requires a separate critique-policy warmup-only run")
     if smoke_contract["num_critiques"] < 2:
         raise ValueError("branch-revision smoke num_critiques must be at least 2 for GRPO")
     if smoke_contract["nodes"] > 4:

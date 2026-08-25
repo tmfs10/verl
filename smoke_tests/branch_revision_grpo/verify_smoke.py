@@ -1405,9 +1405,13 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError(
             f"original solution GRPO groups must contain {rollout_n} rollouts per prompt: {original_solution_groups!r}"
         )
-    if require_algorithm_signal and not any(
-        len({float(row["reward"]) for row in original_actor_rows if str(row["group_id"]) == group_id}) > 1
-        for group_id in original_solution_groups
+    if (
+        require_algorithm_signal
+        and not selected_warmup
+        and not any(
+            len({float(row["reward"]) for row in original_actor_rows if str(row["group_id"]) == group_id}) > 1
+            for group_id in original_solution_groups
+        )
     ):
         raise ValueError("smoke has no nonuniform original-solution GRPO reward group")
     recomputed_prompt_pass_at_1: dict[str, float] = {}
