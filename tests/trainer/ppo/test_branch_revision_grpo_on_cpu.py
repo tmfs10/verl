@@ -1054,6 +1054,20 @@ def test_branch_revision_config_accepts_both_recovery_reference_modes(mode) -> N
     assert feature.recovery_reference_mode == mode
 
 
+def test_branch_revision_config_rejects_disabling_both_objectives() -> None:
+    with pytest.raises(ValueError, match="must enable recovery, positive compression, or both"):
+        BranchRevisionGRPOConfig(enable_recovery=False, enable_positive_compression=False)
+
+
+def test_branch_revision_config_rejects_recovery_reference_when_recovery_is_disabled() -> None:
+    with pytest.raises(ValueError, match="recovery_reference_mode must be none"):
+        BranchRevisionGRPOConfig(
+            enable_recovery=False,
+            enable_positive_compression=True,
+            recovery_reference_mode="successful_original",
+        )
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -2598,6 +2612,24 @@ def test_child_request_selects_correct_rollouts_only_when_positive_compression_i
     assert len(both) == 2
     assert both.non_tensor_batch["branch_revision_parent_objective"].tolist() == ["recovery", "compression"]
     assert both.non_tensor_batch["branch_revision_num_critiques"].tolist() == [2, 3]
+
+
+def test_child_request_can_select_compression_only() -> None:
+    controller = _controller()
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        num_critiques=2,
+        enable_recovery=False,
+        enable_positive_compression=True,
+        num_positive_critiques=8,
+    )
+    source, reward_tensor = _source_batch()
+    rewards = controller._original_rewards(reward_tensor)
+    bundles = controller._build_bundles(source, rewards)
+    request = controller._make_child_request(source, bundles)
+    assert len(request) == 1
+    assert request.non_tensor_batch["branch_revision_parent_objective"].tolist() == ["compression"]
+    assert request.non_tensor_batch["branch_revision_num_critiques"].tolist() == [8]
 
 
 def test_successful_original_mode_reuses_a_same_prompt_success_and_skips_all_failure_prompts() -> None:

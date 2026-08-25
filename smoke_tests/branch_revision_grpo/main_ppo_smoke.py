@@ -104,6 +104,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "critique_prompt_weighting",
         "recovery_reference_mode",
         "recovery_reference_selection_seed",
+        "enable_recovery",
         "enable_positive_compression",
         "loss_mode",
         "learnability_logprob_statistic",
@@ -144,6 +145,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "algorithm.branch_revision_grpo.recovery_reference_selection_seed": smoke_contract[
             "recovery_reference_selection_seed"
         ],
+        "algorithm.branch_revision_grpo.enable_recovery": smoke_contract["enable_recovery"],
         "algorithm.branch_revision_grpo.enable_positive_compression": smoke_contract["enable_positive_compression"],
         "actor_rollout_ref.model.path": smoke_contract["model_path"],
         "critic.model.path": smoke_contract["model_path"],
@@ -230,6 +232,12 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
     reference_seed = smoke_contract["recovery_reference_selection_seed"]
     if not isinstance(reference_seed, int) or isinstance(reference_seed, bool) or reference_seed < 0:
         raise ValueError("branch-revision smoke recovery_reference_selection_seed must be nonnegative")
+    if not isinstance(smoke_contract["enable_recovery"], bool):
+        raise ValueError("branch-revision smoke enable_recovery must be boolean")
+    if not smoke_contract["enable_recovery"] and not smoke_contract["enable_positive_compression"]:
+        raise ValueError("branch-revision smoke must enable recovery, positive compression, or both")
+    if not smoke_contract["enable_recovery"] and smoke_contract["recovery_reference_mode"] != "none":
+        raise ValueError("branch-revision smoke must use recovery_reference_mode=none when recovery is disabled")
     if smoke_contract["critique_advantage_mode"] == "pass_at_1" and smoke_contract["enable_positive_compression"]:
         raise ValueError("branch-revision pass_at_1 smoke must disable positive compression")
     if not isinstance(smoke_contract["enable_positive_compression"], bool):
@@ -305,6 +313,10 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         smoke_contract["enable_positive_compression"]
     ):
         raise ValueError("branch-revision smoke positive-compression mode differs from its launch contract")
+    if bool(OmegaConf.select(config, "algorithm.branch_revision_grpo.enable_recovery")) != bool(
+        smoke_contract["enable_recovery"]
+    ):
+        raise ValueError("branch-revision smoke recovery mode differs from its launch contract")
     if bool(OmegaConf.select(config, "algorithm.intermediate_mc_value.enable")):
         raise ValueError("branch-revision smoke must not enable intermediate MC")
     if bool(OmegaConf.select(config, "critic.enable")):

@@ -257,6 +257,7 @@ class BranchRevisionGRPOConfig(BaseConfig):
     recovery_reference_mode: str = "none"
     recovery_reference_selection_seed: int = 0
     num_critiques: int = 4
+    enable_recovery: bool = True
     enable_positive_compression: bool = False
     num_positive_critiques: int = 4
     positive_compression_target: float = 0.25
@@ -345,8 +346,14 @@ class BranchRevisionGRPOConfig(BaseConfig):
             raise ValueError("algorithm.branch_revision_grpo.num_critiques must be at least 2 for GRPO")
         if self.num_positive_critiques < 2:
             raise ValueError("algorithm.branch_revision_grpo.num_positive_critiques must be at least 2 for GRPO")
+        if not isinstance(self.enable_recovery, bool):
+            raise ValueError("algorithm.branch_revision_grpo.enable_recovery must be boolean")
         if not isinstance(self.enable_positive_compression, bool):
             raise ValueError("algorithm.branch_revision_grpo.enable_positive_compression must be boolean")
+        if not self.enable_recovery and not self.enable_positive_compression:
+            raise ValueError("branch-revision GRPO must enable recovery, positive compression, or both")
+        if not self.enable_recovery and self.recovery_reference_mode != "none":
+            raise ValueError("recovery_reference_mode must be none when branch-revision recovery is disabled")
         if self.critique_advantage_mode == "pass_at_1" and self.enable_positive_compression:
             raise ValueError(
                 "algorithm.branch_revision_grpo.critique_advantage_mode=pass_at_1 currently supports recovery only"

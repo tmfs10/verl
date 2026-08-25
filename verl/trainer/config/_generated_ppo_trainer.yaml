@@ -739,6 +739,7 @@ algorithm:
     recovery_reference_mode: none
     recovery_reference_selection_seed: 0
     num_critiques: 4
+    enable_recovery: true
     enable_positive_compression: false
     num_positive_critiques: 4
     positive_compression_target: 0.25

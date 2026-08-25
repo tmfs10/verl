@@ -242,6 +242,9 @@ algorithm:
     # Number of IID critiques sampled for every incorrect original rollout.
     num_critiques: 4
 
+    # Critique incorrect rollouts with the recovery objective.
+    enable_recovery: true
+
     # Also critique correct rollouts with the positive compression objective.
     enable_positive_compression: false
 

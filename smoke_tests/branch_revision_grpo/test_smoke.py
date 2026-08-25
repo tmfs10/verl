@@ -434,6 +434,41 @@ def test_rendered_smoke_supports_batch_grouped_recovery_only_critiques(tmp_path:
     assert "+branch_revision_smoke.enable_positive_compression=false" in rendered
 
 
+def test_rendered_smoke_supports_compression_only_critiques(tmp_path: Path) -> None:
+    command, _ = build_command(
+        run_tag="compression-only",
+        dry_run=False,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        recovery_reference_mode="none",
+        enable_recovery=False,
+        enable_positive_compression=True,
+    )
+    rendered = " ".join(command)
+    assert "algorithm.branch_revision_grpo.enable_recovery=false" in rendered
+    assert "algorithm.branch_revision_grpo.enable_positive_compression=true" in rendered
+    assert "+branch_revision_smoke.enable_recovery=false" in rendered
+
+
+def test_rendered_smoke_rejects_disabling_both_objectives(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="recovery, positive compression, or both"):
+        build_command(
+            run_tag="no-objective",
+            dry_run=False,
+            python=Path("/python"),
+            launcher=Path("/launcher"),
+            verl_root=Path("/verl"),
+            reward_file=Path("/reward.py"),
+            config_dir=tmp_path,
+            recovery_reference_mode="none",
+            enable_recovery=False,
+            enable_positive_compression=False,
+        )
+
+
 def test_rendered_smoke_supports_external_pass_at_1_recovery_advantages(tmp_path: Path) -> None:
     command, _ = build_command(
         run_tag="external-pass-at-1",
@@ -561,6 +596,7 @@ def _scaled_runtime_config(tmp_path: Path):
                     "recovery_reference_mode": "successful_original",
                     "recovery_reference_selection_seed": 0,
                     "num_critiques": 6,
+                    "enable_recovery": True,
                     "enable_positive_compression": True,
                     "num_positive_critiques": 6,
                     "learnability_logprob_statistic": "mean",
@@ -601,6 +637,7 @@ def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
         "critique_prompt_weighting": "equal_prompt",
         "recovery_reference_mode": "successful_original",
         "recovery_reference_selection_seed": 0,
+        "enable_recovery": True,
         "enable_positive_compression": True,
         "loss_mode": "dppo_tv",
         "learnability_logprob_statistic": "mean",
@@ -709,6 +746,7 @@ def _fixture(
     critique_advantage_mode: str = "grpo",
     critique_prompt_weighting: str = "headroom",
     recovery_reference_mode: str = "none",
+    enable_recovery: bool = True,
     enable_positive_compression: bool = True,
 ) -> None:
     if critique_advantage_mode == "pass_at_1" and enable_positive_compression:
@@ -734,6 +772,7 @@ def _fixture(
         "critique_advantage_rms_floor": 0.10,
         "critique_advantage_clip": 5.0,
         "critique_prompt_headroom_exponent": 1.0,
+        "enable_recovery": enable_recovery,
         "enable_positive_compression": enable_positive_compression,
         "num_positive_critiques": 2,
         "positive_compression_target": 0.25,
@@ -822,7 +861,7 @@ def _fixture(
         )
 
     recovery_references: dict[tuple[str, int], str] = {}
-    if recovery_reference_mode == "successful_original":
+    if enable_recovery and recovery_reference_mode == "successful_original":
         successful_by_prompt = {
             "prompt-0": ["p:1"],
             "prompt-1": ["p:3"],
@@ -900,6 +939,8 @@ def _fixture(
     successful_recoveries = 0.0
     self_critique_rewards: list[float] = []
     for original_index, original_reward in enumerate(original_rewards):
+        if original_reward == 0.0 and not enable_recovery:
+            continue
         if original_reward == 1.0 and not enable_positive_compression:
             continue
         rollout_id = f"p:{original_index}"
@@ -1133,7 +1174,7 @@ def _fixture(
                 advantage=final_advantage,
             )
 
-    selected_original_count = 2 + (14 if enable_positive_compression else 0)
+    selected_original_count = (2 if enable_recovery else 0) + (14 if enable_positive_compression else 0)
     critique_count = selected_original_count * 2
     rows = 16 + critique_count + continuation_count
     padding = (-rows) % (nodes * 8)
@@ -1174,6 +1215,7 @@ def _fixture(
                 "originals": 16,
                 "incorrect": 2,
                 "correct": 14,
+                "recovery_enabled": enable_recovery,
                 "positive_compression_enabled": enable_positive_compression,
                 "critique_grpo_grouping": critique_grpo_grouping,
                 "critique_advantage_mode": critique_advantage_mode,
@@ -1220,7 +1262,8 @@ def _fixture(
                     "branch_revision/incorrect_originals": 2.0,
                     "branch_revision/correct_originals": 14.0,
                     "branch_revision/critiques": float(critique_count),
-                    "branch_revision/recovery_critiques": 4.0,
+                    "branch_revision/recovery_critiques": 4.0 if enable_recovery else 0.0,
+                    "branch_revision/recovery_enabled": float(enable_recovery),
                     "branch_revision/compression_critiques": 28.0 if enable_positive_compression else 0.0,
                     "branch_revision/critique_grpo_grouping_is_batch": float(critique_grpo_grouping == "batch"),
                     "branch_revision/critique_advantage_mode_is_pass_at_1": float(
@@ -1482,6 +1525,17 @@ def test_verifier_accepts_one_iteration_level_critique_grpo_group(tmp_path: Path
     result = verify(tmp_path)
     assert result["status"] == "verified"
     assert result["critique_grpo_grouping"] == "batch"
+
+
+def test_verifier_accepts_compression_only_objective_selection(tmp_path: Path) -> None:
+    _fixture(
+        tmp_path,
+        recovery_reference_mode="none",
+        enable_recovery=False,
+        enable_positive_compression=True,
+    )
+    result = verify(tmp_path)
+    assert result["status"] == "verified"
 
 
 def test_verifier_accepts_successful_original_references_with_equal_prompt_weighting(tmp_path: Path) -> None:

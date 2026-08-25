@@ -150,6 +150,7 @@ def _extra_args(
     critique_prompt_weighting: str = "equal_prompt",
     recovery_reference_mode: str = "successful_original",
     recovery_reference_selection_seed: int = 0,
+    enable_recovery: bool = True,
     enable_positive_compression: bool = True,
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
@@ -188,6 +189,12 @@ def _extra_args(
         or recovery_reference_selection_seed < 0
     ):
         raise ValueError("recovery_reference_selection_seed must be a nonnegative integer")
+    if not isinstance(enable_recovery, bool):
+        raise ValueError("enable_recovery must be boolean")
+    if not enable_recovery and not enable_positive_compression:
+        raise ValueError("recovery, positive compression, or both must be enabled")
+    if not enable_recovery and recovery_reference_mode != "none":
+        raise ValueError("recovery_reference_mode must be none when recovery is disabled")
     if critique_advantage_mode == "pass_at_1" and enable_positive_compression:
         raise ValueError("pass_at_1 critique advantages require recovery-only generation")
     if not isinstance(enable_positive_compression, bool):
@@ -218,6 +225,7 @@ def _extra_args(
         f"algorithm.branch_revision_grpo.critique_prompt_weighting={critique_prompt_weighting}",
         f"algorithm.branch_revision_grpo.recovery_reference_mode={recovery_reference_mode}",
         f"algorithm.branch_revision_grpo.recovery_reference_selection_seed={recovery_reference_selection_seed}",
+        f"algorithm.branch_revision_grpo.enable_recovery={str(enable_recovery).lower()}",
         "algorithm.branch_revision_grpo.critique_invalid_penalty=0.20",
         "algorithm.branch_revision_grpo.critique_learnability_rejection_penalty=0.05",
         "algorithm.branch_revision_grpo.critique_advantage_rms_floor=0.10",
@@ -309,6 +317,7 @@ def _extra_args(
         f"+branch_revision_smoke.critique_prompt_weighting={critique_prompt_weighting}",
         f"+branch_revision_smoke.recovery_reference_mode={recovery_reference_mode}",
         f"+branch_revision_smoke.recovery_reference_selection_seed={recovery_reference_selection_seed}",
+        f"+branch_revision_smoke.enable_recovery={str(enable_recovery).lower()}",
         f"+branch_revision_smoke.enable_positive_compression={str(enable_positive_compression).lower()}",
         f"+branch_revision_smoke.model_path={model_path}",
         f"+branch_revision_smoke.loss_mode={loss_mode}",
@@ -354,6 +363,7 @@ def build_command(
     critique_prompt_weighting: str = "equal_prompt",
     recovery_reference_mode: str = "successful_original",
     recovery_reference_selection_seed: int = 0,
+    enable_recovery: bool = True,
     enable_positive_compression: bool = True,
     seed: int = 43,
     model_path: str = MODEL_PATH,
@@ -417,6 +427,12 @@ def build_command(
         or recovery_reference_selection_seed < 0
     ):
         raise ValueError("recovery_reference_selection_seed must be a nonnegative integer")
+    if not isinstance(enable_recovery, bool):
+        raise ValueError("enable_recovery must be boolean")
+    if not enable_recovery and not enable_positive_compression:
+        raise ValueError("recovery, positive compression, or both must be enabled")
+    if not enable_recovery and recovery_reference_mode != "none":
+        raise ValueError("recovery_reference_mode must be none when recovery is disabled")
     if critique_advantage_mode == "pass_at_1" and enable_positive_compression:
         raise ValueError("pass_at_1 critique advantages require recovery-only generation")
     if not isinstance(enable_positive_compression, bool):
@@ -580,6 +596,7 @@ def build_command(
             critique_prompt_weighting=critique_prompt_weighting,
             recovery_reference_mode=recovery_reference_mode,
             recovery_reference_selection_seed=recovery_reference_selection_seed,
+            enable_recovery=enable_recovery,
             enable_positive_compression=enable_positive_compression,
             model_path=model_path,
             loss_mode=loss_mode,
@@ -643,6 +660,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
         default="successful_original",
     )
     parser.add_argument("--recovery-reference-selection-seed", type=int, default=0)
+    parser.add_argument("--disable-recovery", action="store_true")
     parser.add_argument("--disable-positive-compression", action="store_true")
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument(
@@ -745,6 +763,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
         critique_prompt_weighting=args.critique_prompt_weighting,
         recovery_reference_mode=args.recovery_reference_mode,
         recovery_reference_selection_seed=args.recovery_reference_selection_seed,
+        enable_recovery=not args.disable_recovery,
         enable_positive_compression=not args.disable_positive_compression,
         seed=args.seed,
         model_path=args.model_path,
@@ -800,6 +819,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
             critique_prompt_weighting=args.critique_prompt_weighting,
             recovery_reference_mode=args.recovery_reference_mode,
             recovery_reference_selection_seed=args.recovery_reference_selection_seed,
+            enable_recovery=not args.disable_recovery,
             enable_positive_compression=not args.disable_positive_compression,
             seed=args.seed,
             model_path=args.model_path,

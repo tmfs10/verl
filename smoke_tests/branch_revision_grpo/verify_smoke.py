@@ -335,6 +335,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
                 ):
                     raise ValueError(f"resumed smoke output omits native {role} checkpoint contents")
     num_critiques = int(branch_config["num_critiques"])
+    recovery_enabled = bool(branch_config.get("enable_recovery", True))
     positive_compression_enabled = bool(branch_config["enable_positive_compression"])
     num_positive_critiques = int(branch_config["num_positive_critiques"])
     critique_grpo_grouping = str(branch_config.get("critique_grpo_grouping", "per_original"))
@@ -349,6 +350,10 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     recovery_reference_mode = str(branch_config.get("recovery_reference_mode", "none"))
     if recovery_reference_mode not in {"none", "successful_original"}:
         raise ValueError(f"unsupported recovery reference mode in smoke evidence: {recovery_reference_mode!r}")
+    if not recovery_enabled and not positive_compression_enabled:
+        raise ValueError("smoke evidence disables both recovery and positive compression")
+    if not recovery_enabled and recovery_reference_mode != "none":
+        raise ValueError("smoke evidence uses a recovery reference while recovery is disabled")
     recovery_reference_selection_seed = int(branch_config.get("recovery_reference_selection_seed", 0))
     if recovery_reference_selection_seed < 0:
         raise ValueError("smoke evidence has a negative recovery-reference selection seed")
@@ -445,6 +450,8 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             raise ValueError(f"step {filename_step} used the wrong recovery reference seed")
         if bool(iteration_event.get("positive_compression_enabled")) != positive_compression_enabled:
             raise ValueError(f"step {filename_step} used the wrong positive-compression mode")
+        if bool(iteration_event.get("recovery_enabled", True)) != recovery_enabled:
+            raise ValueError(f"step {filename_step} used the wrong recovery mode")
         actor_batch_events = [event for event in step_events if event.get("event") == "actor_batch"]
         warmup_active = filename_step <= critique_warmup_steps
         expected_policies = (
@@ -567,7 +574,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     for rollout_ids in successful_by_prompt.values():
         rollout_ids.sort()
     incorrect_rollout_ids = {str(original["rollout_id"]) for original in originals if float(original["reward"]) == 0.0}
-    if recovery_reference_mode == "successful_original":
+    if not recovery_enabled:
+        eligible_recovery_ids = set()
+    elif recovery_reference_mode == "successful_original":
         eligible_recovery_ids = {
             str(original["rollout_id"])
             for original in originals
@@ -575,7 +584,11 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         }
     else:
         eligible_recovery_ids = set(incorrect_rollout_ids)
-    skipped_recovery_ids = incorrect_rollout_ids - eligible_recovery_ids
+    skipped_recovery_ids = (
+        incorrect_rollout_ids - eligible_recovery_ids
+        if recovery_enabled and recovery_reference_mode == "successful_original"
+        else set()
+    )
 
     recovery_reference_events = [event for event in events if event.get("event") == "recovery_reference"]
     recovery_reference_skip_events = [event for event in events if event.get("event") == "recovery_reference_skip"]
@@ -1467,6 +1480,8 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         ),
         "branch_revision/critique_grpo_group_size_max": float(max(critique_groups.values(), default=0)),
     }
+    if "enable_recovery" in branch_config:
+        required_metrics["branch_revision/recovery_enabled"] = float(recovery_enabled)
     if audit_schema_version >= 6:
         required_metrics.update(
             {
@@ -1556,7 +1571,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         for event in continuations
         if event.get("objective") == "compression"
     )
-    if require_algorithm_signal and successful_recoveries <= 0.0:
+    if require_algorithm_signal and recovery_enabled and successful_recoveries <= 0.0:
         raise ValueError("smoke has no successful recovery continuation")
     if require_algorithm_signal and positive_compression_enabled and successful_compressions <= 0.0:
         raise ValueError("smoke has no successful positive-rollout compression")

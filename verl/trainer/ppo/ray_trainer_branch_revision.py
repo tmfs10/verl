@@ -219,17 +219,23 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
             template_kwargs = raw_template_kwargs
         if template_kwargs is not None and not isinstance(template_kwargs, dict):
             raise ValueError("branch-revision training chat-template kwargs must be a mapping or null")
-        instructions = [
-            (
-                "recovery",
+        instructions = []
+        if feature.enable_recovery:
+            instructions.append(
                 (
-                    feature.successful_reference_critique_prompt.replace("{successful_rollout}", "")
-                    if feature.recovery_reference_mode == "successful_original"
-                    else feature.critique_prompt
-                ),
-                int(config.data.max_response_length) if feature.recovery_reference_mode == "successful_original" else 0,
+                    "recovery",
+                    (
+                        feature.successful_reference_critique_prompt.replace("{successful_rollout}", "")
+                        if feature.recovery_reference_mode == "successful_original"
+                        else feature.critique_prompt
+                    ),
+                    (
+                        int(config.data.max_response_length)
+                        if feature.recovery_reference_mode == "successful_original"
+                        else 0
+                    ),
+                )
             )
-        ]
         if feature.enable_positive_compression:
             instructions.append(("compression", feature.positive_critique_prompt, 0))
         critique_cap = int(feature.critique_max_response_length or config.data.max_response_length)
@@ -488,7 +494,7 @@ class BranchRevisionGRPOController:
             )
 
     def _assign_recovery_references(self, bundles: list[_Bundle]) -> None:
-        if self.feature.recovery_reference_mode == "none":
+        if not self.feature.enable_recovery or self.feature.recovery_reference_mode == "none":
             return
         successes_by_prompt: defaultdict[str, list[_Bundle]] = defaultdict(list)
         for bundle in bundles:
@@ -543,6 +549,8 @@ class BranchRevisionGRPOController:
     def _bundle_needs_critiques(self, bundle: _Bundle) -> bool:
         if bundle.original_reward == 1.0:
             return self.feature.enable_positive_compression
+        if not self.feature.enable_recovery:
+            return False
         if self.feature.recovery_reference_mode == "none":
             return True
         if bundle.recovery_references and len(bundle.recovery_references) != self.feature.num_critiques:
@@ -2019,6 +2027,7 @@ class BranchRevisionGRPOController:
             ),
             "branch_revision/critique_warmup_active": float(self._critique_warmup_active()),
             "branch_revision/separate_critique_model": float(self.feature.separate_critique_model),
+            "branch_revision/recovery_enabled": float(self.feature.enable_recovery),
             "branch_revision/recovery_reference_mode_is_successful_original": float(
                 self.feature.recovery_reference_mode == "successful_original"
             ),
@@ -2256,6 +2265,7 @@ class BranchRevisionGRPOController:
             originals=len(bundles),
             incorrect=sum(bundle.original_reward == 0.0 for bundle in bundles),
             correct=sum(bundle.original_reward == 1.0 for bundle in bundles),
+            recovery_enabled=self.feature.enable_recovery,
             positive_compression_enabled=self.feature.enable_positive_compression,
             critique_grpo_grouping=self.feature.critique_grpo_grouping,
             critique_advantage_mode=self.feature.critique_advantage_mode,
