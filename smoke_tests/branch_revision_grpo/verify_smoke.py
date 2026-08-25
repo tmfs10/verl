@@ -1390,7 +1390,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         _require_binary(row["reward"], "continuation actor reward") for row in continuation_actor_rows
     )
     continuation_audit_rewards = sorted(float(event["reward"]) for event in continuations)
-    if continuation_actor_rewards != continuation_audit_rewards:
+    if selected_warmup and (original_actor_rows or continuation_actor_rows):
+        raise ValueError("critique warmup must exclude original and continuation rows from actor optimization")
+    if not selected_warmup and continuation_actor_rewards != continuation_audit_rewards:
         raise ValueError("revised solution actor rows must use their binary continuation outcomes")
     critique_actor_rewards = sorted(_float32_values(row["reward"] for row in critique_actor_rows))
     critique_audit_rewards = sorted(_float32_values(event["reward"] for event in critiques))
@@ -1399,8 +1401,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     original_solution_groups = Counter(str(row["group_id"]) for row in original_actor_rows)
     rollout_n = int(resolved_config["actor_rollout_ref"]["rollout"]["n"])
     expected_prompt_groups = expected_originals // rollout_n
-    if len(original_solution_groups) != expected_prompt_groups or any(
-        count != rollout_n for count in original_solution_groups.values()
+    if not selected_warmup and (
+        len(original_solution_groups) != expected_prompt_groups
+        or any(count != rollout_n for count in original_solution_groups.values())
     ):
         raise ValueError(
             f"original solution GRPO groups must contain {rollout_n} rollouts per prompt: {original_solution_groups!r}"
@@ -1414,14 +1417,18 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         )
     ):
         raise ValueError("smoke has no nonuniform original-solution GRPO reward group")
-    recomputed_prompt_pass_at_1: dict[str, float] = {}
-    for group_id in original_solution_groups:
-        prompt_group_id = group_id.removeprefix("solution:")
-        group_rewards = [float(row["reward"]) for row in original_actor_rows if str(row["group_id"]) == group_id]
-        recomputed_prompt_pass_at_1[prompt_group_id] = sum(group_rewards) / len(group_rewards)
+    source_rewards_by_prompt: defaultdict[str, list[float]] = defaultdict(list)
+    for original in originals:
+        source_rewards_by_prompt[str(original["prompt_group_id"])].append(float(original["reward"]))
+    recomputed_prompt_pass_at_1 = {
+        prompt_group_id: sum(group_rewards) / len(group_rewards)
+        for prompt_group_id, group_rewards in source_rewards_by_prompt.items()
+    }
     if recomputed_prompt_pass_at_1 != audited_prompt_pass_at_1:
         raise ValueError("audited prompt pass@1 values do not match original solution outcomes")
-    if any(str(row["group_id"]) not in original_solution_groups for row in continuation_actor_rows):
+    if not selected_warmup and any(
+        str(row["group_id"]) not in original_solution_groups for row in continuation_actor_rows
+    ):
         raise ValueError("revised solutions must join their original prompt's solution GRPO group")
     critique_groups = Counter(str(row["group_id"]) for row in critique_actor_rows)
     if critique_grpo_grouping == "batch":
