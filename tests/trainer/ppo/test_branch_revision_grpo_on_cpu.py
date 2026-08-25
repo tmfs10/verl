@@ -979,6 +979,40 @@ def test_runtime_config_allows_prompt_logprob_admission_to_be_disabled() -> None
     assert config.actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens is None
 
 
+def test_runtime_config_accepts_one_original_only_for_an_entirely_critique_only_warmup() -> None:
+    config = _runtime_config()
+    config.actor_rollout_ref.rollout.n = 1
+    config.algorithm.branch_revision_grpo.separate_critique_model = True
+    config.algorithm.branch_revision_grpo.critique_warmup_steps = 200
+    config.trainer.total_training_steps = 200
+
+    validate_branch_revision_runtime_config(config)
+
+
+@pytest.mark.parametrize(
+    ("separate_critique_model", "critique_warmup_steps", "total_training_steps"),
+    [
+        (False, 200, 200),
+        (True, 0, 200),
+        (True, 199, 200),
+        (True, 200, None),
+        (True, 200, True),
+        (True, 200, 0),
+    ],
+)
+def test_runtime_config_rejects_one_original_when_actor_training_can_occur(
+    separate_critique_model, critique_warmup_steps, total_training_steps
+) -> None:
+    config = _runtime_config()
+    config.actor_rollout_ref.rollout.n = 1
+    config.algorithm.branch_revision_grpo.separate_critique_model = separate_critique_model
+    config.algorithm.branch_revision_grpo.critique_warmup_steps = critique_warmup_steps
+    config.trainer.total_training_steps = total_training_steps
+
+    with pytest.raises(ValueError, match="post-warmup solution GRPO requires rollout.n>=2"):
+        validate_branch_revision_runtime_config(config)
+
+
 @pytest.mark.parametrize("statistic", ["mean", "min"])
 def test_branch_revision_config_accepts_both_learnability_statistics(statistic) -> None:
     feature = BranchRevisionGRPOConfig(learnability_logprob_statistic=statistic)
@@ -1072,7 +1106,7 @@ def test_branch_revision_config_rejects_invalid_learnability_thresholds(kwargs, 
     [
         ("algorithm.intermediate_mc_value.enable", True, "mutually exclusive"),
         ("algorithm.adv_estimator", "gae", "adv_estimator=grpo"),
-        ("actor_rollout_ref.rollout.n", 1, "rollout.n>=2"),
+        ("actor_rollout_ref.rollout.n", 0, "positive integer"),
         ("actor_rollout_ref.actor.policy_loss.loss_mode", "gpg", "dppo_tv and vanilla"),
         ("actor_rollout_ref.rollout.temperature", 0.9, "temperature=1.0"),
         ("actor_rollout_ref.rollout.top_p", 0.9, "top_p=1"),

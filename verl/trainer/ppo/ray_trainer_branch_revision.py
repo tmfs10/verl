@@ -121,8 +121,23 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
     if str(config.algorithm.adv_estimator).lower() != "grpo":
         raise ValueError("branch-revision GRPO requires algorithm.adv_estimator=grpo")
     rollout_n = config.actor_rollout_ref.rollout.n
-    if isinstance(rollout_n, bool) or not isinstance(rollout_n, int) or rollout_n < 2:
-        raise ValueError("branch-revision solution GRPO requires actor_rollout_ref.rollout.n>=2")
+    if isinstance(rollout_n, bool) or not isinstance(rollout_n, int) or rollout_n < 1:
+        raise ValueError("branch-revision GRPO requires actor_rollout_ref.rollout.n to be a positive integer")
+    if rollout_n == 1:
+        total_training_steps = config.trainer.get("total_training_steps", None)
+        singleton_warmup_only = (
+            feature.separate_critique_model
+            and isinstance(total_training_steps, int)
+            and not isinstance(total_training_steps, bool)
+            and total_training_steps > 0
+            and total_training_steps <= feature.critique_warmup_steps
+        )
+        if not singleton_warmup_only:
+            raise ValueError(
+                "branch-revision actor_rollout_ref.rollout.n=1 is supported only for a separate critique model "
+                "when trainer.total_training_steps is positive and does not exceed critique_warmup_steps; "
+                "post-warmup solution GRPO requires rollout.n>=2"
+            )
     loss_mode = str(config.actor_rollout_ref.actor.policy_loss.loss_mode)
     if loss_mode not in {"dppo_tv", "vanilla"}:
         raise ValueError("branch-revision GRPO supports policy loss modes dppo_tv and vanilla")
