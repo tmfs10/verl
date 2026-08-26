@@ -122,6 +122,32 @@ def test_rendered_cw_dfw_smoke_preserves_algorithm_contract_and_cluster_policy(t
     assert "trainer.nnodes=1" in rendered
 
 
+def test_rendered_cw_dfw_smoke_accepts_counterfactual_uplift_for_recovery_and_mixed(tmp_path: Path) -> None:
+    for enable_positive_compression in (False, True):
+        command, _ = build_command(
+            profile=CW_DFW_PROFILE,
+            run_tag=f"counterfactual-{enable_positive_compression}",
+            dry_run=True,
+            python=Path("/python"),
+            launcher=Path("/launcher"),
+            verl_root=Path("/verl"),
+            reward_file=Path("/reward.py"),
+            config_dir=tmp_path,
+            critique_advantage_mode="counterfactual_uplift",
+            enable_recovery=True,
+            enable_positive_compression=enable_positive_compression,
+            model_path="/hf_models/Qwen/Qwen3-4B",
+            nodes=2,
+            separate_critique_model=True,
+        )
+        rendered = " ".join(command)
+        assert "algorithm.branch_revision_grpo.critique_advantage_mode=counterfactual_uplift" in rendered
+        assert (
+            f"algorithm.branch_revision_grpo.enable_positive_compression={str(enable_positive_compression).lower()}"
+            in (rendered)
+        )
+
+
 def test_cw_dfw_execution_config_preserves_authoritative_container(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -294,8 +294,11 @@ class BranchRevisionGRPOConfig(BaseConfig):
                 raise ValueError(f"algorithm.branch_revision_grpo.{name} must be a positive integer")
         if self.critique_grpo_grouping not in {"per_original", "batch"}:
             raise ValueError("algorithm.branch_revision_grpo.critique_grpo_grouping must be per_original or batch")
-        if self.critique_advantage_mode not in {"grpo", "pass_at_1"}:
-            raise ValueError("algorithm.branch_revision_grpo.critique_advantage_mode must be grpo or pass_at_1")
+        if self.critique_advantage_mode not in {"grpo", "pass_at_1", "counterfactual_uplift"}:
+            raise ValueError(
+                "algorithm.branch_revision_grpo.critique_advantage_mode must be grpo, pass_at_1, "
+                "or counterfactual_uplift"
+            )
         if self.critique_prompt_weighting not in {"equal_prompt", "headroom"}:
             raise ValueError(
                 "algorithm.branch_revision_grpo.critique_prompt_weighting must be equal_prompt or headroom"
@@ -357,6 +360,10 @@ class BranchRevisionGRPOConfig(BaseConfig):
         if self.critique_advantage_mode == "pass_at_1" and self.enable_positive_compression:
             raise ValueError(
                 "algorithm.branch_revision_grpo.critique_advantage_mode=pass_at_1 currently supports recovery only"
+            )
+        if self.critique_advantage_mode == "counterfactual_uplift" and not self.enable_recovery:
+            raise ValueError(
+                "algorithm.branch_revision_grpo.critique_advantage_mode=counterfactual_uplift requires recovery"
             )
         if self.critique_max_response_length is not None and (
             not isinstance(self.critique_max_response_length, int)

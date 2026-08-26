@@ -212,7 +212,8 @@ algorithm:
     # in the complete synchronous training iteration. This is never scoped to an optimizer microbatch or rank.
     critique_grpo_grouping: per_original
 
-    # Critique advantage estimator: centered GRPO or an external pass@1 baseline without recentering.
+    # Critique advantage estimator: centered GRPO, an external pass@1 baseline without recentering,
+    # or paired counterfactual uplift max(0, diagnostic_success - direct_control_success).
     critique_advantage_mode: grpo
 
     # Distribute external critique weight equally across eligible prompts, or by remaining pass@1 headroom.

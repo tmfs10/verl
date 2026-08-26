@@ -225,8 +225,10 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("branch-revision smoke resume_mode must be disable or resume_path")
     if smoke_contract["critique_grpo_grouping"] not in {"per_original", "batch"}:
         raise ValueError("branch-revision smoke critique_grpo_grouping must be per_original or batch")
-    if smoke_contract["critique_advantage_mode"] not in {"grpo", "pass_at_1"}:
-        raise ValueError("branch-revision smoke critique_advantage_mode must be grpo or pass_at_1")
+    if smoke_contract["critique_advantage_mode"] not in {"grpo", "pass_at_1", "counterfactual_uplift"}:
+        raise ValueError(
+            "branch-revision smoke critique_advantage_mode must be grpo, pass_at_1, or counterfactual_uplift"
+        )
     if smoke_contract["critique_prompt_weighting"] not in {"equal_prompt", "headroom"}:
         raise ValueError("branch-revision smoke critique_prompt_weighting must be equal_prompt or headroom")
     if smoke_contract["recovery_reference_mode"] not in {"none", "successful_original"}:
@@ -242,6 +244,8 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("branch-revision smoke must use recovery_reference_mode=none when recovery is disabled")
     if smoke_contract["critique_advantage_mode"] == "pass_at_1" and smoke_contract["enable_positive_compression"]:
         raise ValueError("branch-revision pass_at_1 smoke must disable positive compression")
+    if smoke_contract["critique_advantage_mode"] == "counterfactual_uplift" and not smoke_contract["enable_recovery"]:
+        raise ValueError("branch-revision counterfactual_uplift smoke requires recovery")
     if not isinstance(smoke_contract["enable_positive_compression"], bool):
         raise ValueError("branch-revision smoke enable_positive_compression must be boolean")
     critique_warmup_steps = smoke_contract["critique_warmup_steps"]

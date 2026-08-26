@@ -32,8 +32,10 @@ from verl.experimental.agent_loop.branch_revision_agent_loop import (
     BRANCH_REVISION_CHILD_FIELD,
     BRANCH_REVISION_CONTINUATION_FIELD,
     BRANCH_REVISION_SCORE_FIELD,
+    COUNTERFACTUAL_PREFILL_TEXT,
     BranchRevisionAgentLoop,
     BranchRevisionContinuationGeneration,
+    BranchRevisionCounterfactualGeneration,
     BranchRevisionCritiqueGeneration,
     BranchRevisionGenerationRecord,
     BranchRevisionScoreGeneration,
@@ -1079,6 +1081,28 @@ def test_branch_revision_config_rejects_recovery_reference_when_recovery_is_disa
         )
 
 
+def test_counterfactual_uplift_accepts_recovery_only_and_mixed_objectives() -> None:
+    recovery = BranchRevisionGRPOConfig(
+        critique_advantage_mode="counterfactual_uplift",
+        enable_positive_compression=False,
+    )
+    mixed = BranchRevisionGRPOConfig(
+        critique_advantage_mode="counterfactual_uplift",
+        enable_positive_compression=True,
+    )
+    assert recovery.critique_advantage_mode == "counterfactual_uplift"
+    assert mixed.enable_recovery and mixed.enable_positive_compression
+
+
+def test_counterfactual_uplift_rejects_compression_without_recovery() -> None:
+    with pytest.raises(ValueError, match="requires recovery"):
+        BranchRevisionGRPOConfig(
+            critique_advantage_mode="counterfactual_uplift",
+            enable_recovery=False,
+            enable_positive_compression=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -1380,6 +1404,53 @@ def test_agent_loop_generates_and_parses_all_critiques_without_launching_scores_
     assert record.critiques[0].new_continuation_log_probs == ()
     assert record.critiques[1].continuation_ids == ()
     assert [call[0] for call in calls] == ["critique[0]", "critique[1]"]
+
+
+def test_agent_loop_pairs_each_recovery_critique_with_an_exact_no_diagnosis_control() -> None:
+    loop = _loop()
+    loop.feature = replace(loop.feature, critique_advantage_mode="counterfactual_uplift")
+    calls: list[str] = []
+
+    async def fake_generate(_route, prompt, _params, *, max_tokens, kind, prompt_logprob_start=None):
+        del max_tokens
+        assert prompt_logprob_start is None
+        calls.append(kind)
+        if kind == "critique[0]":
+            text = _structured("dead", "better")
+        elif kind == "critique[1]":
+            text = "invalid diagnostic"
+        else:
+            assert kind.startswith("counterfactual")
+            assert decode_exact(prompt[-len(_ids(COUNTERFACTUAL_PREFILL_TEXT)) :], TOKENIZER) == (
+                COUNTERFACTUAL_PREFILL_TEXT
+            )
+            text = "dead</prefix>\n<prefix + new continuation>deadbetter</prefix + new continuation>"
+        return TokenOutput(token_ids=_ids(text), log_probs=[-0.2] * len(_ids(text)))
+
+    loop._generate = fake_generate
+    solution_ids = _ids("start dead and waste")
+    output = asyncio.run(
+        loop.run(
+            {},
+            branch_revision_rollout_id="p:0",
+            branch_revision_parent_objective="recovery",
+            branch_revision_num_critiques=2,
+            branch_revision_parent_prompt_ids=_ids("q"),
+            branch_revision_parent_solution_ids=solution_ids,
+            branch_revision_parent_solution_log_probs=[-0.1] * len(solution_ids),
+            raw_prompt=[{"role": "user", "content": "q"}],
+        )
+    )
+    record = output.extra_fields[BRANCH_REVISION_CHILD_FIELD]
+    assert [critique.parse_reason for critique in record.critiques] == ["valid", "tag_count"]
+    assert [critique.counterfactual.parse_reason for critique in record.critiques] == ["valid", "valid"]
+    for critique in record.critiques:
+        assert critique.counterfactual is not None
+        assert list(critique.counterfactual.prompt_ids) == [
+            *critique.critique_prompt_ids,
+            *_ids(COUNTERFACTUAL_PREFILL_TEXT),
+        ]
+    assert calls == ["critique[0]", "critique[1]", "counterfactual[0]", "counterfactual[1]"]
 
 
 def test_agent_loop_scores_only_the_replacement_slice_then_generates_suffix_without_prompt_logprobs() -> None:
@@ -1869,6 +1940,49 @@ def _critique(text: str, *, valid: bool, continuation: str = "") -> BranchRevisi
     )
 
 
+def _control(*, valid: bool, continuation: str = "") -> BranchRevisionCounterfactualGeneration:
+    generated = _ids("dead</prefix>\n<prefix + new continuation>deadbetter</prefix + new continuation>")
+    if not valid:
+        return BranchRevisionCounterfactualGeneration(
+            prompt_ids=tuple(_ids("critique prompt" + COUNTERFACTUAL_PREFILL_TEXT)),
+            prefill_ids=tuple(_ids(COUNTERFACTUAL_PREFILL_TEXT)),
+            generated_token_ids=tuple(_ids("invalid")),
+            generated_log_probs=tuple([-0.2] * len(_ids("invalid"))),
+            finish_reason="stop",
+            parse_reason="tag_count",
+            prefix_text="",
+            prefix_plus_new_continuation_text="",
+            new_continuation_text="",
+            branch_prefix_ids=(),
+            prefix_ids=(),
+            continuation_prefix_ids=(),
+            new_continuation_ids=(),
+            new_continuation_log_probs=(),
+            revised_prefix_ids=(),
+        )
+    return BranchRevisionCounterfactualGeneration(
+        prompt_ids=tuple(_ids("critique prompt" + COUNTERFACTUAL_PREFILL_TEXT)),
+        prefill_ids=tuple(_ids(COUNTERFACTUAL_PREFILL_TEXT)),
+        generated_token_ids=tuple(generated),
+        generated_log_probs=tuple([-0.2] * len(generated)),
+        finish_reason="stop",
+        parse_reason="valid",
+        prefix_text="dead",
+        prefix_plus_new_continuation_text="deadbetter",
+        new_continuation_text="better",
+        branch_prefix_ids=tuple(_ids("start ")),
+        prefix_ids=tuple(_ids("dead")),
+        continuation_prefix_ids=tuple(_ids("start dead")),
+        new_continuation_ids=tuple(_ids("better")),
+        new_continuation_log_probs=tuple([-0.05] * len(_ids("better"))),
+        revised_prefix_ids=tuple(_ids("start deadbetter")),
+        continuation_ids=tuple(_ids(continuation)),
+        continuation_log_probs=tuple([-0.3] * len(_ids(continuation))),
+        continuation_finish_reason="stop",
+        continuation_max_tokens=128,
+    )
+
+
 def _admission_evidence(bundle: _Bundle, critique: BranchRevisionCritiqueGeneration) -> dict[str, object]:
     prompt_tokens = len(bundle.prompt_ids) + len(critique.continuation_prefix_ids) + len(critique.new_continuation_ids)
     return {
@@ -2047,6 +2161,81 @@ def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revis
     assert actor_batch.batch["advantages"][original_rows[0]].min().item() < 0
     assert actor_batch.batch["advantages"][original_rows[1]].max().item() > 0
     assert actor_batch.meta_info["use_global_loss_normalization"] is True
+
+
+@pytest.mark.parametrize(
+    ("diagnostic_outcome", "control_outcome", "expected_reward"),
+    [(0.0, 0.0, 0.0), (0.0, 1.0, 0.0), (1.0, 0.0, 1.0), (1.0, 1.0, 0.0)],
+)
+def test_counterfactual_uplift_reward_uses_positive_paired_difference_only(
+    diagnostic_outcome, control_outcome, expected_reward
+) -> None:
+    controller = _controller()
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        critique_advantage_mode="counterfactual_uplift",
+        enable_positive_compression=False,
+        num_critiques=2,
+    )
+    critique = replace(
+        _critique(_structured("dead", "better"), valid=True, continuation=" solved"),
+        counterfactual=_control(valid=True, continuation=" controlled"),
+    )
+    bundle = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord(
+            "p:0",
+            "recovery",
+            (critique, replace(critique, token_ids=tuple(_ids("second")), log_probs=tuple([-0.2] * 6))),
+            tuple(_ids("critique prompt")),
+        ),
+        learnability={0: _learnability(), 1: _learnability()},
+        counterfactual_learnability={0: _learnability(), 1: _learnability()},
+        continuation_rewards={0: diagnostic_outcome, 1: 0.0},
+        counterfactual_continuation_rewards={0: control_outcome, 1: 0.0},
+    )
+    rows = controller._actor_rows([bundle])
+    critique_rows = [row for row in rows if row.kind == "critique"]
+    assert critique_rows[0].reward == expected_reward
+    assert len(critique_rows) == 2
+    assert len([row for row in rows if row.kind == "continuation"]) == 2
+    assert all("control" not in row.audit_row_id for row in rows)
+
+
+def test_counterfactual_mode_leaves_mixed_compression_reward_unchanged_and_has_no_control_row() -> None:
+    controller = _controller()
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        critique_advantage_mode="counterfactual_uplift",
+        enable_positive_compression=True,
+        num_critiques=2,
+        num_positive_critiques=2,
+    )
+    critique = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    bundle = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("correct but verbose"),
+        solution_log_probs=[-0.1] * len(_ids("correct but verbose")),
+        original_reward=1.0,
+        record=BranchRevisionGenerationRecord(
+            "p:0", "compression", (critique, critique), tuple(_ids("critique prompt"))
+        ),
+        learnability={0: _learnability(), 1: _learnability()},
+        continuation_rewards={0: 1.0, 1: 1.0},
+        compression_credits={0: 0.5, 1: 0.25},
+    )
+    critique_rows = [row for row in controller._actor_rows([bundle]) if row.kind == "critique"]
+    assert [row.reward for row in critique_rows] == [0.5, 0.25]
+    assert all(critique.counterfactual is None for critique in bundle.record.critiques)
 
 
 @pytest.mark.parametrize(
@@ -2647,6 +2836,91 @@ def test_child_request_can_select_compression_only() -> None:
     assert len(request) == 1
     assert request.non_tensor_batch["branch_revision_parent_objective"].tolist() == ["compression"]
     assert request.non_tensor_batch["branch_revision_num_critiques"].tolist() == [8]
+
+
+def test_counterfactual_score_and_continuation_stages_keep_paired_candidates_distinct() -> None:
+    controller = _controller()
+    controller.feature = replace(
+        controller.feature,
+        critique_advantage_mode="counterfactual_uplift",
+        enable_positive_compression=False,
+    )
+    source, _ = _source_batch()
+    control = replace(_control(valid=True), new_continuation_log_probs=())
+    diagnostic = replace(
+        _critique(_structured("dead", "better"), valid=True),
+        new_continuation_log_probs=(),
+        counterfactual=control,
+    )
+    bundle = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord(
+            "p:0", "recovery", (diagnostic, _critique("invalid", valid=False)), tuple(_ids("prompt"))
+        ),
+    )
+    score_request = controller._make_score_request(source, [bundle])
+    assert score_request.non_tensor_batch["branch_revision_candidate_kind"].tolist() == [
+        "diagnostic",
+        "control",
+    ]
+    diagnostic_score = BranchRevisionScoreGeneration(
+        rollout_id="p:0",
+        critique_index=0,
+        prompt_logprob_start=len(bundle.prompt_ids) + len(diagnostic.continuation_prefix_ids),
+        scored_token_ids=diagnostic.new_continuation_ids,
+        scored_token_log_probs=tuple([-0.1] * len(diagnostic.new_continuation_ids)),
+        admission=None,
+        candidate_kind="diagnostic",
+    )
+    control_score = replace(
+        diagnostic_score,
+        prompt_logprob_start=len(bundle.prompt_ids) + len(control.continuation_prefix_ids),
+        scored_token_ids=control.new_continuation_ids,
+        scored_token_log_probs=tuple([-0.2] * len(control.new_continuation_ids)),
+        candidate_kind="control",
+    )
+    controller._attach_scores(
+        [bundle],
+        {("p:0", 0, "diagnostic"): diagnostic_score, ("p:0", 0, "control"): control_score},
+    )
+    assert bundle.record.critiques[0].new_continuation_log_probs == diagnostic_score.scored_token_log_probs
+    assert bundle.record.critiques[0].counterfactual.new_continuation_log_probs == control_score.scored_token_log_probs
+
+    bundle.learnability[0] = _learnability()
+    bundle.counterfactual_learnability[0] = _learnability()
+    continuation_request = controller._make_continuation_request(source, [bundle])
+    assert continuation_request.non_tensor_batch["branch_revision_candidate_kind"].tolist() == [
+        "diagnostic",
+        "control",
+    ]
+    diagnostic_suffix = BranchRevisionContinuationGeneration(
+        rollout_id="p:0",
+        critique_index=0,
+        token_ids=tuple(_ids(" diagnostic")),
+        log_probs=tuple([-0.3] * len(_ids(" diagnostic"))),
+        finish_reason="stop",
+        max_tokens=diagnostic.continuation_max_tokens,
+        candidate_kind="diagnostic",
+    )
+    control_suffix = replace(
+        diagnostic_suffix,
+        token_ids=tuple(_ids(" control")),
+        log_probs=tuple([-0.4] * len(_ids(" control"))),
+        max_tokens=control.continuation_max_tokens,
+        candidate_kind="control",
+    )
+    controller._attach_continuations(
+        [bundle],
+        {("p:0", 0, "diagnostic"): diagnostic_suffix, ("p:0", 0, "control"): control_suffix},
+    )
+    assert bundle.record.critiques[0].continuation_ids == diagnostic_suffix.token_ids
+    assert bundle.record.critiques[0].counterfactual.continuation_ids == control_suffix.token_ids
 
 
 def test_successful_original_mode_reuses_a_same_prompt_success_and_skips_all_failure_prompts() -> None:

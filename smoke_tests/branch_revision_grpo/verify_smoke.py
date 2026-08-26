@@ -27,8 +27,9 @@ from typing import Any
 
 import numpy as np
 
-_AUDIT_SCHEMA_VERSION = 6
-_SUPPORTED_AUDIT_SCHEMA_VERSIONS = {2, 3, 4, 5, _AUDIT_SCHEMA_VERSION}
+_AUDIT_SCHEMA_VERSION = 7
+_SUPPORTED_AUDIT_SCHEMA_VERSIONS = {2, 3, 4, 5, 6, _AUDIT_SCHEMA_VERSION}
+_COUNTERFACTUAL_PREFILL_TEXT = "<think>\n\n</think>\n\n<prefix>"
 
 
 def _read_json(path: Path) -> Any:
@@ -342,7 +343,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     if critique_grpo_grouping not in {"per_original", "batch"}:
         raise ValueError(f"unsupported critique GRPO grouping in smoke evidence: {critique_grpo_grouping!r}")
     critique_advantage_mode = str(branch_config.get("critique_advantage_mode", "grpo"))
-    if critique_advantage_mode not in {"grpo", "pass_at_1"}:
+    if critique_advantage_mode not in {"grpo", "pass_at_1", "counterfactual_uplift"}:
         raise ValueError(f"unsupported critique advantage mode in smoke evidence: {critique_advantage_mode!r}")
     critique_prompt_weighting = str(branch_config.get("critique_prompt_weighting", "headroom"))
     if critique_prompt_weighting not in {"equal_prompt", "headroom"}:
@@ -364,6 +365,8 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     critique_headroom_exponent = float(branch_config.get("critique_prompt_headroom_exponent", 1.0))
     if critique_advantage_mode == "pass_at_1" and positive_compression_enabled:
         raise ValueError("pass_at_1 critique advantages currently support recovery-only smoke evidence")
+    if critique_advantage_mode == "counterfactual_uplift" and not recovery_enabled:
+        raise ValueError("counterfactual uplift smoke evidence requires recovery")
     min_continuation_tokens = int(branch_config["min_continuation_tokens"])
     statistic = str(branch_config["learnability_logprob_statistic"])
     if statistic not in {"mean", "min"}:
@@ -642,7 +645,13 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError("reference-free recovery unexpectedly emitted successful-reference evidence")
 
     critiques = [event for event in events if event.get("event") == "critique"]
-    continuations = [event for event in events if event.get("event") == "continuation"]
+    all_continuations = [event for event in events if event.get("event") == "continuation"]
+    continuations = [
+        event for event in all_continuations if str(event.get("candidate_kind", "diagnostic")) == "diagnostic"
+    ]
+    control_continuations = [
+        event for event in all_continuations if str(event.get("candidate_kind", "diagnostic")) == "control"
+    ]
     reference_events = [event for event in events if event.get("event") == "learnability_reference"]
     learnability_events = [event for event in events if event.get("event") == "learnability"]
     critique_advantage_events = [event for event in events if event.get("event") == "critique_advantage"]
@@ -658,6 +667,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     critique_by_key: dict[tuple[str, int], dict[str, Any]] = {}
     structurally_valid_keys: set[tuple[str, int]] = set()
     accepted_keys: set[tuple[str, int]] = set()
+    counterfactual_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    control_structurally_valid_keys: set[tuple[str, int]] = set()
+    control_accepted_keys: set[tuple[str, int]] = set()
     per_rollout: defaultdict[str, set[int]] = defaultdict(set)
     rollout_objectives: dict[str, str] = {}
     critique_prompts: defaultdict[str, set[tuple[int, ...]]] = defaultdict(set)
@@ -708,6 +720,76 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         elif critique.get("reference_rollout_id") is not None or critique.get("reference_solution_ids"):
             raise ValueError(f"reference-free critique {key!r} retained successful-reference evidence")
         outcome = _require_binary(critique["continuation_outcome"], "critique continuation outcome")
+        control = critique.get("counterfactual")
+        if critique_advantage_mode == "counterfactual_uplift" and objective == "recovery":
+            if not isinstance(control, dict):
+                raise ValueError(f"recovery critique {key!r} omitted its paired counterfactual control")
+            counterfactual_by_key[key] = control
+            prefill_ids = [int(token) for token in control.get("prefill_ids", ())]
+            control_prompt_ids = [int(token) for token in control.get("prompt_ids", ())]
+            control_generated_ids = [int(token) for token in control.get("generated_token_ids", ())]
+            control_generated_log_probs = _float32_values(control.get("generated_log_probs", ()))
+            if (
+                control.get("prefill_text") != _COUNTERFACTUAL_PREFILL_TEXT
+                or not prefill_ids
+                or control_prompt_ids != [*critique_prompt_ids, *prefill_ids]
+                or not control_generated_ids
+                or len(control_generated_ids) != len(control_generated_log_probs)
+            ):
+                raise ValueError(f"counterfactual control {key!r} did not use the exact paired prefill path")
+            control_outcome = _require_binary(control.get("outcome"), "counterfactual continuation outcome")
+            if not math.isclose(
+                control_outcome,
+                _require_binary(critique.get("counterfactual_outcome"), "critique counterfactual outcome"),
+                abs_tol=1e-12,
+            ):
+                raise ValueError(f"counterfactual outcome for {key!r} differs across paired evidence")
+            control_accepted = bool(control.get("learnability_accepted"))
+            control_parse_reason = str(control.get("parse_reason"))
+            if control_parse_reason == "valid":
+                control_structurally_valid_keys.add(key)
+                if control_accepted:
+                    control_accepted_keys.add(key)
+                control_branch_prefix = [int(token) for token in control.get("branch_prefix_ids", ())]
+                control_prefix_ids = [int(token) for token in control.get("prefix_ids", ())]
+                control_continuation_prefix = [int(token) for token in control.get("continuation_prefix_ids", ())]
+                control_replacement_ids = [int(token) for token in control.get("new_continuation_ids", ())]
+                control_replacement_log_probs = _float32_values(control.get("new_continuation_log_probs", ()))
+                control_revised_prefix = [int(token) for token in control.get("revised_prefix_ids", ())]
+                if (
+                    not control_prefix_ids
+                    or not control_replacement_ids
+                    or control_continuation_prefix != [*control_branch_prefix, *control_prefix_ids]
+                    or control_revised_prefix != [*control_continuation_prefix, *control_replacement_ids]
+                    or len(control_replacement_ids) != len(control_replacement_log_probs)
+                ):
+                    raise ValueError(f"valid counterfactual control {key!r} has inconsistent edit boundaries")
+                generated_suffix_ids = [int(token) for token in control.get("generated_continuation_ids", ())]
+                generated_suffix_log_probs = _float32_values(control.get("generated_continuation_log_probs", ()))
+                if control_accepted:
+                    if not generated_suffix_ids or len(generated_suffix_ids) != len(generated_suffix_log_probs):
+                        raise ValueError(f"accepted counterfactual control {key!r} lacks its generated suffix")
+                elif generated_suffix_ids or generated_suffix_log_probs:
+                    raise ValueError(f"rejected counterfactual control {key!r} unexpectedly generated a suffix")
+                if bool(control.get("continuation_reward_evaluated")) != control_accepted:
+                    raise ValueError(f"counterfactual control {key!r} reward flag differs from acceptance")
+            else:
+                forbidden = (
+                    "branch_prefix_ids",
+                    "prefix_ids",
+                    "continuation_prefix_ids",
+                    "new_continuation_ids",
+                    "new_continuation_log_probs",
+                    "revised_prefix_ids",
+                    "generated_continuation_ids",
+                    "generated_continuation_log_probs",
+                )
+                if any(control.get(field) for field in forbidden) or control_accepted:
+                    raise ValueError(f"invalid counterfactual control {key!r} retained proposal credit")
+        else:
+            if control is not None:
+                raise ValueError(f"critique {key!r} unexpectedly retained a counterfactual control")
+            control_outcome = 0.0
         prompt_group_id = str(critique.get("prompt_group_id"))
         baseline = float(critique["prompt_pass_at_1"])
         reward = float(critique["reward"])
@@ -742,6 +824,13 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
                 )
             ):
                 raise ValueError(f"critique {key!r} has corrupted external-advantage penalty evidence")
+        elif critique_advantage_mode == "counterfactual_uplift" and objective == "recovery":
+            expected_delta = outcome - control_outcome
+            expected_reward = max(0.0, expected_delta)
+            if not math.isclose(
+                float(critique.get("counterfactual_delta")), expected_delta, abs_tol=1e-12
+            ) or not math.isclose(float(critique.get("counterfactual_uplift")), expected_reward, abs_tol=1e-12):
+                raise ValueError(f"recovery critique {key!r} has inconsistent paired uplift evidence")
         else:
             expected_reward = (
                 outcome * learnability_weight - baseline
@@ -971,14 +1060,26 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         exhaustive_scores_by_reference[reference_key] = exhaustive_scores
 
     learnability_by_key = {
-        (str(event["rollout_id"]), int(event["critique_index"])): event for event in learnability_events
+        (
+            str(event["rollout_id"]),
+            int(event["critique_index"]),
+            str(event.get("candidate_kind", "diagnostic")),
+        ): event
+        for event in learnability_events
     }
     if len(learnability_by_key) != len(learnability_events):
         raise ValueError("duplicate learnability evidence")
-    if set(learnability_by_key) != structurally_valid_keys:
+    expected_learnability_keys = {
+        (rollout_id, critique_index, "diagnostic") for rollout_id, critique_index in structurally_valid_keys
+    } | {(rollout_id, critique_index, "control") for rollout_id, critique_index in control_structurally_valid_keys}
+    if set(learnability_by_key) != expected_learnability_keys:
         raise ValueError("every structurally valid edit must have exactly one learnability assessment")
     prompt_logprob_admissions: list[dict[str, Any]] = []
     for key, event in learnability_by_key.items():
+        pair_key = (key[0], key[1])
+        candidate_kind = key[2]
+        if candidate_kind not in {"diagnostic", "control"}:
+            raise ValueError(f"learnability event {key!r} has an invalid candidate kind")
         if event.get("score_source") != "vllm_prompt_logprobs":
             raise ValueError(f"learnability event {key!r} did not use vLLM prompt log probabilities")
         if event.get("logprob_statistic") != statistic:
@@ -988,7 +1089,8 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         seed_tokens = int(event["seed_tokens"])
         if seed_tokens <= 0:
             raise ValueError(f"learnability event {key!r} has no replacement seed")
-        critique = critique_by_key[key]
+        critique = critique_by_key[pair_key]
+        candidate = critique if candidate_kind == "diagnostic" else counterfactual_by_key[pair_key]
         reference = references.get(str(event.get("reference_key")))
         if reference is None or int(reference["seed_tokens"]) != seed_tokens:
             raise ValueError(f"learnability event {key!r} lacks its exact length-matched reference")
@@ -1003,20 +1105,20 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         prompt_logprob_start = int(event.get("prompt_logprob_start", -1))
         original = original_by_rollout[key[0]]
         if audit_schema_version >= 4:
-            scoring_prefix_ids = [int(token) for token in critique["continuation_prefix_ids"]]
+            scoring_prefix_ids = [int(token) for token in candidate["continuation_prefix_ids"]]
         else:
-            scoring_prefix_ids = [int(token) for token in critique["branch_prefix_ids"]]
+            scoring_prefix_ids = [int(token) for token in candidate["branch_prefix_ids"]]
         expected_prompt = [
             *[int(token) for token in original["prompt_ids"]],
             *scoring_prefix_ids,
-            *[int(token) for token in critique["new_continuation_ids"]],
+            *[int(token) for token in candidate["new_continuation_ids"]],
         ]
         expected_start = len(original["prompt_ids"]) + len(scoring_prefix_ids)
         if (
             scoring_prompt_ids != expected_prompt
             or prompt_logprob_start != expected_start
-            or scored_ids != [int(token) for token in critique["new_continuation_ids"]]
-            or scored_log_probs != _float32_values(critique["new_continuation_log_probs"])
+            or scored_ids != [int(token) for token in candidate["new_continuation_ids"]]
+            or scored_log_probs != _float32_values(candidate["new_continuation_log_probs"])
             or scoring_prompt_ids[prompt_logprob_start:] != scored_ids
             or len(scored_ids) != len(scored_log_probs)
         ):
@@ -1134,8 +1236,8 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             or not math.isclose(float(event["reward_weight"]), expected_weight, rel_tol=0.0, abs_tol=1e-12)
         ):
             raise ValueError(f"learnability event {key!r} does not match its audited reference distribution")
-        if bool(event["accepted"]) != bool(critique["learnability_accepted"]) or not math.isclose(
-            float(event["reward_weight"]), float(critique["learnability_weight"]), abs_tol=1e-9
+        if bool(event["accepted"]) != bool(candidate["learnability_accepted"]) or not math.isclose(
+            float(event["reward_weight"]), float(candidate["learnability_weight"]), abs_tol=1e-9
         ):
             raise ValueError(f"learnability event {key!r} differs from its trained critique reward")
 
@@ -1182,29 +1284,43 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     ):
         raise ValueError("prompt-logprob admission summary exists without any scored edit")
 
-    continuation_keys: set[tuple[str, int]] = set()
-    for continuation in continuations:
-        key = (str(continuation["rollout_id"]), int(continuation["critique_index"]))
+    continuation_keys: set[tuple[str, int, str]] = set()
+    for continuation in all_continuations:
+        candidate_kind = str(continuation.get("candidate_kind", "diagnostic"))
+        key = (str(continuation["rollout_id"]), int(continuation["critique_index"]), candidate_kind)
         if key in continuation_keys:
             raise ValueError(f"duplicate continuation evidence for {key!r}")
+        if candidate_kind not in {"diagnostic", "control"}:
+            raise ValueError(f"continuation {key!r} has an invalid candidate kind")
         continuation_keys.add(key)
         continuation_reward = _require_binary(continuation["reward"], "continuation reward")
         objective = str(continuation.get("objective"))
         if objective != rollout_objectives.get(key[0]):
             raise ValueError(f"continuation {key!r} objective differs from its critique group")
+        pair_key = (key[0], key[1])
+        candidate = critique_by_key[pair_key] if candidate_kind == "diagnostic" else counterfactual_by_key[pair_key]
         if not continuation["revised_prefix_ids"] or not continuation["continuation_ids"]:
             raise ValueError(f"continuation {key!r} lacks its revised prefix or generated suffix")
+        if continuation["revised_prefix_ids"] != candidate["revised_prefix_ids"]:
+            raise ValueError(f"continuation {key!r} changed its candidate prefix")
         if len(continuation["continuation_ids"]) != len(continuation["continuation_log_probs"]):
             raise ValueError(f"continuation {key!r} token/log-prob lengths differ")
         if int(continuation.get("continuation_max_tokens", 0)) < min_continuation_tokens:
             raise ValueError(f"continuation {key!r} did not receive its configured minimum token budget")
+        if candidate_kind == "control" and continuation.get("actor_row_id") is not None:
+            raise ValueError(f"counterfactual continuation {key!r} must never become an actor row")
         if objective == "compression":
+            if candidate_kind != "diagnostic":
+                raise ValueError(f"compression continuation {key!r} unexpectedly has a control")
             fraction = float(continuation["compression_fraction"])
             credit = float(continuation["compression_credit"])
             target = float(branch_config["positive_compression_target"])
             if fraction < 0.0 or not math.isclose(credit, continuation_reward * min(fraction / target, 1.0)):
                 raise ValueError(f"compression continuation {key!r} has inconsistent length credit")
-    if continuation_keys != accepted_keys:
+    expected_continuation_keys = {
+        (rollout_id, critique_index, "diagnostic") for rollout_id, critique_index in accepted_keys
+    } | {(rollout_id, critique_index, "control") for rollout_id, critique_index in control_accepted_keys}
+    if continuation_keys != expected_continuation_keys:
         raise ValueError("learnability-accepted critiques and rewarded continuation evidence must be one-to-one")
 
     expected_sources: dict[str, dict[str, Any]] = {}
@@ -1509,6 +1625,31 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
                 ),
             }
         )
+    if audit_schema_version >= 7:
+        paired = [critique for critique in critiques if isinstance(critique.get("counterfactual"), dict)]
+        required_metrics.update(
+            {
+                "branch_revision/counterfactual/enabled": float(critique_advantage_mode == "counterfactual_uplift"),
+                "branch_revision/critique_advantage_mode_is_counterfactual_uplift": float(
+                    critique_advantage_mode == "counterfactual_uplift"
+                ),
+                "branch_revision/counterfactual/controls": float(len(paired)),
+                "branch_revision/counterfactual/valid_edits": float(len(control_structurally_valid_keys)),
+                "branch_revision/counterfactual/accepted_edits": float(len(control_accepted_keys)),
+                "branch_revision/counterfactual/continuation_successes": float(
+                    sum(float(event["reward"]) for event in control_continuations)
+                ),
+                "branch_revision/counterfactual/diagnostic_wins": float(
+                    sum(float(critique["counterfactual_delta"]) > 0.0 for critique in paired)
+                ),
+                "branch_revision/counterfactual/control_wins": float(
+                    sum(float(critique["counterfactual_delta"]) < 0.0 for critique in paired)
+                ),
+                "branch_revision/counterfactual/ties": float(
+                    sum(float(critique["counterfactual_delta"]) == 0.0 for critique in paired)
+                ),
+            }
+        )
     if separate_critique_model:
         required_metrics.update(
             {
@@ -1584,6 +1725,12 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     )
     if require_algorithm_signal and recovery_enabled and successful_recoveries <= 0.0:
         raise ValueError("smoke has no successful recovery continuation")
+    if (
+        require_algorithm_signal
+        and critique_advantage_mode == "counterfactual_uplift"
+        and not any(float(critique["reward"]) > 0.0 for critique in critiques if critique["objective"] == "recovery")
+    ):
+        raise ValueError("smoke has no diagnostic recovery that beats its paired no-diagnosis control")
     if require_algorithm_signal and positive_compression_enabled and successful_compressions <= 0.0:
         raise ValueError("smoke has no successful positive-rollout compression")
 
@@ -1625,7 +1772,7 @@ def main() -> None:
     parser.add_argument(
         "--integrity-only",
         action="store_true",
-        help="verify complete schema-v2 through schema-v6 evidence without requiring nonzero revision learning signal",
+        help="verify complete schema-v2 through schema-v7 evidence without requiring nonzero revision learning signal",
     )
     args = parser.parse_args()
     result = verify(args.root, require_algorithm_signal=not args.integrity_only)

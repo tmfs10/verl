@@ -178,8 +178,8 @@ def _extra_args(
         raise ValueError("loss_mode must be dppo_tv or vanilla")
     if critique_grpo_grouping not in {"per_original", "batch"}:
         raise ValueError("critique_grpo_grouping must be per_original or batch")
-    if critique_advantage_mode not in {"grpo", "pass_at_1"}:
-        raise ValueError("critique_advantage_mode must be grpo or pass_at_1")
+    if critique_advantage_mode not in {"grpo", "pass_at_1", "counterfactual_uplift"}:
+        raise ValueError("critique_advantage_mode must be grpo, pass_at_1, or counterfactual_uplift")
     if critique_prompt_weighting not in {"equal_prompt", "headroom"}:
         raise ValueError("critique_prompt_weighting must be equal_prompt or headroom")
     if recovery_reference_mode not in {"none", "successful_original"}:
@@ -198,6 +198,8 @@ def _extra_args(
         raise ValueError("recovery_reference_mode must be none when recovery is disabled")
     if critique_advantage_mode == "pass_at_1" and enable_positive_compression:
         raise ValueError("pass_at_1 critique advantages require recovery-only generation")
+    if critique_advantage_mode == "counterfactual_uplift" and not enable_recovery:
+        raise ValueError("counterfactual_uplift critique advantages require recovery")
     if not isinstance(enable_positive_compression, bool):
         raise ValueError("enable_positive_compression must be boolean")
     if learnability_logprob_statistic not in {"mean", "min"}:
@@ -419,8 +421,8 @@ def build_command(
         raise ValueError("separate_critique_model must be boolean")
     if critique_grpo_grouping not in {"per_original", "batch"}:
         raise ValueError("critique_grpo_grouping must be per_original or batch")
-    if critique_advantage_mode not in {"grpo", "pass_at_1"}:
-        raise ValueError("critique_advantage_mode must be grpo or pass_at_1")
+    if critique_advantage_mode not in {"grpo", "pass_at_1", "counterfactual_uplift"}:
+        raise ValueError("critique_advantage_mode must be grpo, pass_at_1, or counterfactual_uplift")
     if critique_prompt_weighting not in {"equal_prompt", "headroom"}:
         raise ValueError("critique_prompt_weighting must be equal_prompt or headroom")
     if recovery_reference_mode not in {"none", "successful_original"}:
@@ -439,6 +441,8 @@ def build_command(
         raise ValueError("recovery_reference_mode must be none when recovery is disabled")
     if critique_advantage_mode == "pass_at_1" and enable_positive_compression:
         raise ValueError("pass_at_1 critique advantages require recovery-only generation")
+    if critique_advantage_mode == "counterfactual_uplift" and not enable_recovery:
+        raise ValueError("counterfactual_uplift critique advantages require recovery")
     if not isinstance(enable_positive_compression, bool):
         raise ValueError("enable_positive_compression must be boolean")
     if (
@@ -658,7 +662,11 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
     parser.add_argument("--num-critiques", type=int, default=4)
     parser.add_argument("--ppo-mini-batch-size", type=int, default=8)
     parser.add_argument("--critique-grpo-grouping", choices=("per_original", "batch"), default="per_original")
-    parser.add_argument("--critique-advantage-mode", choices=("grpo", "pass_at_1"), default="grpo")
+    parser.add_argument(
+        "--critique-advantage-mode",
+        choices=("grpo", "pass_at_1", "counterfactual_uplift"),
+        default="grpo",
+    )
     parser.add_argument("--critique-prompt-weighting", choices=("equal_prompt", "headroom"), default="equal_prompt")
     parser.add_argument(
         "--recovery-reference-mode",

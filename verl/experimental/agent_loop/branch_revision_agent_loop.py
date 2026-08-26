@@ -37,6 +37,34 @@ BRANCH_REVISION_AGENT_NAME = "branch_revision_agent"
 BRANCH_REVISION_CHILD_FIELD = "__branch_revision_children__"
 BRANCH_REVISION_SCORE_FIELD = "__branch_revision_score__"
 BRANCH_REVISION_CONTINUATION_FIELD = "__branch_revision_continuation__"
+COUNTERFACTUAL_PREFILL_TEXT = "<think>\n\n</think>\n\n<prefix>"
+
+
+@dataclass(frozen=True)
+class BranchRevisionCounterfactualGeneration:
+    prompt_ids: tuple[int, ...]
+    prefill_ids: tuple[int, ...]
+    generated_token_ids: tuple[int, ...]
+    generated_log_probs: tuple[float, ...]
+    finish_reason: str | None
+    parse_reason: str
+    prefix_text: str
+    prefix_plus_new_continuation_text: str
+    new_continuation_text: str
+    branch_prefix_ids: tuple[int, ...]
+    prefix_ids: tuple[int, ...]
+    continuation_prefix_ids: tuple[int, ...]
+    new_continuation_ids: tuple[int, ...]
+    new_continuation_log_probs: tuple[float, ...]
+    revised_prefix_ids: tuple[int, ...]
+    continuation_ids: tuple[int, ...] = ()
+    continuation_log_probs: tuple[float, ...] = ()
+    continuation_finish_reason: str | None = None
+    continuation_max_tokens: int = 0
+
+    @property
+    def valid(self) -> bool:
+        return self.parse_reason == "valid"
 
 
 @dataclass(frozen=True)
@@ -61,6 +89,7 @@ class BranchRevisionCritiqueGeneration:
     critique_prompt_ids: tuple[int, ...] = ()
     reference_rollout_id: str | None = None
     reference_solution_ids: tuple[int, ...] = ()
+    counterfactual: BranchRevisionCounterfactualGeneration | None = None
 
     @property
     def valid(self) -> bool:
@@ -83,6 +112,7 @@ class BranchRevisionScoreGeneration:
     scored_token_ids: tuple[int, ...]
     scored_token_log_probs: tuple[float, ...]
     admission: dict[str, Any] | None
+    candidate_kind: str = "diagnostic"
 
 
 @dataclass(frozen=True)
@@ -93,6 +123,7 @@ class BranchRevisionContinuationGeneration:
     log_probs: tuple[float, ...]
     finish_reason: str | None
     max_tokens: int
+    candidate_kind: str = "diagnostic"
 
 
 def _as_int_list(value: Any, name: str) -> list[int]:
@@ -235,6 +266,53 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         value = output.extra_fields.get("finish_reason", output.stop_reason)
         return None if value is None else str(value)
 
+    def _proposal_fields(
+        self,
+        *,
+        solution_ids: list[int],
+        response_ids: list[int],
+        parent_prompt_ids: list[int],
+    ) -> dict[str, Any]:
+        parsed = parse_branch_revision(
+            solution_ids,
+            response_ids,
+            self.tokenizer,
+            branch_max_tokens=self.feature.branch_max_tokens,
+            new_continuation_max_tokens=self.feature.new_continuation_max_tokens,
+        )
+        parse_reason = parsed.reason
+        branch_prefix_ids = list(parsed.branch_prefix_ids)
+        prefix_ids = list(parsed.prefix_ids)
+        continuation_prefix_ids = list(parsed.continuation_prefix_ids)
+        new_continuation_ids = list(parsed.new_continuation_ids)
+        revised_prefix_ids = list(parsed.revised_prefix_ids)
+        continuation_max_tokens = 0
+        if parsed.valid:
+            continuation_max_tokens = min(
+                self.response_length - len(revised_prefix_ids),
+                self.max_model_len - len(parent_prompt_ids) - len(revised_prefix_ids),
+            )
+            if continuation_max_tokens < self.feature.min_continuation_tokens:
+                parse_reason = "insufficient_continuation_budget"
+                branch_prefix_ids = []
+                prefix_ids = []
+                continuation_prefix_ids = []
+                new_continuation_ids = []
+                revised_prefix_ids = []
+                continuation_max_tokens = 0
+        return {
+            "parse_reason": parse_reason,
+            "prefix_text": parsed.prefix_text,
+            "prefix_plus_new_continuation_text": parsed.prefix_plus_new_continuation_text,
+            "new_continuation_text": parsed.new_continuation_text,
+            "branch_prefix_ids": branch_prefix_ids,
+            "prefix_ids": prefix_ids,
+            "continuation_prefix_ids": continuation_prefix_ids,
+            "new_continuation_ids": new_continuation_ids,
+            "revised_prefix_ids": revised_prefix_ids,
+            "continuation_max_tokens": continuation_max_tokens,
+        }
+
     def _score_only_response(self, output: TokenOutput) -> list[int]:
         if output.token_ids:
             return [int(output.token_ids[0])]
@@ -254,6 +332,9 @@ class BranchRevisionAgentLoop(AgentLoopBase):
     ) -> AgentLoopOutput:
         rollout_id = str(kwargs["branch_revision_rollout_id"])
         critique_index = int(kwargs["branch_revision_critique_index"])
+        candidate_kind = str(kwargs.get("branch_revision_candidate_kind", "diagnostic"))
+        if candidate_kind not in {"diagnostic", "control"}:
+            raise ValueError(f"unknown branch-revision score candidate kind {candidate_kind!r}")
         route_key = str(kwargs["branch_revision_route_key"])
         prompt_ids = _as_int_list(kwargs["branch_revision_parent_prompt_ids"], "parent prompt")
         continuation_prefix_ids = _as_int_list(
@@ -301,6 +382,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
             scored_token_ids=tuple(new_continuation_ids),
             scored_token_log_probs=tuple(float(value) for value in normalized.tolist()),
             admission=None if admission is None else dict(admission),
+            candidate_kind=candidate_kind,
         )
         response_ids = self._score_only_response(output)
         return AgentLoopOutput(
@@ -334,6 +416,9 @@ class BranchRevisionAgentLoop(AgentLoopBase):
     ) -> AgentLoopOutput:
         rollout_id = str(kwargs["branch_revision_rollout_id"])
         critique_index = int(kwargs["branch_revision_critique_index"])
+        candidate_kind = str(kwargs.get("branch_revision_candidate_kind", "diagnostic"))
+        if candidate_kind not in {"diagnostic", "control"}:
+            raise ValueError(f"unknown branch-revision continuation candidate kind {candidate_kind!r}")
         route_key = str(kwargs["branch_revision_route_key"])
         prompt_ids = _as_int_list(kwargs["branch_revision_parent_prompt_ids"], "parent prompt")
         revised_prefix_ids = _as_int_list(
@@ -362,6 +447,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
             log_probs=tuple(log_probs),
             finish_reason=self._finish_reason(output),
             max_tokens=max_tokens,
+            candidate_kind=candidate_kind,
         )
         return AgentLoopOutput(
             prompt_ids=prompt_ids,
@@ -503,52 +589,24 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                     cap=critique_caps[index],
                     kind=f"critique[{index}]",
                 )
-                parsed = parse_branch_revision(
-                    solution_ids,
-                    critique_ids,
-                    self.tokenizer,
-                    branch_max_tokens=self.feature.branch_max_tokens,
-                    new_continuation_max_tokens=self.feature.new_continuation_max_tokens,
+                proposal = self._proposal_fields(
+                    solution_ids=solution_ids,
+                    response_ids=critique_ids,
+                    parent_prompt_ids=prompt_ids,
                 )
-                parse_reason = parsed.reason
-                branch_prefix_ids = list(parsed.branch_prefix_ids)
-                prefix_ids = list(parsed.prefix_ids)
-                continuation_prefix_ids = list(parsed.continuation_prefix_ids)
-                new_continuation_ids = list(parsed.new_continuation_ids)
-                revised_prefix_ids = list(parsed.revised_prefix_ids)
-                continuation_max_tokens = 0
-                if parsed.valid:
-                    continuation_max_tokens = min(
-                        self.response_length - len(revised_prefix_ids),
-                        self.max_model_len - len(prompt_ids) - len(revised_prefix_ids),
-                    )
-                    if continuation_max_tokens < self.feature.min_continuation_tokens:
-                        parse_reason = "insufficient_continuation_budget"
-                        branch_prefix_ids = []
-                        prefix_ids = []
-                        continuation_prefix_ids = []
-                        new_continuation_ids = []
-                        revised_prefix_ids = []
-                        continuation_max_tokens = 0
                 parsed_records[index] = {
                     "token_ids": critique_ids,
                     "log_probs": critique_log_probs,
                     "finish_reason": self._finish_reason(raw_output),
-                    "parse_reason": parse_reason,
-                    "prefix_text": parsed.prefix_text,
-                    "prefix_plus_new_continuation_text": parsed.prefix_plus_new_continuation_text,
-                    "new_continuation_text": parsed.new_continuation_text,
-                    "branch_prefix_ids": branch_prefix_ids,
-                    "prefix_ids": prefix_ids,
-                    "continuation_prefix_ids": continuation_prefix_ids,
-                    "new_continuation_ids": new_continuation_ids,
-                    "revised_prefix_ids": revised_prefix_ids,
-                    "continuation_max_tokens": continuation_max_tokens,
+                    **proposal,
                     "critique_prompt_ids": critique_prompts[index],
                     "reference_rollout_id": reference_rollout_ids[index] if reference_rollout_ids else None,
                     "reference_solution_ids": reference_solution_ids[index] if reference_solution_ids else [],
                 }
-                if parse_reason == "valid" and continuation_max_tokens < self.feature.min_continuation_tokens:
+                if (
+                    proposal["parse_reason"] == "valid"
+                    and proposal["continuation_max_tokens"] < self.feature.min_continuation_tokens
+                ):
                     raise RuntimeError("valid branch revision unexpectedly lacks its minimum continuation capacity")
             except Exception as error:
                 processing_errors.append(f"critique[{index}]: {error!r}")
@@ -559,6 +617,87 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         if any(record is None for record in parsed_records):
             raise RuntimeError("branch-revision critique validation did not produce every parsed record")
         complete_records = [record for record in parsed_records if record is not None]
+
+        if objective == "recovery" and self.feature.critique_advantage_mode == "counterfactual_uplift":
+            prefill_ids = [
+                int(token) for token in self.tokenizer.encode(COUNTERFACTUAL_PREFILL_TEXT, add_special_tokens=False)
+            ]
+            if not prefill_ids or decode_exact(prefill_ids, self.tokenizer) != COUNTERFACTUAL_PREFILL_TEXT:
+                raise RuntimeError("counterfactual prefill is not an exact tokenizer round trip")
+            counterfactual_prompts: list[list[int]] = []
+            counterfactual_caps: list[int] = []
+            for index in range(num_critiques):
+                control_prompt = [*critique_prompts[index], *prefill_ids]
+                control_cap = min(
+                    requested_cap - len(prefill_ids),
+                    self.max_model_len - len(control_prompt),
+                )
+                if control_cap <= 0:
+                    raise ValueError(
+                        f"branch-revision counterfactual[{index}] has no response capacity after its exact prefill: "
+                        f"prompt={len(control_prompt)} requested_cap={requested_cap} limit={self.max_model_len}"
+                    )
+                counterfactual_prompts.append(control_prompt)
+                counterfactual_caps.append(control_cap)
+            counterfactual_tasks = [
+                asyncio.create_task(
+                    self._generate(
+                        f"{rollout_id}:counterfactual:{index}",
+                        counterfactual_prompts[index],
+                        sampling_params,
+                        max_tokens=counterfactual_caps[index],
+                        kind=f"counterfactual[{index}]",
+                    )
+                )
+                for index in range(num_critiques)
+            ]
+            counterfactual_results = await _gather_and_drain(
+                counterfactual_tasks,
+                phase="counterfactual",
+                indices=list(range(num_critiques)),
+            )
+            processing_errors = []
+            for index, raw_output in enumerate(counterfactual_results):
+                try:
+                    if not isinstance(raw_output, TokenOutput):
+                        raise TypeError(f"counterfactual[{index}] returned unexpected type {type(raw_output)!r}")
+                    num_preempted += int(raw_output.num_preempted or 0)
+                    generated_ids, generated_log_probs = self._validated_output(
+                        raw_output,
+                        cap=counterfactual_caps[index],
+                        kind=f"counterfactual[{index}]",
+                    )
+                    response_ids = [*prefill_ids, *generated_ids]
+                    proposal = self._proposal_fields(
+                        solution_ids=solution_ids,
+                        response_ids=response_ids,
+                        parent_prompt_ids=prompt_ids,
+                    )
+                    complete_records[index]["counterfactual"] = BranchRevisionCounterfactualGeneration(
+                        prompt_ids=tuple(counterfactual_prompts[index]),
+                        prefill_ids=tuple(prefill_ids),
+                        generated_token_ids=tuple(generated_ids),
+                        generated_log_probs=tuple(generated_log_probs),
+                        finish_reason=self._finish_reason(raw_output),
+                        parse_reason=proposal["parse_reason"],
+                        prefix_text=proposal["prefix_text"],
+                        prefix_plus_new_continuation_text=proposal["prefix_plus_new_continuation_text"],
+                        new_continuation_text=proposal["new_continuation_text"],
+                        branch_prefix_ids=tuple(proposal["branch_prefix_ids"]),
+                        prefix_ids=tuple(proposal["prefix_ids"]),
+                        continuation_prefix_ids=tuple(proposal["continuation_prefix_ids"]),
+                        new_continuation_ids=tuple(proposal["new_continuation_ids"]),
+                        new_continuation_log_probs=(),
+                        revised_prefix_ids=tuple(proposal["revised_prefix_ids"]),
+                        continuation_max_tokens=int(proposal["continuation_max_tokens"]),
+                    )
+                except Exception as error:
+                    processing_errors.append(f"counterfactual[{index}]: {error!r}")
+            if processing_errors:
+                raise RuntimeError(
+                    "branch-revision counterfactual validation failed before score launch: "
+                    + "; ".join(processing_errors)
+                )
 
         critiques = tuple(
             BranchRevisionCritiqueGeneration(
@@ -582,6 +721,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 critique_prompt_ids=tuple(record["critique_prompt_ids"]),
                 reference_rollout_id=record["reference_rollout_id"],
                 reference_solution_ids=tuple(record["reference_solution_ids"]),
+                counterfactual=record.get("counterfactual"),
             )
             for record in complete_records
         )

@@ -36,7 +36,9 @@ from verl.experimental.agent_loop.branch_revision_agent_loop import (
     BRANCH_REVISION_CHILD_FIELD,
     BRANCH_REVISION_CONTINUATION_FIELD,
     BRANCH_REVISION_SCORE_FIELD,
+    COUNTERFACTUAL_PREFILL_TEXT,
     BranchRevisionContinuationGeneration,
+    BranchRevisionCounterfactualGeneration,
     BranchRevisionCritiqueGeneration,
     BranchRevisionGenerationRecord,
     BranchRevisionScoreGeneration,
@@ -60,7 +62,7 @@ from verl.utils.metric import reduce_metrics
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import marked_timer
 
-_AUDIT_SCHEMA_VERSION = 6
+_AUDIT_SCHEMA_VERSION = 7
 
 
 def _add_exception_note(error: BaseException, note: str) -> None:
@@ -239,6 +241,25 @@ def validate_branch_revision_runtime_config(config, actor_tokenizer=None, actor_
         if feature.enable_positive_compression:
             instructions.append(("compression", feature.positive_critique_prompt, 0))
         critique_cap = int(feature.critique_max_response_length or config.data.max_response_length)
+        if feature.critique_advantage_mode == "counterfactual_uplift":
+            counterfactual_prefill_ids = [
+                int(token) for token in actor_tokenizer.encode(COUNTERFACTUAL_PREFILL_TEXT, add_special_tokens=False)
+            ]
+            if (
+                not counterfactual_prefill_ids
+                or critique_cap <= len(counterfactual_prefill_ids)
+                or str(
+                    actor_tokenizer.decode(
+                        counterfactual_prefill_ids,
+                        skip_special_tokens=False,
+                        clean_up_tokenization_spaces=False,
+                    )
+                )
+                != COUNTERFACTUAL_PREFILL_TEXT
+            ):
+                raise ValueError(
+                    "counterfactual uplift requires an exact prefill round trip and critique response headroom"
+                )
         for objective, instruction, reference_cap in instructions:
             followup_tokens = len(
                 encode_followup_user_turn(
@@ -301,6 +322,9 @@ class _Bundle:
     learnability: dict[int, LearnabilityScore] = field(default_factory=dict)
     score_admissions: dict[int, dict[str, Any] | None] = field(default_factory=dict)
     continuation_rewards: dict[int, float] = field(default_factory=dict)
+    counterfactual_learnability: dict[int, LearnabilityScore] = field(default_factory=dict)
+    counterfactual_score_admissions: dict[int, dict[str, Any] | None] = field(default_factory=dict)
+    counterfactual_continuation_rewards: dict[int, float] = field(default_factory=dict)
     compression_fractions: dict[int, float] = field(default_factory=dict)
     compression_credits: dict[int, float] = field(default_factory=dict)
     recovery_references: dict[int, _RecoveryReference] = field(default_factory=dict)
@@ -672,12 +696,42 @@ class BranchRevisionGRPOController:
         )
 
     @staticmethod
-    def _coerce_critique(value: Any) -> BranchRevisionCritiqueGeneration:
+    def _coerce_counterfactual(value: Any) -> BranchRevisionCounterfactualGeneration:
+        if isinstance(value, BranchRevisionCounterfactualGeneration):
+            return value
+        if not isinstance(value, dict):
+            raise TypeError(f"invalid branch-revision counterfactual record {type(value)!r}")
+        seed_log_probs = value.get("new_continuation_log_probs", ())
+        return BranchRevisionCounterfactualGeneration(
+            prompt_ids=tuple(int(token) for token in value["prompt_ids"]),
+            prefill_ids=tuple(int(token) for token in value["prefill_ids"]),
+            generated_token_ids=tuple(int(token) for token in value["generated_token_ids"]),
+            generated_log_probs=tuple(float(item) for item in value["generated_log_probs"]),
+            finish_reason=value.get("finish_reason"),
+            parse_reason=str(value["parse_reason"]),
+            prefix_text=str(value.get("prefix_text", "")),
+            prefix_plus_new_continuation_text=str(value.get("prefix_plus_new_continuation_text", "")),
+            new_continuation_text=str(value.get("new_continuation_text", "")),
+            branch_prefix_ids=tuple(int(token) for token in value.get("branch_prefix_ids", ())),
+            prefix_ids=tuple(int(token) for token in value.get("prefix_ids", ())),
+            continuation_prefix_ids=tuple(int(token) for token in value.get("continuation_prefix_ids", ())),
+            new_continuation_ids=tuple(int(token) for token in value.get("new_continuation_ids", ())),
+            new_continuation_log_probs=tuple(_float32_list(seed_log_probs)) if seed_log_probs else (),
+            revised_prefix_ids=tuple(int(token) for token in value.get("revised_prefix_ids", ())),
+            continuation_ids=tuple(int(token) for token in value.get("continuation_ids", ())),
+            continuation_log_probs=tuple(float(item) for item in value.get("continuation_log_probs", ())),
+            continuation_finish_reason=value.get("continuation_finish_reason"),
+            continuation_max_tokens=int(value.get("continuation_max_tokens", 0)),
+        )
+
+    @classmethod
+    def _coerce_critique(cls, value: Any) -> BranchRevisionCritiqueGeneration:
         if isinstance(value, BranchRevisionCritiqueGeneration):
             return value
         if not isinstance(value, dict):
             raise TypeError(f"invalid branch-revision critique record {type(value)!r}")
         seed_log_probs = value.get("new_continuation_log_probs", ())
+        counterfactual = value.get("counterfactual")
         return BranchRevisionCritiqueGeneration(
             token_ids=tuple(int(token) for token in value["token_ids"]),
             log_probs=tuple(float(item) for item in value["log_probs"]),
@@ -701,6 +755,7 @@ class BranchRevisionGRPOController:
                 None if value.get("reference_rollout_id") is None else str(value["reference_rollout_id"])
             ),
             reference_solution_ids=tuple(int(token) for token in value.get("reference_solution_ids", ())),
+            counterfactual=None if counterfactual is None else cls._coerce_counterfactual(counterfactual),
         )
 
     @classmethod
@@ -757,6 +812,7 @@ class BranchRevisionGRPOController:
                     )
                 editable_solution = strip_terminal_eos(bundle.solution_ids, self.tokenizer)
                 expected_prefix = [*bundle.prompt_ids, *editable_solution]
+                expected_counterfactual_prefill = self._encode(COUNTERFACTUAL_PREFILL_TEXT)
                 for critique_index, critique in enumerate(bundle.record.critiques):
                     critique_prompt = list(critique.critique_prompt_ids or bundle.record.critique_prompt_ids)
                     if (
@@ -782,6 +838,26 @@ class BranchRevisionGRPOController:
                         raise RuntimeError(
                             "reference-free critique unexpectedly retained successful-reference evidence"
                         )
+                    needs_counterfactual = (
+                        expected_objective == "recovery"
+                        and self.feature.critique_advantage_mode == "counterfactual_uplift"
+                    )
+                    if needs_counterfactual:
+                        control = critique.counterfactual
+                        if control is None:
+                            raise RuntimeError("counterfactual uplift is missing its paired no-diagnosis control")
+                        if list(control.prefill_ids) != expected_counterfactual_prefill:
+                            raise RuntimeError("counterfactual control changed the exact no-diagnosis prefill")
+                        if list(control.prompt_ids) != [*critique_prompt, *expected_counterfactual_prefill]:
+                            raise RuntimeError("counterfactual control did not reuse the exact diagnostic prompt")
+                        if not control.generated_token_ids or len(control.generated_token_ids) != len(
+                            control.generated_log_probs
+                        ):
+                            raise RuntimeError("counterfactual control tokens and behavior log probabilities misalign")
+                    elif critique.counterfactual is not None:
+                        raise RuntimeError(
+                            "non-recovery or non-counterfactual critique unexpectedly retained a control"
+                        )
             elif bundle.rollout_id in records:
                 raise RuntimeError("unselected original solution unexpectedly received branch critiques")
 
@@ -797,42 +873,82 @@ class BranchRevisionGRPOController:
             }
         }
 
+    @staticmethod
+    def _candidate_entries(
+        bundle: _Bundle,
+    ) -> list[tuple[int, str, BranchRevisionCritiqueGeneration | BranchRevisionCounterfactualGeneration]]:
+        if bundle.record is None:
+            return []
+        entries: list[tuple[int, str, BranchRevisionCritiqueGeneration | BranchRevisionCounterfactualGeneration]] = []
+        for critique_index, critique in enumerate(bundle.record.critiques):
+            entries.append((critique_index, "diagnostic", critique))
+            if critique.counterfactual is not None:
+                entries.append((critique_index, "control", critique.counterfactual))
+        return entries
+
+    @staticmethod
+    def _candidate_learnability(bundle: _Bundle, candidate_kind: str) -> dict[int, LearnabilityScore]:
+        if candidate_kind == "diagnostic":
+            return bundle.learnability
+        if candidate_kind == "control":
+            return bundle.counterfactual_learnability
+        raise ValueError(f"unknown branch-revision candidate kind {candidate_kind!r}")
+
+    @staticmethod
+    def _candidate_score_admissions(bundle: _Bundle, candidate_kind: str) -> dict[int, dict[str, Any] | None]:
+        if candidate_kind == "diagnostic":
+            return bundle.score_admissions
+        if candidate_kind == "control":
+            return bundle.counterfactual_score_admissions
+        raise ValueError(f"unknown branch-revision candidate kind {candidate_kind!r}")
+
+    @staticmethod
+    def _candidate_rewards(bundle: _Bundle, candidate_kind: str) -> dict[int, float]:
+        if candidate_kind == "diagnostic":
+            return bundle.continuation_rewards
+        if candidate_kind == "control":
+            return bundle.counterfactual_continuation_rewards
+        raise ValueError(f"unknown branch-revision candidate kind {candidate_kind!r}")
+
     def _make_score_request(self, source: DataProto, bundles: list[_Bundle]) -> DataProto | None:
-        items: list[tuple[_Bundle, int, BranchRevisionCritiqueGeneration]] = []
-        for bundle in bundles:
-            if bundle.record is None:
-                continue
-            items.extend(
-                (bundle, critique_index, critique)
-                for critique_index, critique in enumerate(bundle.record.critiques)
-                if critique.valid
-            )
+        items = [
+            (bundle, critique_index, candidate_kind, candidate)
+            for bundle in bundles
+            for critique_index, candidate_kind, candidate in self._candidate_entries(bundle)
+            if candidate.valid
+        ]
         if not items:
             return None
-        rows = [bundle.source_row for bundle, _, _ in items]
+        rows = [bundle.source_row for bundle, _, _, _ in items]
         non_tensors = self._phase_non_tensors(source, rows)
         non_tensors["agent_name"] = np.array([BRANCH_REVISION_AGENT_NAME] * len(items), dtype=object)
         non_tensors["branch_revision_phase"] = np.array(["score"] * len(items), dtype=object)
         non_tensors["branch_revision_rollout_id"] = np.array(
-            [bundle.rollout_id for bundle, _, _ in items],
+            [bundle.rollout_id for bundle, _, _, _ in items],
             dtype=object,
         )
         non_tensors["branch_revision_critique_index"] = np.array(
-            [critique_index for _, critique_index, _ in items],
+            [critique_index for _, critique_index, _, _ in items],
             dtype=np.int64,
         )
+        non_tensors["branch_revision_candidate_kind"] = np.array(
+            [candidate_kind for _, _, candidate_kind, _ in items], dtype=object
+        )
         non_tensors["branch_revision_route_key"] = np.array(
-            [f"{bundle.rollout_id}:revision:{critique_index}" for bundle, critique_index, _ in items],
+            [
+                f"{bundle.rollout_id}:{candidate_kind}:score:{critique_index}"
+                for bundle, critique_index, candidate_kind, _ in items
+            ],
             dtype=object,
         )
         non_tensors["branch_revision_parent_prompt_ids"] = self._object_array(
-            [bundle.prompt_ids for bundle, _, _ in items]
+            [bundle.prompt_ids for bundle, _, _, _ in items]
         )
         non_tensors["branch_revision_continuation_prefix_ids"] = self._object_array(
-            [list(critique.continuation_prefix_ids) for _, _, critique in items]
+            [list(candidate.continuation_prefix_ids) for _, _, _, candidate in items]
         )
         non_tensors["branch_revision_new_continuation_ids"] = self._object_array(
-            [list(critique.new_continuation_ids) for _, _, critique in items]
+            [list(candidate.new_continuation_ids) for _, _, _, candidate in items]
         )
         return DataProto.from_dict(
             non_tensors=non_tensors,
@@ -855,16 +971,19 @@ class BranchRevisionGRPOController:
             scored_token_ids=tuple(int(token) for token in value["scored_token_ids"]),
             scored_token_log_probs=tuple(_float32_list(value["scored_token_log_probs"])),
             admission=None if admission is None else dict(admission),
+            candidate_kind=str(value.get("candidate_kind", "diagnostic")),
         )
 
-    def _extract_scores(self, output: DataProto) -> dict[tuple[str, int], BranchRevisionScoreGeneration]:
+    def _extract_scores(self, output: DataProto) -> dict[tuple[str, int, str], BranchRevisionScoreGeneration]:
         raw = output.non_tensor_batch.pop(BRANCH_REVISION_SCORE_FIELD, None)
         if raw is None or len(raw) != len(output):
             raise RuntimeError("branch-revision score stage did not return one record per proposal")
-        records: dict[tuple[str, int], BranchRevisionScoreGeneration] = {}
+        records: dict[tuple[str, int, str], BranchRevisionScoreGeneration] = {}
         for value in raw:
             record = self._coerce_score(value)
-            key = (record.rollout_id, record.critique_index)
+            if record.candidate_kind not in {"diagnostic", "control"}:
+                raise RuntimeError(f"invalid branch-revision score candidate kind {record.candidate_kind!r}")
+            key = (record.rollout_id, record.critique_index, record.candidate_kind)
             if key in records:
                 raise RuntimeError(f"duplicate branch-revision score key {key!r}")
             records[key] = record
@@ -873,14 +992,13 @@ class BranchRevisionGRPOController:
     def _attach_scores(
         self,
         bundles: list[_Bundle],
-        scores: dict[tuple[str, int], BranchRevisionScoreGeneration],
+        scores: dict[tuple[str, int, str], BranchRevisionScoreGeneration],
     ) -> None:
         expected = {
-            (bundle.rollout_id, critique_index)
+            (bundle.rollout_id, critique_index, candidate_kind)
             for bundle in bundles
-            if bundle.record is not None
-            for critique_index, critique in enumerate(bundle.record.critiques)
-            if critique.valid
+            for critique_index, candidate_kind, candidate in self._candidate_entries(bundle)
+            if candidate.valid
         }
         if set(scores) != expected:
             raise RuntimeError("branch-revision score stage returned an unexpected proposal set")
@@ -888,62 +1006,75 @@ class BranchRevisionGRPOController:
             if bundle.record is None:
                 continue
             critiques = list(bundle.record.critiques)
-            for critique_index, critique in enumerate(critiques):
-                if not critique.valid:
+            for critique_index, candidate_kind, candidate in self._candidate_entries(bundle):
+                if not candidate.valid:
                     continue
-                score = scores[(bundle.rollout_id, critique_index)]
-                expected_start = len(bundle.prompt_ids) + len(critique.continuation_prefix_ids)
+                score = scores[(bundle.rollout_id, critique_index, candidate_kind)]
+                expected_start = len(bundle.prompt_ids) + len(candidate.continuation_prefix_ids)
                 if score.prompt_logprob_start != expected_start:
                     raise RuntimeError("branch-revision score changed the prompt-logprob slice boundary")
-                if list(score.scored_token_ids) != list(critique.new_continuation_ids):
+                if list(score.scored_token_ids) != list(candidate.new_continuation_ids):
                     raise RuntimeError("branch-revision score changed the replacement-token sequence")
-                if len(score.scored_token_log_probs) != len(critique.new_continuation_ids):
+                if len(score.scored_token_log_probs) != len(candidate.new_continuation_ids):
                     raise RuntimeError("branch-revision score omitted replacement-token log probabilities")
-                critiques[critique_index] = replace(
-                    critique,
-                    new_continuation_log_probs=score.scored_token_log_probs,
-                )
-                bundle.score_admissions[critique_index] = None if score.admission is None else dict(score.admission)
+                if candidate_kind == "diagnostic":
+                    critiques[critique_index] = replace(
+                        critiques[critique_index],
+                        new_continuation_log_probs=score.scored_token_log_probs,
+                    )
+                else:
+                    control = critiques[critique_index].counterfactual
+                    if control is None:
+                        raise RuntimeError("counterfactual score lost its paired control")
+                    critiques[critique_index] = replace(
+                        critiques[critique_index],
+                        counterfactual=replace(control, new_continuation_log_probs=score.scored_token_log_probs),
+                    )
+                admissions = self._candidate_score_admissions(bundle, candidate_kind)
+                admissions[critique_index] = None if score.admission is None else dict(score.admission)
             bundle.record = replace(bundle.record, critiques=tuple(critiques))
 
     def _make_continuation_request(self, source: DataProto, bundles: list[_Bundle]) -> DataProto | None:
-        items: list[tuple[_Bundle, int, BranchRevisionCritiqueGeneration]] = []
-        for bundle in bundles:
-            if bundle.record is None:
-                continue
-            items.extend(
-                (bundle, critique_index, critique)
-                for critique_index, critique in enumerate(bundle.record.critiques)
-                if critique.valid
-                and bundle.learnability.get(critique_index, None) is not None
-                and bundle.learnability[critique_index].accepted
-            )
+        items = [
+            (bundle, critique_index, candidate_kind, candidate)
+            for bundle in bundles
+            for critique_index, candidate_kind, candidate in self._candidate_entries(bundle)
+            if candidate.valid
+            and self._candidate_learnability(bundle, candidate_kind).get(critique_index) is not None
+            and self._candidate_learnability(bundle, candidate_kind)[critique_index].accepted
+        ]
         if not items:
             return None
-        rows = [bundle.source_row for bundle, _, _ in items]
+        rows = [bundle.source_row for bundle, _, _, _ in items]
         non_tensors = self._phase_non_tensors(source, rows)
         non_tensors["agent_name"] = np.array([BRANCH_REVISION_AGENT_NAME] * len(items), dtype=object)
         non_tensors["branch_revision_phase"] = np.array(["continuation"] * len(items), dtype=object)
         non_tensors["branch_revision_rollout_id"] = np.array(
-            [bundle.rollout_id for bundle, _, _ in items],
+            [bundle.rollout_id for bundle, _, _, _ in items],
             dtype=object,
         )
         non_tensors["branch_revision_critique_index"] = np.array(
-            [critique_index for _, critique_index, _ in items],
+            [critique_index for _, critique_index, _, _ in items],
             dtype=np.int64,
         )
+        non_tensors["branch_revision_candidate_kind"] = np.array(
+            [candidate_kind for _, _, candidate_kind, _ in items], dtype=object
+        )
         non_tensors["branch_revision_route_key"] = np.array(
-            [f"{bundle.rollout_id}:revision:{critique_index}" for bundle, critique_index, _ in items],
+            [
+                f"{bundle.rollout_id}:{candidate_kind}:continuation:{critique_index}"
+                for bundle, critique_index, candidate_kind, _ in items
+            ],
             dtype=object,
         )
         non_tensors["branch_revision_parent_prompt_ids"] = self._object_array(
-            [bundle.prompt_ids for bundle, _, _ in items]
+            [bundle.prompt_ids for bundle, _, _, _ in items]
         )
         non_tensors["branch_revision_revised_prefix_ids"] = self._object_array(
-            [list(critique.revised_prefix_ids) for _, _, critique in items]
+            [list(candidate.revised_prefix_ids) for _, _, _, candidate in items]
         )
         non_tensors["branch_revision_continuation_max_tokens"] = np.array(
-            [critique.continuation_max_tokens for _, _, critique in items],
+            [candidate.continuation_max_tokens for _, _, _, candidate in items],
             dtype=np.int64,
         )
         return DataProto.from_dict(
@@ -964,19 +1095,22 @@ class BranchRevisionGRPOController:
             log_probs=tuple(float(item) for item in value["log_probs"]),
             finish_reason=value.get("finish_reason"),
             max_tokens=int(value["max_tokens"]),
+            candidate_kind=str(value.get("candidate_kind", "diagnostic")),
         )
 
     def _extract_continuations(
         self,
         output: DataProto,
-    ) -> dict[tuple[str, int], BranchRevisionContinuationGeneration]:
+    ) -> dict[tuple[str, int, str], BranchRevisionContinuationGeneration]:
         raw = output.non_tensor_batch.pop(BRANCH_REVISION_CONTINUATION_FIELD, None)
         if raw is None or len(raw) != len(output):
             raise RuntimeError("branch-revision continuation stage did not return one record per accepted edit")
-        records: dict[tuple[str, int], BranchRevisionContinuationGeneration] = {}
+        records: dict[tuple[str, int, str], BranchRevisionContinuationGeneration] = {}
         for value in raw:
             record = self._coerce_continuation(value)
-            key = (record.rollout_id, record.critique_index)
+            if record.candidate_kind not in {"diagnostic", "control"}:
+                raise RuntimeError(f"invalid continuation candidate kind {record.candidate_kind!r}")
+            key = (record.rollout_id, record.critique_index, record.candidate_kind)
             if key in records:
                 raise RuntimeError(f"duplicate branch-revision continuation key {key!r}")
             records[key] = record
@@ -985,14 +1119,15 @@ class BranchRevisionGRPOController:
     def _attach_continuations(
         self,
         bundles: list[_Bundle],
-        continuations: dict[tuple[str, int], BranchRevisionContinuationGeneration],
+        continuations: dict[tuple[str, int, str], BranchRevisionContinuationGeneration],
     ) -> None:
         expected = {
-            (bundle.rollout_id, critique_index)
+            (bundle.rollout_id, critique_index, candidate_kind)
             for bundle in bundles
-            if bundle.record is not None
-            for critique_index, critique in enumerate(bundle.record.critiques)
-            if critique.valid and critique_index in bundle.learnability and bundle.learnability[critique_index].accepted
+            for critique_index, candidate_kind, candidate in self._candidate_entries(bundle)
+            if candidate.valid
+            and critique_index in self._candidate_learnability(bundle, candidate_kind)
+            and self._candidate_learnability(bundle, candidate_kind)[critique_index].accepted
         }
         if set(continuations) != expected:
             raise RuntimeError("branch-revision continuation stage returned an unexpected accepted-edit set")
@@ -1000,21 +1135,35 @@ class BranchRevisionGRPOController:
             if bundle.record is None:
                 continue
             critiques = list(bundle.record.critiques)
-            for critique_index, critique in enumerate(critiques):
-                key = (bundle.rollout_id, critique_index)
+            for critique_index, candidate_kind, candidate in self._candidate_entries(bundle):
+                key = (bundle.rollout_id, critique_index, candidate_kind)
                 if key not in expected:
                     continue
                 continuation = continuations[key]
-                if continuation.max_tokens != critique.continuation_max_tokens:
+                if continuation.max_tokens != candidate.continuation_max_tokens:
                     raise RuntimeError("branch-revision continuation changed its configured token budget")
                 if not continuation.token_ids or len(continuation.token_ids) != len(continuation.log_probs):
                     raise RuntimeError("branch-revision continuation tokens and behavior log probabilities misalign")
-                critiques[critique_index] = replace(
-                    critique,
-                    continuation_ids=continuation.token_ids,
-                    continuation_log_probs=continuation.log_probs,
-                    continuation_finish_reason=continuation.finish_reason,
-                )
+                if candidate_kind == "diagnostic":
+                    critiques[critique_index] = replace(
+                        critiques[critique_index],
+                        continuation_ids=continuation.token_ids,
+                        continuation_log_probs=continuation.log_probs,
+                        continuation_finish_reason=continuation.finish_reason,
+                    )
+                else:
+                    control = critiques[critique_index].counterfactual
+                    if control is None:
+                        raise RuntimeError("counterfactual continuation lost its paired control")
+                    critiques[critique_index] = replace(
+                        critiques[critique_index],
+                        counterfactual=replace(
+                            control,
+                            continuation_ids=continuation.token_ids,
+                            continuation_log_probs=continuation.log_probs,
+                            continuation_finish_reason=continuation.finish_reason,
+                        ),
+                    )
             bundle.record = replace(bundle.record, critiques=tuple(critiques))
 
     def _score_seed_learnability(self, bundles: list[_Bundle]) -> None:
@@ -1032,32 +1181,42 @@ class BranchRevisionGRPOController:
         admission_records: list[dict[str, Any]] = []
         proposals_by_length: defaultdict[
             int,
-            list[tuple[_Bundle, int, BranchRevisionCritiqueGeneration, list[float]]],
+            list[
+                tuple[
+                    _Bundle,
+                    int,
+                    str,
+                    BranchRevisionCritiqueGeneration | BranchRevisionCounterfactualGeneration,
+                    list[float],
+                ]
+            ],
         ] = defaultdict(list)
         for bundle in bundles:
             if bundle.record is None:
                 continue
-            for critique_index, critique in enumerate(bundle.record.critiques):
-                if not critique.valid:
+            for critique_index, candidate_kind, candidate in self._candidate_entries(bundle):
+                if not candidate.valid:
                     continue
                 if (
-                    not critique.new_continuation_ids
-                    or not critique.revised_prefix_ids
-                    or not critique.prefix_ids
-                    or [*critique.branch_prefix_ids, *critique.prefix_ids] != list(critique.continuation_prefix_ids)
-                    or [*critique.continuation_prefix_ids, *critique.new_continuation_ids]
-                    != list(critique.revised_prefix_ids)
+                    not candidate.new_continuation_ids
+                    or not candidate.revised_prefix_ids
+                    or not candidate.prefix_ids
+                    or [*candidate.branch_prefix_ids, *candidate.prefix_ids] != list(candidate.continuation_prefix_ids)
+                    or [*candidate.continuation_prefix_ids, *candidate.new_continuation_ids]
+                    != list(candidate.revised_prefix_ids)
                 ):
                     raise RuntimeError("valid branch revision has inconsistent prefix/joint token boundaries")
-                seed_length = len(critique.new_continuation_ids)
-                seed_values = _float32_list(critique.new_continuation_log_probs)
+                seed_length = len(candidate.new_continuation_ids)
+                seed_values = _float32_list(candidate.new_continuation_log_probs)
                 if len(seed_values) != seed_length:
                     raise RuntimeError(
                         "valid branch revision does not have one vLLM prompt log probability per replacement token"
                     )
                 if not all(math.isfinite(value) for value in seed_values):
                     raise RuntimeError("vLLM returned non-finite replacement-seed prompt log probabilities")
-                proposals_by_length[seed_length].append((bundle, critique_index, critique, seed_values))
+                proposals_by_length[seed_length].append(
+                    (bundle, critique_index, candidate_kind, candidate, seed_values)
+                )
 
         for seed_length in sorted(proposals_by_length):
             reference = build_learnability_reference(
@@ -1081,13 +1240,16 @@ class BranchRevisionGRPOController:
                 population_mean=reference.population_mean,
                 population_stddev=reference.population_stddev,
             )
-            for bundle, critique_index, critique, seed_values in proposals_by_length[seed_length]:
-                if critique_index not in bundle.score_admissions:
+            for bundle, critique_index, candidate_kind, candidate, seed_values in proposals_by_length[seed_length]:
+                admissions = self._candidate_score_admissions(bundle, candidate_kind)
+                if critique_index not in admissions:
                     raise RuntimeError("valid branch revision is missing its prompt-logprob admission result")
-                admission = bundle.score_admissions[critique_index]
+                admission = admissions[critique_index]
                 configured_capacity = self.config.actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens
                 expected_prompt_tokens = (
-                    len(bundle.prompt_ids) + len(critique.continuation_prefix_ids) + len(critique.new_continuation_ids)
+                    len(bundle.prompt_ids)
+                    + len(candidate.continuation_prefix_ids)
+                    + len(candidate.new_continuation_ids)
                 )
                 if configured_capacity is None:
                     if admission is not None:
@@ -1154,7 +1316,7 @@ class BranchRevisionGRPOController:
                     minimum_percentile=self.feature.min_seed_window_percentile,
                     full_credit_percentile=self.feature.full_credit_seed_window_percentile,
                 )
-                bundle.learnability[critique_index] = score
+                self._candidate_learnability(bundle, candidate_kind)[critique_index] = score
                 self._audit(
                     "learnability",
                     score_source="vllm_prompt_logprobs",
@@ -1162,17 +1324,18 @@ class BranchRevisionGRPOController:
                     rollout_id=bundle.rollout_id,
                     objective=bundle.record.objective,
                     critique_index=critique_index,
+                    candidate_kind=candidate_kind,
                     seed_tokens=seed_length,
                     logprob_statistic=score.logprob_statistic,
                     threshold_mode=score.threshold_mode,
                     seed_score=score.seed_score,
                     scoring_prompt_ids=[
                         *bundle.prompt_ids,
-                        *critique.continuation_prefix_ids,
-                        *critique.new_continuation_ids,
+                        *candidate.continuation_prefix_ids,
+                        *candidate.new_continuation_ids,
                     ],
-                    prompt_logprob_start=len(bundle.prompt_ids) + len(critique.continuation_prefix_ids),
-                    scored_token_ids=list(critique.new_continuation_ids),
+                    prompt_logprob_start=len(bundle.prompt_ids) + len(candidate.continuation_prefix_ids),
+                    scored_token_ids=list(candidate.new_continuation_ids),
                     scored_token_log_probs=seed_values,
                     prompt_logprob_admission=admission,
                     percentile=score.percentile,
@@ -1267,7 +1430,7 @@ class BranchRevisionGRPOController:
         rows: list[int] = []
         prompts: list[list[int]] = []
         responses: list[list[int]] = []
-        mapping: list[tuple[int, int]] = []
+        mapping: list[tuple[int, int, str]] = []
         for bundle_index, bundle in enumerate(bundles):
             if bundle.record is None:
                 continue
@@ -1276,39 +1439,40 @@ class BranchRevisionGRPOController:
                     raise RuntimeError("branch-revision critique tokens and behavior log probabilities misalign")
                 if not all(math.isfinite(value) for value in critique.log_probs):
                     raise RuntimeError("branch-revision critique contains non-finite behavior log probabilities")
-                if critique.valid:
+            for critique_index, candidate_kind, candidate in self._candidate_entries(bundle):
+                if candidate.valid:
                     if (
-                        not critique.new_continuation_ids
-                        or not critique.revised_prefix_ids
-                        or critique.continuation_max_tokens < self.feature.min_continuation_tokens
+                        not candidate.new_continuation_ids
+                        or not candidate.revised_prefix_ids
+                        or candidate.continuation_max_tokens < self.feature.min_continuation_tokens
                     ):
                         raise RuntimeError("valid branch revision lacks its parsed replacement record")
-                    learnability = bundle.learnability.get(critique_index)
+                    learnability = self._candidate_learnability(bundle, candidate_kind).get(critique_index)
                     if learnability is None:
                         raise RuntimeError("valid branch revision is missing its learnability assessment")
                     if learnability.accepted:
-                        if not critique.continuation_ids or len(critique.continuation_ids) != len(
-                            critique.continuation_log_probs
+                        if not candidate.continuation_ids or len(candidate.continuation_ids) != len(
+                            candidate.continuation_log_probs
                         ):
                             raise RuntimeError("accepted branch revision lacks one complete continuation record")
-                        if not all(math.isfinite(value) for value in critique.continuation_log_probs):
+                        if not all(math.isfinite(value) for value in candidate.continuation_log_probs):
                             raise RuntimeError(
                                 "branch-revision continuation contains non-finite behavior log probabilities"
                             )
                         rows.append(bundle.source_row)
                         prompts.append(bundle.prompt_ids)
-                        responses.append([*critique.revised_prefix_ids, *critique.continuation_ids])
-                        mapping.append((bundle_index, critique_index))
-                    elif critique.continuation_ids or critique.continuation_log_probs:
+                        responses.append([*candidate.revised_prefix_ids, *candidate.continuation_ids])
+                        mapping.append((bundle_index, critique_index, candidate_kind))
+                    elif candidate.continuation_ids or candidate.continuation_log_probs:
                         raise RuntimeError("learnability-rejected branch revision unexpectedly generated a suffix")
                 elif (
-                    critique.branch_prefix_ids
-                    or critique.prefix_ids
-                    or critique.continuation_prefix_ids
-                    or critique.new_continuation_ids
-                    or critique.revised_prefix_ids
-                    or critique.continuation_ids
-                    or critique.continuation_log_probs
+                    candidate.branch_prefix_ids
+                    or candidate.prefix_ids
+                    or candidate.continuation_prefix_ids
+                    or candidate.new_continuation_ids
+                    or candidate.revised_prefix_ids
+                    or candidate.continuation_ids
+                    or candidate.continuation_log_probs
                 ):
                     raise RuntimeError("invalid branch revision unexpectedly launched or retained a continuation")
         if not mapping:
@@ -1322,15 +1486,18 @@ class BranchRevisionGRPOController:
         reward_rows = reward_tensor.detach().cpu().tolist()
         if len(reward_rows) != len(mapping):
             raise RuntimeError("branch-revision continuation reward count does not match generated continuations")
-        for (bundle_index, critique_index), row in zip(mapping, reward_rows, strict=True):
+        for (bundle_index, critique_index, candidate_kind), row in zip(mapping, reward_rows, strict=True):
             reward = validate_binary_reward_row(row, tolerance=self.feature.reward_tolerance)
             bundle = bundles[bundle_index]
-            bundle.continuation_rewards[critique_index] = reward
+            self._candidate_rewards(bundle, candidate_kind)[critique_index] = reward
             critique = bundle.record.critiques[critique_index]
-            if bundle.record.objective == "compression":
+            candidate = critique if candidate_kind == "diagnostic" else critique.counterfactual
+            if candidate is None:
+                raise RuntimeError("counterfactual reward lost its paired control")
+            if bundle.record.objective == "compression" and candidate_kind == "diagnostic":
                 original_length = len(strip_terminal_eos(bundle.solution_ids, self.tokenizer))
                 revised_length = len(
-                    strip_terminal_eos([*critique.revised_prefix_ids, *critique.continuation_ids], self.tokenizer)
+                    strip_terminal_eos([*candidate.revised_prefix_ids, *candidate.continuation_ids], self.tokenizer)
                 )
                 compression_fraction = max(0.0, (original_length - revised_length) / original_length)
                 compression_credit = reward * min(
@@ -1341,18 +1508,21 @@ class BranchRevisionGRPOController:
                 bundle.compression_credits[critique_index] = compression_credit
             self._audit(
                 "continuation",
-                actor_row_id=f"continuation:{bundle.rollout_id}:{critique_index}",
+                actor_row_id=(
+                    f"continuation:{bundle.rollout_id}:{critique_index}" if candidate_kind == "diagnostic" else None
+                ),
+                candidate_kind=candidate_kind,
                 rollout_id=bundle.rollout_id,
                 objective=bundle.record.objective,
                 critique_index=critique_index,
                 reward=reward,
                 compression_fraction=bundle.compression_fractions.get(critique_index),
                 compression_credit=bundle.compression_credits.get(critique_index),
-                revised_prefix_ids=list(critique.revised_prefix_ids),
-                continuation_ids=list(critique.continuation_ids),
-                continuation_log_probs=_float32_list(critique.continuation_log_probs),
-                continuation_max_tokens=critique.continuation_max_tokens,
-                finish_reason=critique.continuation_finish_reason,
+                revised_prefix_ids=list(candidate.revised_prefix_ids),
+                continuation_ids=list(candidate.continuation_ids),
+                continuation_log_probs=_float32_list(candidate.continuation_log_probs),
+                continuation_max_tokens=candidate.continuation_max_tokens,
+                finish_reason=candidate.continuation_finish_reason,
             )
 
     @staticmethod
@@ -1392,6 +1562,9 @@ class BranchRevisionGRPOController:
                 if not critique_prompt:
                     raise RuntimeError("branch-revision critique omitted its exact behavior-policy prompt")
                 continuation_outcome = bundle.continuation_rewards.get(critique_index, 0.0)
+                counterfactual_outcome = bundle.counterfactual_continuation_rewards.get(critique_index, 0.0)
+                counterfactual_delta = continuation_outcome - counterfactual_outcome
+                counterfactual_uplift = max(0.0, counterfactual_delta)
                 baseline = prompt_pass_at_1[bundle.prompt_group_id]
                 learnability = bundle.learnability.get(critique_index)
                 learnability_weight = learnability.reward_weight if learnability is not None else 0.0
@@ -1410,6 +1583,8 @@ class BranchRevisionGRPOController:
                         critique_reward = (
                             continuation_outcome - baseline - invalid_penalty - learnability_rejection_penalty
                         )
+                    elif self.feature.critique_advantage_mode == "counterfactual_uplift":
+                        critique_reward = counterfactual_uplift
                     else:
                         critique_reward = objective_credit * learnability_weight - baseline
                 elif bundle.record.objective == "compression":
@@ -1458,6 +1633,9 @@ class BranchRevisionGRPOController:
                     reward=critique_reward,
                     objective_credit=objective_credit,
                     continuation_outcome=continuation_outcome,
+                    counterfactual_outcome=counterfactual_outcome,
+                    counterfactual_delta=counterfactual_delta,
+                    counterfactual_uplift=counterfactual_uplift,
                     prompt_pass_at_1=baseline,
                     learnability_accepted=accepted,
                     learnability_percentile=learnability.percentile if learnability is not None else None,
@@ -1495,6 +1673,58 @@ class BranchRevisionGRPOController:
                     reference_rollout_id=critique.reference_rollout_id,
                     reference_solution_ids=list(critique.reference_solution_ids),
                     finish_reason=critique.finish_reason,
+                    counterfactual=(
+                        None
+                        if critique.counterfactual is None
+                        else {
+                            "prompt_ids": list(critique.counterfactual.prompt_ids),
+                            "prefill_text": COUNTERFACTUAL_PREFILL_TEXT,
+                            "prefill_ids": list(critique.counterfactual.prefill_ids),
+                            "generated_token_ids": list(critique.counterfactual.generated_token_ids),
+                            "generated_log_probs": _float32_list(critique.counterfactual.generated_log_probs),
+                            "parse_reason": critique.counterfactual.parse_reason,
+                            "prefix": critique.counterfactual.prefix_text,
+                            "prefix_plus_new_continuation": (critique.counterfactual.prefix_plus_new_continuation_text),
+                            "new_continuation": critique.counterfactual.new_continuation_text,
+                            "branch_prefix_ids": list(critique.counterfactual.branch_prefix_ids),
+                            "prefix_ids": list(critique.counterfactual.prefix_ids),
+                            "continuation_prefix_ids": list(critique.counterfactual.continuation_prefix_ids),
+                            "new_continuation_ids": list(critique.counterfactual.new_continuation_ids),
+                            "new_continuation_log_probs": _float32_list(
+                                critique.counterfactual.new_continuation_log_probs
+                            )
+                            if critique.counterfactual.new_continuation_log_probs
+                            else [],
+                            "revised_prefix_ids": list(critique.counterfactual.revised_prefix_ids),
+                            "generated_continuation_ids": list(critique.counterfactual.continuation_ids),
+                            "generated_continuation_log_probs": _float32_list(
+                                critique.counterfactual.continuation_log_probs
+                            )
+                            if critique.counterfactual.continuation_log_probs
+                            else [],
+                            "continuation_max_tokens": critique.counterfactual.continuation_max_tokens,
+                            "finish_reason": critique.counterfactual.finish_reason,
+                            "continuation_finish_reason": critique.counterfactual.continuation_finish_reason,
+                            "learnability_accepted": bool(
+                                bundle.counterfactual_learnability.get(critique_index) is not None
+                                and bundle.counterfactual_learnability[critique_index].accepted
+                            ),
+                            "learnability_percentile": (
+                                bundle.counterfactual_learnability[critique_index].percentile
+                                if critique_index in bundle.counterfactual_learnability
+                                else None
+                            ),
+                            "learnability_weight": (
+                                bundle.counterfactual_learnability[critique_index].reward_weight
+                                if critique_index in bundle.counterfactual_learnability
+                                else 0.0
+                            ),
+                            "continuation_reward_evaluated": (
+                                critique_index in bundle.counterfactual_continuation_rewards
+                            ),
+                            "outcome": counterfactual_outcome,
+                        }
+                    ),
                 )
         if self.feature.critique_advantage_mode == "pass_at_1":
             rows = self._apply_external_critique_advantages(rows, prompt_pass_at_1)
@@ -1836,6 +2066,9 @@ class BranchRevisionGRPOController:
             critique for bundle in incorrect if bundle.record is not None for critique in bundle.record.critiques
         ]
         correct_critiques = [critique for bundle in correct if bundle.record for critique in bundle.record.critiques]
+        counterfactuals = [
+            critique.counterfactual for critique in incorrect_critiques if critique.counterfactual is not None
+        ]
         valid_count = sum(critique.valid for critique in critiques)
         accepted_count = sum(score.accepted for bundle in selected for score in bundle.learnability.values())
         incorrect_accepted = sum(score.accepted for bundle in incorrect for score in bundle.learnability.values())
@@ -1869,6 +2102,22 @@ class BranchRevisionGRPOController:
         ]
         compression_fractions = [value for bundle in correct for value in bundle.compression_fractions.values()]
         compression_credits = [value for bundle in correct for value in bundle.compression_credits.values()]
+        counterfactual_scores = [score for bundle in incorrect for score in bundle.counterfactual_learnability.values()]
+        counterfactual_valid = sum(control.valid for control in counterfactuals)
+        counterfactual_accepted = sum(score.accepted for score in counterfactual_scores)
+        counterfactual_successes = sum(sum(bundle.counterfactual_continuation_rewards.values()) for bundle in incorrect)
+        paired_outcomes = [
+            (
+                bundle.continuation_rewards.get(critique_index, 0.0),
+                bundle.counterfactual_continuation_rewards.get(critique_index, 0.0),
+            )
+            for bundle in incorrect
+            if bundle.record is not None
+            for critique_index, critique in enumerate(bundle.record.critiques)
+            if critique.counterfactual is not None
+        ]
+        counterfactual_deltas = [diagnostic - control for diagnostic, control in paired_outcomes]
+        counterfactual_uplifts = [max(0.0, delta) for delta in counterfactual_deltas]
         self_critique_rewards = [
             bundle.continuation_rewards.get(critique_index, 0.0) - prompt_pass_at_1[bundle.prompt_group_id]
             for bundle in selected
@@ -2031,6 +2280,45 @@ class BranchRevisionGRPOController:
             "branch_revision/recovery_reference_mode_is_successful_original": float(
                 self.feature.recovery_reference_mode == "successful_original"
             ),
+            "branch_revision/counterfactual/enabled": float(
+                self.feature.critique_advantage_mode == "counterfactual_uplift"
+            ),
+            "branch_revision/counterfactual/controls": float(len(counterfactuals)),
+            "branch_revision/counterfactual/valid_edits": float(counterfactual_valid),
+            "branch_revision/counterfactual/accepted_edits": float(counterfactual_accepted),
+            "branch_revision/counterfactual/continuation_successes": float(counterfactual_successes),
+            "branch_revision/counterfactual/diagnostic_wins": float(
+                sum(diagnostic > control for diagnostic, control in paired_outcomes)
+            ),
+            "branch_revision/counterfactual/control_wins": float(
+                sum(diagnostic < control for diagnostic, control in paired_outcomes)
+            ),
+            "branch_revision/counterfactual/ties": float(
+                sum(diagnostic == control for diagnostic, control in paired_outcomes)
+            ),
+            "branch_revision/counterfactual/uplift_nonzero_fraction": (
+                float(sum(value > 0.0 for value in counterfactual_uplifts) / len(counterfactual_uplifts))
+                if counterfactual_uplifts
+                else 0.0
+            ),
+            "branch_revision/counterfactual/groups_with_positive_uplift": float(
+                sum(
+                    any(
+                        bundle.continuation_rewards.get(index, 0.0)
+                        > bundle.counterfactual_continuation_rewards.get(index, 0.0)
+                        for index, critique in enumerate(bundle.record.critiques)
+                        if critique.counterfactual is not None
+                    )
+                    for bundle in incorrect
+                    if bundle.record is not None
+                )
+            ),
+            "branch_revision/counterfactual/generated_tokens": float(
+                sum(len(control.generated_token_ids) for control in counterfactuals)
+            ),
+            "branch_revision/counterfactual/continuation_tokens": float(
+                sum(len(control.continuation_ids) for control in counterfactuals)
+            ),
             "branch_revision/recovery_reference/eligible_incorrect": float(len(referenced_incorrect)),
             "branch_revision/recovery_reference/skipped_incorrect": float(len(skipped_incorrect)),
             "branch_revision/recovery_reference/assignments": float(len(reference_ids)),
@@ -2038,6 +2326,9 @@ class BranchRevisionGRPOController:
             "branch_revision/critique_grpo_grouping_is_batch": float(self.feature.critique_grpo_grouping == "batch"),
             "branch_revision/critique_advantage_mode_is_pass_at_1": float(
                 self.feature.critique_advantage_mode == "pass_at_1"
+            ),
+            "branch_revision/critique_advantage_mode_is_counterfactual_uplift": float(
+                self.feature.critique_advantage_mode == "counterfactual_uplift"
             ),
             "branch_revision/critique_advantage/raw_rms": (
                 float(np.sqrt(np.mean(np.square(np.asarray(critique_raw_advantages, dtype=np.float64)))))
@@ -2082,6 +2373,8 @@ class BranchRevisionGRPOController:
             ),
         }
         metrics.update(distribution_metrics(critique_rewards, "branch_revision/critique_reward"))
+        metrics.update(distribution_metrics(counterfactual_deltas, "branch_revision/counterfactual/raw_delta"))
+        metrics.update(distribution_metrics(counterfactual_uplifts, "branch_revision/counterfactual/uplift_reward"))
         metrics.update(distribution_metrics(critique_raw_advantages, "branch_revision/critique_raw_advantage"))
         metrics.update(distribution_metrics(critique_prompt_weights, "branch_revision/critique_prompt_weight"))
         metrics.update(distribution_metrics(critique_advantages, "branch_revision/critique_advantage"))
