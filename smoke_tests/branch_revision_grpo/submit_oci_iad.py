@@ -145,6 +145,7 @@ def _extra_args(
     n_prompts: int = 8,
     n_samples: int = 4,
     num_critiques: int = 4,
+    ppo_mini_batch_size: int = 8,
     critique_grpo_grouping: str = "per_original",
     critique_advantage_mode: str = "grpo",
     critique_prompt_weighting: str = "equal_prompt",
@@ -255,7 +256,7 @@ def _extra_args(
         "actor_rollout_ref.model.use_remove_padding=true",
         "actor_rollout_ref.model.enable_gradient_checkpointing=true",
         "actor_rollout_ref.actor.strategy=fsdp",
-        "actor_rollout_ref.actor.ppo_mini_batch_size=8",
+        f"actor_rollout_ref.actor.ppo_mini_batch_size={ppo_mini_batch_size}",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=null",
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.use_dynamic_bsz=true",
@@ -312,6 +313,7 @@ def _extra_args(
         f"+branch_revision_smoke.n_prompts={n_prompts}",
         f"+branch_revision_smoke.n_samples={n_samples}",
         f"+branch_revision_smoke.num_critiques={num_critiques}",
+        f"+branch_revision_smoke.ppo_mini_batch_size={ppo_mini_batch_size}",
         f"+branch_revision_smoke.critique_grpo_grouping={critique_grpo_grouping}",
         f"+branch_revision_smoke.critique_advantage_mode={critique_advantage_mode}",
         f"+branch_revision_smoke.critique_prompt_weighting={critique_prompt_weighting}",
@@ -358,6 +360,7 @@ def build_command(
     n_prompts: int = 8,
     n_samples: int = 4,
     num_critiques: int = 4,
+    ppo_mini_batch_size: int = 8,
     critique_grpo_grouping: str = "per_original",
     critique_advantage_mode: str = "grpo",
     critique_prompt_weighting: str = "equal_prompt",
@@ -392,6 +395,7 @@ def build_command(
         "n_prompts": n_prompts,
         "n_samples": n_samples,
         "num_critiques": num_critiques,
+        "ppo_mini_batch_size": ppo_mini_batch_size,
         "nodes": nodes,
         "max_prompt_length": max_prompt_length,
         "max_response_length": max_response_length,
@@ -591,6 +595,7 @@ def build_command(
             n_prompts=n_prompts,
             n_samples=n_samples,
             num_critiques=num_critiques,
+            ppo_mini_batch_size=ppo_mini_batch_size,
             critique_grpo_grouping=critique_grpo_grouping,
             critique_advantage_mode=critique_advantage_mode,
             critique_prompt_weighting=critique_prompt_weighting,
@@ -651,6 +656,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
     parser.add_argument("--n-prompts", type=int, default=8)
     parser.add_argument("--n-samples", type=int, default=4)
     parser.add_argument("--num-critiques", type=int, default=4)
+    parser.add_argument("--ppo-mini-batch-size", type=int, default=8)
     parser.add_argument("--critique-grpo-grouping", choices=("per_original", "batch"), default="per_original")
     parser.add_argument("--critique-advantage-mode", choices=("grpo", "pass_at_1"), default="grpo")
     parser.add_argument("--critique-prompt-weighting", choices=("equal_prompt", "headroom"), default="equal_prompt")
@@ -758,6 +764,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
         n_prompts=args.n_prompts,
         n_samples=args.n_samples,
         num_critiques=args.num_critiques,
+        ppo_mini_batch_size=args.ppo_mini_batch_size,
         critique_grpo_grouping=args.critique_grpo_grouping,
         critique_advantage_mode=args.critique_advantage_mode,
         critique_prompt_weighting=args.critique_prompt_weighting,
@@ -814,6 +821,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
             n_prompts=args.n_prompts,
             n_samples=args.n_samples,
             num_critiques=args.num_critiques,
+            ppo_mini_batch_size=args.ppo_mini_batch_size,
             critique_grpo_grouping=args.critique_grpo_grouping,
             critique_advantage_mode=args.critique_advantage_mode,
             critique_prompt_weighting=args.critique_prompt_weighting,

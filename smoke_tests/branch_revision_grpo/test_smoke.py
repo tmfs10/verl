@@ -189,6 +189,7 @@ def test_rendered_smoke_supports_two_node_32k_context_and_8k_answers(tmp_path: P
         n_prompts=64,
         n_samples=8,
         num_critiques=2,
+        ppo_mini_batch_size=64,
         nodes=2,
         max_prompt_length=2048,
         max_response_length=8192,
@@ -206,12 +207,14 @@ def test_rendered_smoke_supports_two_node_32k_context_and_8k_answers(tmp_path: P
     assert "data.max_prompt_length=2048" in rendered
     assert "data.max_response_length=8192" in rendered
     assert "actor_rollout_ref.rollout.n=8" in rendered
+    assert "actor_rollout_ref.actor.ppo_mini_batch_size=64" in rendered
     assert "actor_rollout_ref.rollout.max_model_len=32768" in rendered
     assert "actor_rollout_ref.rollout.prompt_logprob_max_inflight_tokens=null" in rendered
     assert "actor_rollout_ref.rollout.gpu_memory_utilization=0.6" in rendered
     assert "algorithm.branch_revision_grpo.critique_max_response_length=8192" in rendered
     assert "algorithm.branch_revision_grpo.num_critiques=2" in rendered
     assert "algorithm.branch_revision_grpo.num_positive_critiques=2" in rendered
+    assert "+branch_revision_smoke.ppo_mini_batch_size=64" in rendered
     assert "trainer.total_training_steps=5" in rendered
     assert "+branch_revision_smoke.training_steps=5" in rendered
     assert "--partition interactive" in rendered
@@ -510,6 +513,7 @@ def test_rendered_smoke_rejects_external_pass_at_1_with_compression(tmp_path: Pa
         ({"n_samples": 0}, "n_samples"),
         ({"n_samples": 1}, "warmup-only"),
         ({"num_critiques": 1}, "at least 2"),
+        ({"ppo_mini_batch_size": 0}, "ppo_mini_batch_size"),
         ({"seed": -1}, "nonnegative"),
         ({"model_path": "/hf_models/not-supported"}, "model_path"),
         ({"loss_mode": "not-supported"}, "loss_mode"),
@@ -652,6 +656,7 @@ def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
         "n_prompts": n_prompts,
         "n_samples": 4,
         "num_critiques": 6,
+        "ppo_mini_batch_size": 8,
         "critique_grpo_grouping": "per_original",
         "critique_advantage_mode": "grpo",
         "critique_prompt_weighting": "equal_prompt",
@@ -785,6 +790,7 @@ def _fixture(
     _write_json(root / "completed.json", completion)
     branch_config = {
         "num_critiques": 2,
+        "ppo_mini_batch_size": 8,
         "critique_grpo_grouping": critique_grpo_grouping,
         "critique_advantage_mode": critique_advantage_mode,
         "critique_invalid_penalty": 0.20,

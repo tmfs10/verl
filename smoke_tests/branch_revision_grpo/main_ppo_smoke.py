@@ -35,7 +35,6 @@ from verl.trainer.ppo.ray_trainer_branch_revision import validate_branch_revisio
 from verl.utils.device import auto_set_device
 
 EXPECTED = {
-    "actor_rollout_ref.actor.ppo_mini_batch_size": 8,
     "actor_rollout_ref.actor.ppo_epochs": 1,
     "algorithm.branch_revision_grpo.min_continuation_tokens": 128,
     "trainer.n_gpus_per_node": 8,
@@ -99,6 +98,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "n_prompts",
         "n_samples",
         "num_critiques",
+        "ppo_mini_batch_size",
         "critique_grpo_grouping",
         "critique_advantage_mode",
         "critique_prompt_weighting",
@@ -138,6 +138,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "actor_rollout_ref.rollout.n": smoke_contract["n_samples"],
         "algorithm.branch_revision_grpo.num_critiques": smoke_contract["num_critiques"],
         "algorithm.branch_revision_grpo.num_positive_critiques": smoke_contract["num_critiques"],
+        "actor_rollout_ref.actor.ppo_mini_batch_size": smoke_contract["ppo_mini_batch_size"],
         "algorithm.branch_revision_grpo.critique_grpo_grouping": smoke_contract["critique_grpo_grouping"],
         "algorithm.branch_revision_grpo.critique_advantage_mode": smoke_contract["critique_advantage_mode"],
         "algorithm.branch_revision_grpo.critique_prompt_weighting": smoke_contract["critique_prompt_weighting"],
@@ -187,6 +188,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "n_prompts",
         "n_samples",
         "num_critiques",
+        "ppo_mini_batch_size",
         "nodes",
         "max_prompt_length",
         "max_response_length",
