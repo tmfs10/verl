@@ -180,10 +180,21 @@ def test_objective_prompts_share_the_causal_and_exact_edit_contract() -> None:
     assert "never from the successful rollout" in BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
 
 
-def test_critique_instruction_is_a_new_user_turn_with_visible_assistant_output() -> None:
+def test_critique_instruction_is_a_new_user_turn_with_native_thinking_boundary() -> None:
     ids = encode_followup_user_turn(BRANCH_REVISION_CRITIQUE_PROMPT, TOKENIZER)
     text = decode_exact(ids, TOKENIZER)
     assert text.startswith("</assistant><user>The attempted solution above is incorrect.")
+    assert text.endswith("</user><assistant>")
+    assert not text.endswith("</user><assistant><think>\n\n</think>\n\n")
+
+
+def test_critique_instruction_honors_explicit_non_thinking_override() -> None:
+    ids = encode_followup_user_turn(
+        BRANCH_REVISION_CRITIQUE_PROMPT,
+        TOKENIZER,
+        chat_template_kwargs={"enable_thinking": False},
+    )
+    text = decode_exact(ids, TOKENIZER)
     assert text.endswith("</user><assistant><think>\n\n</think>\n\n")
 
 
@@ -1334,7 +1345,7 @@ def test_agent_loop_generates_and_parses_all_critiques_without_launching_scores_
         if kind.startswith("critique"):
             decoded_prompt = decode_exact(prompt, TOKENIZER)
             assert "</assistant><user>The attempted solution above is incorrect." in decoded_prompt
-            assert decoded_prompt.endswith("</user><assistant><think>\n\n</think>\n\n")
+            assert decoded_prompt.endswith("</user><assistant>")
         if kind == "critique[0]":
             text = _structured("dead", "better")
             return TokenOutput(token_ids=_ids(text), log_probs=[-0.2] * len(_ids(text)))
@@ -1360,7 +1371,7 @@ def test_agent_loop_generates_and_parses_all_critiques_without_launching_scores_
     record = output.extra_fields[BRANCH_REVISION_CHILD_FIELD]
     assert list(record.critique_prompt_ids[: len(_ids("qstart dead and waste"))]) == _ids("qstart dead and waste")
     assert decode_exact(record.critique_prompt_ids, TOKENIZER).endswith(
-        "</assistant><user>" + BRANCH_REVISION_CRITIQUE_PROMPT + "</user><assistant><think>\n\n</think>\n\n"
+        "</assistant><user>" + BRANCH_REVISION_CRITIQUE_PROMPT + "</user><assistant>"
     )
     assert [critique.parse_reason for critique in record.critiques] == ["valid", "tag_count"]
     assert record.objective == "recovery"
@@ -1976,7 +1987,8 @@ def test_controller_scores_learnability_without_admission_evidence_when_disabled
 
 def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revision_seed() -> None:
     controller = _controller()
-    valid = _critique(_structured("dead", "better"), valid=True, continuation=" solved")
+    native_thinking_critique = "<think>\nDiagnose the dead end.\n</think>\n\n" + _structured("dead", "better")
+    valid = _critique(native_thinking_critique, valid=True, continuation=" solved")
     invalid = _critique("invalid", valid=False)
     wrong = _Bundle(
         source_row=0,
@@ -2021,6 +2033,11 @@ def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revis
         actor_batch.batch["attention_mask"][critique_rows[0]].bool()
     ].tolist()
     assert packed_critique == [*expected_critique_prompt, *valid.token_ids]
+    valid_critique_mask = actor_batch.batch["response_mask"][critique_rows[0]].bool()
+    assert valid_critique_mask.sum().item() == len(valid.token_ids)
+    assert actor_batch.batch["old_log_probs"][critique_rows[0]][valid_critique_mask].tolist() == pytest.approx(
+        [-0.2] * len(valid.token_ids)
+    )
     critique_rewards = actor_batch.non_tensor_batch["branch_revision_reward"][critique_rows].tolist()
     assert critique_rewards == pytest.approx([0.5, -0.5])
     assert actor_batch.non_tensor_batch["branch_revision_reward"][continuation_row] == pytest.approx(1.0)

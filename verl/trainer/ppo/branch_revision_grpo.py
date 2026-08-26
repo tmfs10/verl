@@ -155,9 +155,9 @@ def encode_followup_user_turn(
     """Encode a genuine user follow-up plus assistant generation boundary.
 
     Deriving the suffix from the tokenizer's own chat template avoids hard-coding
-    model-specific role tokens. Disabling hidden thinking for this turn keeps the
-    generated critique itself visible and trainable; it does not change sampling
-    temperature or the original solution rollout.
+    model-specific role tokens. Chat-template options are preserved exactly so the
+    tokenizer's native generation mode remains authoritative unless the caller
+    explicitly overrides it.
     """
 
     apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
@@ -181,7 +181,6 @@ def encode_followup_user_turn(
             ]
         )
     template_kwargs = dict(chat_template_kwargs or {})
-    template_kwargs["enable_thinking"] = False
     rendered = apply_chat_template(
         messages,
         tokenize=False,
