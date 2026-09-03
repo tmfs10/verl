@@ -111,6 +111,7 @@ def test_rendered_branch_only_smoke_disables_seeded_revision_by_contract(tmp_pat
         ppo_mini_batch_size=32,
         critique_advantage_mode="counterfactual_uplift",
         recovery_reference_mode="none",
+        positive_compression_target=0.75,
         separate_critique_model=True,
         critique_warmup_steps=1,
         training_steps=2,
@@ -123,10 +124,27 @@ def test_rendered_branch_only_smoke_disables_seeded_revision_by_contract(tmp_pat
     )
     rendered = " ".join(command)
     assert "algorithm.branch_revision_grpo.revision_mode=branch_only" in rendered
+    assert "algorithm.branch_revision_grpo.positive_compression_target=0.75" in rendered
     assert "+branch_revision_smoke.revision_mode=branch_only" in rendered
     assert "trainer.experiment_name=branch_revision_branch_only_dppo_tv" in rendered
     assert "actor_rollout_ref.rollout.temperature=1.0" in rendered
     assert "trainer.logger=[file]" in rendered
+
+
+@pytest.mark.parametrize("target", [0.0, -0.1, 1.01, float("inf"), float("nan")])
+def test_smoke_launcher_rejects_invalid_positive_compression_target(tmp_path: Path, target: float) -> None:
+    with pytest.raises(ValueError, match="positive_compression_target must be in"):
+        _build_command(
+            revision_mode="branch_only",
+            run_tag="bad-compression-target",
+            dry_run=True,
+            python=Path("/python"),
+            launcher=Path("/launcher"),
+            verl_root=Path("/verl"),
+            reward_file=Path("/reward.py"),
+            config_dir=tmp_path,
+            positive_compression_target=target,
+        )
 
 
 def test_rendered_cw_dfw_smoke_preserves_algorithm_contract_and_cluster_policy(tmp_path: Path) -> None:

@@ -176,6 +176,7 @@ COMMON_ARGS=(
   --critique-grpo-grouping batch
   --critique-advantage-mode counterfactual_uplift
   --critique-prompt-weighting equal_prompt
+  --positive-compression-target 0.75
   --recovery-reference-mode none --loss-mode dppo_tv
 )
 

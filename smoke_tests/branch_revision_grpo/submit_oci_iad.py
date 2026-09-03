@@ -154,6 +154,7 @@ def _extra_args(
     recovery_reference_selection_seed: int = 0,
     enable_recovery: bool = True,
     enable_positive_compression: bool = True,
+    positive_compression_target: float = 0.25,
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
     learnability_logprob_statistic: str = "mean",
@@ -205,6 +206,8 @@ def _extra_args(
         raise ValueError("counterfactual_uplift critique advantages require recovery")
     if not isinstance(enable_positive_compression, bool):
         raise ValueError("enable_positive_compression must be boolean")
+    if not math.isfinite(positive_compression_target) or not 0.0 < positive_compression_target <= 1.0:
+        raise ValueError("positive_compression_target must be in (0, 1]")
     if learnability_logprob_statistic not in {"mean", "min"}:
         raise ValueError("learnability_logprob_statistic must be mean or min")
     if learnability_threshold_mode not in {"stddev", "percentile"}:
@@ -240,7 +243,7 @@ def _extra_args(
         "algorithm.branch_revision_grpo.critique_prompt_headroom_exponent=1.0",
         f"algorithm.branch_revision_grpo.enable_positive_compression={str(enable_positive_compression).lower()}",
         f"algorithm.branch_revision_grpo.num_positive_critiques={num_critiques}",
-        "algorithm.branch_revision_grpo.positive_compression_target=0.25",
+        f"algorithm.branch_revision_grpo.positive_compression_target={positive_compression_target}",
         f"algorithm.branch_revision_grpo.learnability_logprob_statistic={learnability_logprob_statistic}",
         f"algorithm.branch_revision_grpo.learnability_threshold_mode={learnability_threshold_mode}",
         f"algorithm.branch_revision_grpo.max_seed_window_stddevs={max_seed_window_stddevs}",
@@ -376,6 +379,7 @@ def build_command(
     recovery_reference_selection_seed: int = 0,
     enable_recovery: bool = True,
     enable_positive_compression: bool = True,
+    positive_compression_target: float = 0.25,
     seed: int = 43,
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
@@ -453,6 +457,8 @@ def build_command(
         raise ValueError("counterfactual_uplift critique advantages require recovery")
     if not isinstance(enable_positive_compression, bool):
         raise ValueError("enable_positive_compression must be boolean")
+    if not math.isfinite(positive_compression_target) or not 0.0 < positive_compression_target <= 1.0:
+        raise ValueError("positive_compression_target must be in (0, 1]")
     if (
         not isinstance(critique_warmup_steps, int)
         or isinstance(critique_warmup_steps, bool)
@@ -616,6 +622,7 @@ def build_command(
             recovery_reference_selection_seed=recovery_reference_selection_seed,
             enable_recovery=enable_recovery,
             enable_positive_compression=enable_positive_compression,
+            positive_compression_target=positive_compression_target,
             model_path=model_path,
             loss_mode=loss_mode,
             learnability_logprob_statistic=learnability_logprob_statistic,
@@ -686,6 +693,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
     parser.add_argument("--recovery-reference-selection-seed", type=int, default=0)
     parser.add_argument("--disable-recovery", action="store_true")
     parser.add_argument("--disable-positive-compression", action="store_true")
+    parser.add_argument("--positive-compression-target", type=float, default=0.25)
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument(
         "--model-path",
@@ -791,6 +799,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
         recovery_reference_selection_seed=args.recovery_reference_selection_seed,
         enable_recovery=not args.disable_recovery,
         enable_positive_compression=not args.disable_positive_compression,
+        positive_compression_target=args.positive_compression_target,
         seed=args.seed,
         model_path=args.model_path,
         loss_mode=args.loss_mode,
@@ -849,6 +858,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
             recovery_reference_selection_seed=args.recovery_reference_selection_seed,
             enable_recovery=not args.disable_recovery,
             enable_positive_compression=not args.disable_positive_compression,
+            positive_compression_target=args.positive_compression_target,
             seed=args.seed,
             model_path=args.model_path,
             loss_mode=args.loss_mode,
