@@ -198,6 +198,10 @@ algorithm:
     # Enable branch-analysis critiques and exact-prefix revised continuations.
     enable: false
 
+    # Required when enabled: branch_only selects a branch and samples the suffix naturally;
+    # seeded_revision retains the existing critique-proposed continuation seed.
+    revision_mode: null
+
     # Train critique tokens with a separate policy initialized from actor_rollout_ref.model.path.
     separate_critique_model: false
 

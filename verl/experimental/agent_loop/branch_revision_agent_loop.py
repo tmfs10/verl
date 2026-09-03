@@ -27,6 +27,7 @@ from verl.trainer.ppo.branch_revision_grpo import (
     encode_followup_user_turn,
     normalize_log_probs_float32,
     parse_branch_revision,
+    parse_branch_selection,
     strip_terminal_eos,
 )
 from verl.utils.config import omega_conf_to_dataclass
@@ -61,6 +62,11 @@ class BranchRevisionCounterfactualGeneration:
     continuation_log_probs: tuple[float, ...] = ()
     continuation_finish_reason: str | None = None
     continuation_max_tokens: int = 0
+    revision_mode: str = "seeded_revision"
+    match_kind: str = ""
+    match_start: int = -1
+    branch_end: int = -1
+    matched_source_text: str = ""
 
     @property
     def valid(self) -> bool:
@@ -90,6 +96,11 @@ class BranchRevisionCritiqueGeneration:
     reference_rollout_id: str | None = None
     reference_solution_ids: tuple[int, ...] = ()
     counterfactual: BranchRevisionCounterfactualGeneration | None = None
+    revision_mode: str = "seeded_revision"
+    match_kind: str = ""
+    match_start: int = -1
+    branch_end: int = -1
+    matched_source_text: str = ""
 
     @property
     def valid(self) -> bool:
@@ -102,6 +113,7 @@ class BranchRevisionGenerationRecord:
     objective: str
     critiques: tuple[BranchRevisionCritiqueGeneration, ...]
     critique_prompt_ids: tuple[int, ...]
+    revision_mode: str = "seeded_revision"
 
 
 @dataclass(frozen=True)
@@ -273,21 +285,61 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         response_ids: list[int],
         parent_prompt_ids: list[int],
     ) -> dict[str, Any]:
-        parsed = parse_branch_revision(
-            solution_ids,
-            response_ids,
-            self.tokenizer,
-            branch_max_tokens=self.feature.branch_max_tokens,
-            new_continuation_max_tokens=self.feature.new_continuation_max_tokens,
-        )
-        parse_reason = parsed.reason
-        branch_prefix_ids = list(parsed.branch_prefix_ids)
-        prefix_ids = list(parsed.prefix_ids)
-        continuation_prefix_ids = list(parsed.continuation_prefix_ids)
-        new_continuation_ids = list(parsed.new_continuation_ids)
-        revised_prefix_ids = list(parsed.revised_prefix_ids)
+        if self.feature.revision_mode == "branch_only":
+            selection = parse_branch_selection(
+                solution_ids,
+                response_ids,
+                self.tokenizer,
+                branch_max_tokens=self.feature.branch_max_tokens,
+            )
+            parsed_fields = {
+                "valid": selection.valid,
+                "parse_reason": selection.reason,
+                "prefix_text": selection.prefix_text,
+                "prefix_plus_new_continuation_text": "",
+                "new_continuation_text": "",
+                "branch_prefix_ids": [],
+                "prefix_ids": [],
+                "continuation_prefix_ids": list(selection.retained_solution_ids),
+                "new_continuation_ids": [],
+                "revised_prefix_ids": list(selection.retained_solution_ids),
+                "match_kind": selection.match_kind,
+                "match_start": selection.match_start,
+                "branch_end": selection.branch_end,
+                "matched_source_text": selection.matched_source_text,
+            }
+        else:
+            parsed = parse_branch_revision(
+                solution_ids,
+                response_ids,
+                self.tokenizer,
+                branch_max_tokens=self.feature.branch_max_tokens,
+                new_continuation_max_tokens=self.feature.new_continuation_max_tokens,
+            )
+            parsed_fields = {
+                "valid": parsed.valid,
+                "parse_reason": parsed.reason,
+                "prefix_text": parsed.prefix_text,
+                "prefix_plus_new_continuation_text": parsed.prefix_plus_new_continuation_text,
+                "new_continuation_text": parsed.new_continuation_text,
+                "branch_prefix_ids": list(parsed.branch_prefix_ids),
+                "prefix_ids": list(parsed.prefix_ids),
+                "continuation_prefix_ids": list(parsed.continuation_prefix_ids),
+                "new_continuation_ids": list(parsed.new_continuation_ids),
+                "revised_prefix_ids": list(parsed.revised_prefix_ids),
+                "match_kind": "exact_or_normalized",
+                "match_start": parsed.branch_start,
+                "branch_end": -1,
+                "matched_source_text": "",
+            }
+        parse_reason = str(parsed_fields["parse_reason"])
+        branch_prefix_ids = list(parsed_fields["branch_prefix_ids"])
+        prefix_ids = list(parsed_fields["prefix_ids"])
+        continuation_prefix_ids = list(parsed_fields["continuation_prefix_ids"])
+        new_continuation_ids = list(parsed_fields["new_continuation_ids"])
+        revised_prefix_ids = list(parsed_fields["revised_prefix_ids"])
         continuation_max_tokens = 0
-        if parsed.valid:
+        if parsed_fields["valid"]:
             continuation_max_tokens = min(
                 self.response_length - len(revised_prefix_ids),
                 self.max_model_len - len(parent_prompt_ids) - len(revised_prefix_ids),
@@ -302,15 +354,20 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 continuation_max_tokens = 0
         return {
             "parse_reason": parse_reason,
-            "prefix_text": parsed.prefix_text,
-            "prefix_plus_new_continuation_text": parsed.prefix_plus_new_continuation_text,
-            "new_continuation_text": parsed.new_continuation_text,
+            "prefix_text": parsed_fields["prefix_text"],
+            "prefix_plus_new_continuation_text": parsed_fields["prefix_plus_new_continuation_text"],
+            "new_continuation_text": parsed_fields["new_continuation_text"],
             "branch_prefix_ids": branch_prefix_ids,
             "prefix_ids": prefix_ids,
             "continuation_prefix_ids": continuation_prefix_ids,
             "new_continuation_ids": new_continuation_ids,
             "revised_prefix_ids": revised_prefix_ids,
             "continuation_max_tokens": continuation_max_tokens,
+            "revision_mode": self.feature.revision_mode,
+            "match_kind": parsed_fields["match_kind"],
+            "match_start": parsed_fields["match_start"],
+            "branch_end": parsed_fields["branch_end"],
+            "matched_source_text": parsed_fields["matched_source_text"],
         }
 
     def _score_only_response(self, output: TokenOutput) -> list[int]:
@@ -330,6 +387,8 @@ class BranchRevisionAgentLoop(AgentLoopBase):
         started: float,
         **kwargs,
     ) -> AgentLoopOutput:
+        if self.feature.revision_mode != "seeded_revision":
+            raise ValueError("branch-only revision does not support a prompt-logprob score phase")
         rollout_id = str(kwargs["branch_revision_rollout_id"])
         critique_index = int(kwargs["branch_revision_critique_index"])
         candidate_kind = str(kwargs.get("branch_revision_candidate_kind", "diagnostic"))
@@ -533,13 +592,15 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 if not editable_reference:
                     raise ValueError(f"successful reference[{index}] is empty after removing terminal EOS")
                 reference_text = decode_exact(editable_reference, self.tokenizer)
-                critique_instruction = self.feature.successful_reference_critique_prompt.replace(
+                critique_instruction = self.feature.active_successful_reference_critique_prompt.replace(
                     "{successful_rollout}",
                     reference_text,
                 )
             else:
                 critique_instruction = (
-                    self.feature.critique_prompt if objective == "recovery" else self.feature.positive_critique_prompt
+                    self.feature.active_critique_prompt
+                    if objective == "recovery"
+                    else self.feature.active_positive_critique_prompt
                 )
             critique_instruction_ids = encode_followup_user_turn(
                 critique_instruction,
@@ -690,6 +751,11 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                         new_continuation_log_probs=(),
                         revised_prefix_ids=tuple(proposal["revised_prefix_ids"]),
                         continuation_max_tokens=int(proposal["continuation_max_tokens"]),
+                        revision_mode=str(proposal["revision_mode"]),
+                        match_kind=str(proposal["match_kind"]),
+                        match_start=int(proposal["match_start"]),
+                        branch_end=int(proposal["branch_end"]),
+                        matched_source_text=str(proposal["matched_source_text"]),
                     )
                 except Exception as error:
                     processing_errors.append(f"counterfactual[{index}]: {error!r}")
@@ -722,6 +788,11 @@ class BranchRevisionAgentLoop(AgentLoopBase):
                 reference_rollout_id=record["reference_rollout_id"],
                 reference_solution_ids=tuple(record["reference_solution_ids"]),
                 counterfactual=record.get("counterfactual"),
+                revision_mode=str(record["revision_mode"]),
+                match_kind=str(record["match_kind"]),
+                match_start=int(record["match_start"]),
+                branch_end=int(record["branch_end"]),
+                matched_source_text=str(record["matched_source_text"]),
             )
             for record in complete_records
         )
@@ -732,6 +803,7 @@ class BranchRevisionAgentLoop(AgentLoopBase):
             critique_prompt_ids=(
                 tuple(critique_prompts[0]) if all(prompt == critique_prompts[0] for prompt in critique_prompts) else ()
             ),
+            revision_mode=str(self.feature.revision_mode),
         )
         extra_fields = {
             BRANCH_REVISION_CHILD_FIELD: record,

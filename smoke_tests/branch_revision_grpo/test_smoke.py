@@ -29,9 +29,16 @@ from smoke_tests.branch_revision_grpo.submit_cw_dfw import CW_DFW_PROFILE
 from smoke_tests.branch_revision_grpo.submit_oci_iad import (
     _extra_args,
     _prepare_execution_config,
-    build_command,
+)
+from smoke_tests.branch_revision_grpo.submit_oci_iad import (
+    build_command as _build_command,
 )
 from smoke_tests.branch_revision_grpo.verify_smoke import _aggregate, _canonical_sha256, verify
+
+
+def build_command(**kwargs):
+    kwargs.setdefault("revision_mode", "seeded_revision")
+    return _build_command(**kwargs)
 
 
 def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(tmp_path: Path) -> None:
@@ -70,6 +77,56 @@ def test_rendered_smoke_contract_is_synchronous_temperature_one_and_wandb_free(t
     assert "--enable_wandb" not in command
     assert "--no_requeue" in command
     assert "--add_interactive" in command
+
+
+def test_smoke_launcher_requires_an_explicit_revision_mode(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="revision_mode must be explicitly set"):
+        _build_command(
+            run_tag="missing-mode",
+            dry_run=True,
+            python=Path("/python"),
+            launcher=Path("/launcher"),
+            verl_root=Path("/verl"),
+            reward_file=Path("/reward.py"),
+            config_dir=tmp_path,
+        )
+
+
+def test_rendered_branch_only_smoke_disables_seeded_revision_by_contract(tmp_path: Path) -> None:
+    command, _ = _build_command(
+        revision_mode="branch_only",
+        run_tag="branch-only",
+        dry_run=True,
+        python=Path("/python"),
+        launcher=Path("/launcher"),
+        verl_root=Path("/verl"),
+        reward_file=Path("/reward.py"),
+        config_dir=tmp_path,
+        profile=CW_DFW_PROFILE,
+        model_path="/hf_models/Qwen/Qwen3-4B",
+        nodes=2,
+        n_prompts=32,
+        n_samples=8,
+        num_critiques=2,
+        ppo_mini_batch_size=32,
+        critique_advantage_mode="counterfactual_uplift",
+        recovery_reference_mode="none",
+        separate_critique_model=True,
+        critique_warmup_steps=1,
+        training_steps=2,
+        max_prompt_length=2048,
+        max_response_length=8192,
+        critique_max_response_length=8192,
+        max_model_len=32768,
+        max_tokens_per_gpu=32768,
+        partition="interactive",
+    )
+    rendered = " ".join(command)
+    assert "algorithm.branch_revision_grpo.revision_mode=branch_only" in rendered
+    assert "+branch_revision_smoke.revision_mode=branch_only" in rendered
+    assert "trainer.experiment_name=branch_revision_branch_only_dppo_tv" in rendered
+    assert "actor_rollout_ref.rollout.temperature=1.0" in rendered
+    assert "trainer.logger=[file]" in rendered
 
 
 def test_rendered_cw_dfw_smoke_preserves_algorithm_contract_and_cluster_policy(tmp_path: Path) -> None:
@@ -636,6 +693,7 @@ def _scaled_runtime_config(tmp_path: Path):
                 "intermediate_mc_value": {"enable": False},
                 "branch_revision_grpo": {
                     "enable": True,
+                    "revision_mode": "seeded_revision",
                     "separate_critique_model": False,
                     "critique_warmup_steps": 0,
                     "critique_model_nnodes": 1,
@@ -679,6 +737,7 @@ def _scaled_runtime_config(tmp_path: Path):
 def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
     return {
         "model_path": str(tmp_path / "model"),
+        "revision_mode": "seeded_revision",
         "n_prompts": n_prompts,
         "n_samples": 4,
         "num_critiques": 6,
@@ -1841,7 +1900,7 @@ def test_verifier_accepts_only_expected_native_runtime_config_normalization(tmp_
 
 def test_verifier_rejects_smoke_without_a_valid_revision(tmp_path: Path) -> None:
     _fixture(tmp_path, include_continuation=False)
-    with pytest.raises(ValueError, match="no learnability-accepted"):
+    with pytest.raises(ValueError, match="no valid branch candidate"):
         verify(tmp_path)
 
 
@@ -2042,7 +2101,7 @@ def test_verifier_rejects_missing_attempt_selection_or_step_completion(tmp_path:
 
 
 def test_extra_args_contains_no_async_or_critic_training() -> None:
-    rendered = _extra_args("/output/evidence")
+    rendered = _extra_args("/output/evidence", revision_mode="seeded_revision")
     assert "critic.enable=false" in rendered
     assert "launch_reward_fn_async=false" in rendered
     assert "actor_rollout_ref.rollout.temperature=1.0" in rendered

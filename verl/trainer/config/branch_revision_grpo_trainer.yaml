@@ -20,6 +20,7 @@ algorithm:
   adv_estimator: grpo
   branch_revision_grpo:
     enable: true
+    revision_mode: seeded_revision
     enable_positive_compression: true
     separate_critique_model: false
     critique_warmup_steps: 0

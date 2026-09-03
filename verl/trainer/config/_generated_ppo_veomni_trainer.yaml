@@ -659,6 +659,7 @@ algorithm:
   branch_revision_grpo:
     _target_: verl.trainer.config.BranchRevisionGRPOConfig
     enable: false
+    revision_mode: null
     separate_critique_model: false
     critique_warmup_steps: 0
     critique_model_nnodes: 1

@@ -65,6 +65,22 @@ class ParsedBranchRevision:
 
 
 @dataclass(frozen=True)
+class ParsedBranchSelection:
+    valid: bool
+    reason: str
+    solution_text: str
+    critique_text: str
+    analysis_text: str = ""
+    prefix_text: str = ""
+    match_kind: str = ""
+    match_start: int = -1
+    branch_end: int = -1
+    matched_source_text: str = ""
+    retained_text: str = ""
+    retained_solution_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class RolloutLogProbPrefix:
     rollout_id: str
     log_probs: torch.Tensor
@@ -401,6 +417,36 @@ def _normalized_unique_prefix_location(branch_text: str, solution_text: str) -> 
     return semantic_start, formatting_gap_start
 
 
+def _normalized_unique_prefix_span(prefix_text: str, solution_text: str) -> tuple[int, int] | None:
+    """Map the existing unique-best normalized match back to its raw source span."""
+
+    normalized_prefix, _ = _normalize_branch_match_text(prefix_text)
+    normalized_solution, solution_offsets = _normalize_branch_match_text(solution_text)
+    if not normalized_prefix or not normalized_solution:
+        return None
+    match_lengths = _z_prefix_lengths(normalized_prefix, normalized_solution)
+    best_length = max(match_lengths, default=0)
+    if best_length <= 0:
+        return None
+    best_positions = [index for index, value in enumerate(match_lengths) if value == best_length]
+    if len(best_positions) != 1:
+        return (-1, -1)
+    normalized_start = best_positions[0]
+    match_start = solution_offsets[normalized_start]
+    branch_end = solution_offsets[normalized_start + best_length - 1] + 1
+
+    # When the complete normalized locator matched and the generated locator
+    # explicitly ends in formatting, preserve the corresponding formatting run
+    # from the source. This keeps complete lines and closing delimiters intact
+    # without estimating an end offset from the generated raw string length.
+    if best_length == len(normalized_prefix):
+        last_alphanumeric = max(index for index, character in enumerate(prefix_text) if character.isalnum())
+        if prefix_text[last_alphanumeric + 1 :]:
+            while branch_end < len(solution_text) and not solution_text[branch_end].isalnum():
+                branch_end += 1
+    return match_start, branch_end
+
+
 def _matching_explicit_block_opener(
     branch_text: str,
     solution_text: str,
@@ -634,6 +680,80 @@ def score_seed_learnability(
 
 def _invalid(reason: str, solution_text: str, critique_text: str) -> ParsedBranchRevision:
     return ParsedBranchRevision(False, reason, solution_text, critique_text)
+
+
+def _invalid_selection(reason: str, solution_text: str, critique_text: str) -> ParsedBranchSelection:
+    return ParsedBranchSelection(False, reason, solution_text, critique_text)
+
+
+def parse_branch_selection(
+    solution_ids: Iterable[int],
+    critique_ids: Iterable[int],
+    tokenizer: Any,
+    *,
+    branch_max_tokens: int,
+) -> ParsedBranchSelection:
+    """Parse one locator whose matched end is the natural-continuation boundary."""
+
+    editable_solution_ids = strip_terminal_eos(solution_ids, tokenizer)
+    canonical_critique_ids = strip_terminal_eos(critique_ids, tokenizer)
+    solution_text = decode_exact(editable_solution_ids, tokenizer)
+    critique_text = decode_exact(canonical_critique_ids, tokenizer)
+    if critique_text.count(PREFIX_OPEN) != 1 or critique_text.count(PREFIX_CLOSE) != 1:
+        return _invalid_selection("tag_count", solution_text, critique_text)
+    prefix_open = critique_text.index(PREFIX_OPEN)
+    prefix_content_start = prefix_open + len(PREFIX_OPEN)
+    prefix_close = critique_text.index(PREFIX_CLOSE)
+    if prefix_content_start > prefix_close:
+        return _invalid_selection("tag_order", solution_text, critique_text)
+    if critique_text[prefix_close + len(PREFIX_CLOSE) :].strip():
+        return _invalid_selection("text_after_tags", solution_text, critique_text)
+    analysis_text = critique_text[:prefix_open]
+    prefix_text = critique_text[prefix_content_start:prefix_close]
+    if not prefix_text or not prefix_text.strip():
+        return _invalid_selection("empty_prefix", solution_text, critique_text)
+    prefix_ids = [int(token) for token in tokenizer.encode(prefix_text, add_special_tokens=False)]
+    if not prefix_ids or len(prefix_ids) > branch_max_tokens:
+        return _invalid_selection("prefix_token_cap", solution_text, critique_text)
+
+    match_start = solution_text.find(prefix_text)
+    if match_start >= 0:
+        if solution_text.find(prefix_text, match_start + 1) >= 0:
+            return _invalid_selection("prefix_not_unique", solution_text, critique_text)
+        branch_end = match_start + len(prefix_text)
+        match_kind = "exact"
+    else:
+        normalized_span = _normalized_unique_prefix_span(prefix_text, solution_text)
+        if normalized_span is None:
+            return _invalid_selection("prefix_not_found", solution_text, critique_text)
+        match_start, branch_end = normalized_span
+        if match_start < 0:
+            return _invalid_selection("prefix_not_unique", solution_text, critique_text)
+        match_kind = "normalized"
+
+    retained_text = solution_text[:branch_end]
+    open_block_reason = branch_prefix_open_block_reason(retained_text)
+    if open_block_reason is not None:
+        return _invalid_selection(open_block_reason, solution_text, critique_text)
+    retained_solution_ids = [int(token) for token in tokenizer.encode(retained_text, add_special_tokens=False)]
+    if decode_exact(retained_solution_ids, tokenizer) != retained_text:
+        return _invalid_selection("continuation_prefix_not_roundtrip_exact", solution_text, critique_text)
+    if editable_solution_ids[: len(retained_solution_ids)] != retained_solution_ids:
+        return _invalid_selection("branch_not_at_token_boundary", solution_text, critique_text)
+    return ParsedBranchSelection(
+        valid=True,
+        reason="valid",
+        solution_text=solution_text,
+        critique_text=critique_text,
+        analysis_text=analysis_text,
+        prefix_text=prefix_text,
+        match_kind=match_kind,
+        match_start=match_start,
+        branch_end=branch_end,
+        matched_source_text=solution_text[match_start:branch_end],
+        retained_text=retained_text,
+        retained_solution_ids=tuple(retained_solution_ids),
+    )
 
 
 def parse_branch_revision(

@@ -46,6 +46,10 @@ from verl.trainer.config import (
     BRANCH_REVISION_CRITIQUE_PROMPT,
     BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT,
     BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT,
+    BRANCH_SELECTION_CORRECT_CRITIQUE_PROMPT,
+    BRANCH_SELECTION_CRITIQUE_PROMPT,
+    BRANCH_SELECTION_INCORRECT_CRITIQUE_PROMPT,
+    BRANCH_SELECTION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT,
     BranchRevisionGRPOConfig,
 )
 from verl.trainer.ppo import ray_trainer_branch_revision as branch_controller_module
@@ -57,6 +61,7 @@ from verl.trainer.ppo.branch_revision_grpo import (
     decode_exact,
     encode_followup_user_turn,
     parse_branch_revision,
+    parse_branch_selection,
     score_seed_learnability,
     strip_terminal_eos,
     validate_binary_reward_row,
@@ -180,6 +185,22 @@ def test_objective_prompts_share_the_causal_and_exact_edit_contract() -> None:
     assert BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT.count("{successful_rollout}") == 1
     assert "entire successful rollout hidden" in BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
     assert "never from the successful rollout" in BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
+
+
+def test_branch_selection_prompts_request_diagnosis_and_only_one_locator() -> None:
+    assert BRANCH_SELECTION_CRITIQUE_PROMPT == BRANCH_SELECTION_INCORRECT_CRITIQUE_PROMPT
+    for prompt in (BRANCH_SELECTION_INCORRECT_CRITIQUE_PROMPT, BRANCH_SELECTION_CORRECT_CRITIQUE_PROMPT):
+        assert "meaningfully narrowed" in prompt
+        assert "Do not propose, describe, or write a replacement direction or continuation." in " ".join(prompt.split())
+        assert "generate a new continuation naturally" in prompt
+        assert "<prefix + new continuation>" not in prompt
+        assert prompt.count("<prefix>") >= 1
+        assert "opening and closing $$ delimiter" in prompt
+    assert BRANCH_SELECTION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT.count("{successful_rollout}") == 1
+    assert "diagnostic reference only" in BRANCH_SELECTION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
+    assert "locate a span of the incorrect attempted solution" in " ".join(
+        BRANCH_SELECTION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT.split()
+    )
 
 
 def test_critique_instruction_is_a_new_user_turn_with_native_thinking_boundary() -> None:
@@ -333,6 +354,69 @@ def test_parser_allows_empty_free_form_analysis() -> None:
     assert parsed.analysis_text == ""
     assert parsed.prefix_text == "x"
     assert parsed.new_continuation_text == " new"
+
+
+def test_branch_selection_retains_the_exact_original_prefix_and_allows_empty_analysis() -> None:
+    solution = "useful setup\nwrong turn\nmore work"
+    parsed = parse_branch_selection(
+        _ids(solution),
+        _ids("<prefix>useful setup\n</prefix>"),
+        TOKENIZER,
+        branch_max_tokens=128,
+    )
+    assert parsed.valid
+    assert parsed.analysis_text == ""
+    assert parsed.match_kind == "exact"
+    assert parsed.branch_end == len("useful setup\n")
+    assert parsed.matched_source_text == "useful setup\n"
+    assert parsed.retained_text == "useful setup\n"
+    assert list(parsed.retained_solution_ids) == _ids("useful setup\n")
+
+
+def test_branch_selection_uses_the_existing_unique_normalized_locator_rule() -> None:
+    solution = "setup\nSo N*K = 9,143.\nwrong turn"
+    parsed = parse_branch_selection(
+        _ids(solution),
+        _ids("analysis\n<prefix>so n k 9 143!</prefix>"),
+        TOKENIZER,
+        branch_max_tokens=128,
+    )
+    assert parsed.valid
+    assert parsed.match_kind == "normalized"
+    assert parsed.retained_text == "setup\nSo N*K = 9,143.\n"
+    assert list(parsed.retained_solution_ids) == _ids(parsed.retained_text)
+
+
+@pytest.mark.parametrize(
+    ("critique", "reason"),
+    [
+        ("<prefix>same</prefix><prefix>same</prefix>", "tag_count"),
+        ("<prefix>$$</prefix>", "prefix_not_found"),
+        ("<prefix>same</prefix>", "prefix_not_unique"),
+        ("<prefix>unique</prefix>extra", "text_after_tags"),
+    ],
+)
+def test_branch_selection_rejects_ambiguous_or_malformed_locators(critique: str, reason: str) -> None:
+    solution = "same then same and unique"
+    parsed = parse_branch_selection(
+        _ids(solution),
+        _ids(critique),
+        TOKENIZER,
+        branch_max_tokens=128,
+    )
+    assert not parsed.valid
+    assert parsed.reason == reason
+
+
+def test_branch_selection_rejects_a_boundary_inside_display_math() -> None:
+    parsed = parse_branch_selection(
+        _ids("setup\n$$\nx + 1\n$$\nafter"),
+        _ids("diagnosis\n<prefix>x + 1</prefix>"),
+        TOKENIZER,
+        branch_max_tokens=128,
+    )
+    assert not parsed.valid
+    assert parsed.reason == "branch_inside_display_math"
 
 
 def test_parser_enforces_token_caps_without_trimming_contents() -> None:
@@ -899,6 +983,7 @@ def _runtime_config(loss_mode="dppo_tv"):
                 "branch_revision_grpo": {
                     "_target_": "verl.trainer.config.BranchRevisionGRPOConfig",
                     "enable": True,
+                    "revision_mode": "seeded_revision",
                     "num_critiques": 4,
                     "enable_positive_compression": True,
                     "num_positive_critiques": 4,
@@ -1256,6 +1341,7 @@ def _loop() -> BranchRevisionAgentLoop:
     loop = BranchRevisionAgentLoop.__new__(BranchRevisionAgentLoop)
     loop.feature = BranchRevisionGRPOConfig(
         enable=True,
+        revision_mode="seeded_revision",
         num_critiques=2,
         enable_positive_compression=True,
         num_positive_critiques=2,
@@ -1269,6 +1355,24 @@ def _loop() -> BranchRevisionAgentLoop:
     loop.rollout_config = SimpleNamespace(prompt_logprob_max_inflight_tokens=8192)
     loop.tokenizer = TOKENIZER
     return loop
+
+
+def test_branch_only_agent_builds_a_natural_prefix_without_a_seed_or_score_slice() -> None:
+    loop = _loop()
+    loop.feature = replace(loop.feature, revision_mode="branch_only")
+    proposal = loop._proposal_fields(
+        solution_ids=_ids("useful setup\nwrong turn\nmore work"),
+        response_ids=_ids("diagnosis\n<prefix>useful setup\n</prefix>"),
+        parent_prompt_ids=_ids("question"),
+    )
+    retained = _ids("useful setup\n")
+    assert proposal["parse_reason"] == "valid"
+    assert proposal["revision_mode"] == "branch_only"
+    assert proposal["continuation_prefix_ids"] == retained
+    assert proposal["revised_prefix_ids"] == retained
+    assert proposal["new_continuation_ids"] == []
+    assert proposal["new_continuation_text"] == ""
+    assert proposal["continuation_max_tokens"] == 256 - len(retained)
 
 
 def test_child_sampling_always_uses_temperature_one_and_processed_logprobs() -> None:
@@ -1809,7 +1913,7 @@ def test_gather_and_drain_cancels_every_task_when_parent_is_cancelled() -> None:
 
 def _controller() -> BranchRevisionGRPOController:
     controller = BranchRevisionGRPOController.__new__(BranchRevisionGRPOController)
-    controller.feature = BranchRevisionGRPOConfig(enable=True, num_critiques=2)
+    controller.feature = BranchRevisionGRPOConfig(enable=True, revision_mode="seeded_revision", num_critiques=2)
     controller.config = OmegaConf.create(
         {
             "algorithm": {"norm_adv_by_std_in_grpo": True},
@@ -1980,6 +2084,70 @@ def _control(*, valid: bool, continuation: str = "") -> BranchRevisionCounterfac
         continuation_log_probs=tuple([-0.3] * len(_ids(continuation))),
         continuation_finish_reason="stop",
         continuation_max_tokens=128,
+    )
+
+
+def _branch_only_critique(
+    *,
+    continuation: str,
+    counterfactual: BranchRevisionCounterfactualGeneration | None = None,
+) -> BranchRevisionCritiqueGeneration:
+    text = "The next step is where the trajectory stopped pruning.\n<prefix>start </prefix>"
+    critique_ids = _ids(text)
+    return BranchRevisionCritiqueGeneration(
+        token_ids=tuple(critique_ids),
+        log_probs=tuple([-0.2] * len(critique_ids)),
+        finish_reason="stop",
+        parse_reason="valid",
+        prefix_text="start ",
+        prefix_plus_new_continuation_text="",
+        new_continuation_text="",
+        branch_prefix_ids=(),
+        prefix_ids=(),
+        continuation_prefix_ids=tuple(_ids("start ")),
+        new_continuation_ids=(),
+        new_continuation_log_probs=(),
+        revised_prefix_ids=tuple(_ids("start ")),
+        continuation_ids=tuple(_ids(continuation)),
+        continuation_log_probs=tuple([-0.3] * len(_ids(continuation))),
+        continuation_finish_reason="stop",
+        continuation_max_tokens=128,
+        counterfactual=counterfactual,
+        revision_mode="branch_only",
+        match_kind="exact",
+        match_start=0,
+        branch_end=len("start "),
+        matched_source_text="start ",
+    )
+
+
+def _branch_only_control(*, continuation: str) -> BranchRevisionCounterfactualGeneration:
+    generated = _ids("start </prefix>")
+    return BranchRevisionCounterfactualGeneration(
+        prompt_ids=tuple(_ids("critique prompt" + COUNTERFACTUAL_PREFILL_TEXT)),
+        prefill_ids=tuple(_ids(COUNTERFACTUAL_PREFILL_TEXT)),
+        generated_token_ids=tuple(generated),
+        generated_log_probs=tuple([-0.2] * len(generated)),
+        finish_reason="stop",
+        parse_reason="valid",
+        prefix_text="start ",
+        prefix_plus_new_continuation_text="",
+        new_continuation_text="",
+        branch_prefix_ids=(),
+        prefix_ids=(),
+        continuation_prefix_ids=tuple(_ids("start ")),
+        new_continuation_ids=(),
+        new_continuation_log_probs=(),
+        revised_prefix_ids=tuple(_ids("start ")),
+        continuation_ids=tuple(_ids(continuation)),
+        continuation_log_probs=tuple([-0.3] * len(_ids(continuation))),
+        continuation_finish_reason="stop",
+        continuation_max_tokens=128,
+        revision_mode="branch_only",
+        match_kind="exact",
+        match_start=0,
+        branch_end=len("start "),
+        matched_source_text="start ",
     )
 
 
@@ -2173,6 +2341,7 @@ def test_counterfactual_uplift_reward_uses_positive_paired_difference_only(
     controller = _controller()
     controller.feature = BranchRevisionGRPOConfig(
         enable=True,
+        revision_mode="seeded_revision",
         critique_advantage_mode="counterfactual_uplift",
         enable_positive_compression=False,
         num_critiques=2,
@@ -2212,6 +2381,7 @@ def test_counterfactual_mode_leaves_mixed_compression_reward_unchanged_and_has_n
     controller = _controller()
     controller.feature = BranchRevisionGRPOConfig(
         enable=True,
+        revision_mode="seeded_revision",
         critique_advantage_mode="counterfactual_uplift",
         enable_positive_compression=True,
         num_critiques=2,
@@ -2238,6 +2408,100 @@ def test_counterfactual_mode_leaves_mixed_compression_reward_unchanged_and_has_n
     assert all(critique.counterfactual is None for critique in bundle.record.critiques)
 
 
+def test_branch_only_counterfactual_trains_only_the_natural_suffix_and_never_scores_a_seed() -> None:
+    controller = _controller()
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        revision_mode="branch_only",
+        critique_advantage_mode="counterfactual_uplift",
+        enable_positive_compression=False,
+        num_critiques=2,
+    )
+    control = _branch_only_control(continuation=" failed")
+    first = _branch_only_critique(continuation=" solved", counterfactual=control)
+    second = _branch_only_critique(continuation=" failed", counterfactual=control)
+    bundle = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord(
+            "p:0",
+            "recovery",
+            (first, second),
+            tuple(_ids("critique prompt")),
+            revision_mode="branch_only",
+        ),
+        continuation_rewards={0: 1.0, 1: 0.0},
+        counterfactual_continuation_rewards={0: 0.0, 1: 0.0},
+    )
+    with pytest.raises(RuntimeError, match="must not launch prompt-logprob scoring"):
+        controller._make_score_request(_source_batch()[0], [bundle])
+    with pytest.raises(RuntimeError, match="must not compute replacement-seed learnability"):
+        controller._score_seed_learnability([bundle])
+
+    rows = controller._actor_rows([bundle])
+    critique_rows = [row for row in rows if row.kind == "critique"]
+    continuation_rows = [row for row in rows if row.kind == "continuation"]
+    assert [row.reward for row in critique_rows] == [1.0, 0.0]
+    assert len(continuation_rows) == 2
+    for row, critique in zip(continuation_rows, (first, second), strict=True):
+        assert row.full_ids == [*_ids("q"), *_ids("start "), *critique.continuation_ids]
+        assert row.train_start == len(_ids("qstart "))
+        assert row.behavior_log_probs == list(critique.continuation_log_probs)
+
+    actor_batch, padding = controller._make_actor_batch([bundle])
+    metrics = controller._metrics([bundle], actor_batch, padding)
+    assert metrics["branch_revision/valid_branches"] == 2.0
+    assert metrics["branch_revision/accepted_branches"] == 2.0
+    assert metrics["branch_revision/learnability_accepted_edits"] == 0.0
+    assert metrics["branch_revision/learnability_rejected_edits"] == 0.0
+    assert metrics["branch_revision/continuations"] == 2.0
+
+
+def test_branch_only_continuations_attach_without_learnability_records() -> None:
+    controller = _controller()
+    controller.feature = replace(
+        controller.feature,
+        revision_mode="branch_only",
+        enable_positive_compression=False,
+    )
+    critique = _branch_only_critique(continuation="")
+    bundle = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
+        original_reward=0.0,
+        record=BranchRevisionGenerationRecord(
+            "p:0",
+            "recovery",
+            (critique, replace(critique, token_ids=tuple(_ids("second")), log_probs=tuple([-0.2] * 6))),
+            tuple(_ids("critique prompt")),
+            revision_mode="branch_only",
+        ),
+    )
+    continuations = {
+        ("p:0", index, "diagnostic"): BranchRevisionContinuationGeneration(
+            rollout_id="p:0",
+            critique_index=index,
+            token_ids=tuple(_ids(" natural")),
+            log_probs=tuple([-0.3] * len(_ids(" natural"))),
+            finish_reason="stop",
+            max_tokens=128,
+        )
+        for index in range(2)
+    }
+    controller._attach_continuations([bundle], continuations)
+    assert bundle.learnability == {}
+    assert all(item.continuation_ids == tuple(_ids(" natural")) for item in bundle.record.critiques)
+
+
 @pytest.mark.parametrize(
     ("separate", "global_step", "expected_actor_kinds", "expected_critique_kinds"),
     [
@@ -2253,6 +2517,7 @@ def test_critique_warmup_routes_only_requested_policy_rows(
     controller = _controller()
     controller.feature = BranchRevisionGRPOConfig(
         enable=True,
+        revision_mode="seeded_revision",
         num_critiques=2,
         separate_critique_model=separate,
         critique_warmup_steps=1,
@@ -2295,7 +2560,11 @@ def test_critique_warmup_routes_only_requested_policy_rows(
 
 def test_separate_critique_rollout_uses_its_own_checkpoint_lifecycle() -> None:
     controller = _controller()
-    controller.feature = BranchRevisionGRPOConfig(enable=True, separate_critique_model=True)
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        revision_mode="seeded_revision",
+        separate_critique_model=True,
+    )
     events: list[str] = []
     controller.trainer.critique_checkpoint_manager = SimpleNamespace(
         update_weights=lambda step: events.append(f"critique_restore:{step}"),
@@ -2385,6 +2654,7 @@ def test_batch_critique_grouping_normalizes_all_iteration_critiques_together() -
     controller = _controller()
     controller.feature = BranchRevisionGRPOConfig(
         enable=True,
+        revision_mode="seeded_revision",
         num_critiques=2,
         critique_grpo_grouping="batch",
     )
@@ -2459,6 +2729,7 @@ def test_pass_at_1_critique_advantages_keep_all_failure_signal_and_apply_penalti
     controller = _controller()
     controller.feature = BranchRevisionGRPOConfig(
         enable=True,
+        revision_mode="seeded_revision",
         num_critiques=2,
         critique_grpo_grouping="batch",
         critique_advantage_mode="pass_at_1",
@@ -2522,6 +2793,7 @@ def test_pass_at_1_prompt_weights_downweight_easier_prompts_without_recentering(
     controller = _controller()
     controller.feature = BranchRevisionGRPOConfig(
         enable=True,
+        revision_mode="seeded_revision",
         num_critiques=2,
         critique_grpo_grouping="batch",
         critique_advantage_mode="pass_at_1",
@@ -2562,6 +2834,7 @@ def test_pass_at_1_equal_prompt_weighting_gives_each_prompt_equal_total_mass() -
     controller = _controller()
     controller.feature = BranchRevisionGRPOConfig(
         enable=True,
+        revision_mode="seeded_revision",
         num_critiques=2,
         critique_grpo_grouping="batch",
         critique_advantage_mode="pass_at_1",
@@ -2618,6 +2891,7 @@ def test_pass_at_1_critique_advantages_reject_positive_compression() -> None:
     with pytest.raises(ValueError, match="currently supports recovery only"):
         BranchRevisionGRPOConfig(
             enable=True,
+            revision_mode="seeded_revision",
             num_critiques=2,
             critique_advantage_mode="pass_at_1",
             enable_positive_compression=True,
@@ -2659,6 +2933,7 @@ def test_positive_continuation_credit_uses_completed_editable_length(monkeypatch
     controller = _controller()
     controller.feature = BranchRevisionGRPOConfig(
         enable=True,
+        revision_mode="seeded_revision",
         num_critiques=2,
         enable_positive_compression=True,
         num_positive_critiques=2,
@@ -2810,6 +3085,7 @@ def test_child_request_selects_correct_rollouts_only_when_positive_compression_i
 
     controller.feature = BranchRevisionGRPOConfig(
         enable=True,
+        revision_mode="seeded_revision",
         num_critiques=2,
         enable_positive_compression=True,
         num_positive_critiques=3,
@@ -2824,6 +3100,7 @@ def test_child_request_can_select_compression_only() -> None:
     controller = _controller()
     controller.feature = BranchRevisionGRPOConfig(
         enable=True,
+        revision_mode="seeded_revision",
         num_critiques=2,
         enable_recovery=False,
         enable_positive_compression=True,

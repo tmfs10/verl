@@ -10,15 +10,19 @@ table { width: 100% !important; }
 
 # Branch-revision GRPO smoke
 
-This is a production-faithful, fully synchronous, multi-step acceptance smoke for Qwen3-1.7B or Qwen3-4B on the OPSD Math 30K training data. Its small default cell uses Qwen3-1.7B on one exclusive eight-GPU OCI-IAD node, four original rollouts per each of eight prompts, four IID recovery critiques for every incorrect original whose prompt also has a successful original, four IID compression critiques for every correct original, one revised continuation per learnability-accepted edit, a real actor optimizer step, temperature `1.0` for every generation, and no W&B logging. Each default recovery critique receives an independently selected successful original from its prompt. Prompt-logprob OOM acceptance uses the documented five-step Qwen3-4B cell below; a one-step run is only a plumbing check. Original solutions have a 2,048-token cap, and a valid edit must leave at least 128 tokens of continuation capacity. `--model-path`, `--n-prompts`, `--n-samples`, `--num-critiques`, and `--seed` may select or scale a timestamped acceptance retry; the launcher applies the critique count to both objectives and keeps the model, dataset batch, rollout multiplicity, and verifier expectations synchronized.
+This is a production-faithful, fully synchronous, multi-step acceptance smoke for Qwen3-1.7B or Qwen3-4B on the OPSD Math 30K training data. Every launch must explicitly choose `--revision-mode branch_only` or `--revision-mode seeded_revision`; there is no implicit behavior-changing default. `branch_only` asks the critique policy to diagnose and locate a branch point, discards the original suffix, and lets the actor generate a natural continuation from the exact retained prefix. `seeded_revision` retains the earlier joint prefix-plus-candidate-continuation workflow and its learnability gate. All generation uses temperature `1.0`, and smoke runs disable W&B by default.
 
-The default smoke allows up to 2,560 critique tokens inside an 8,192-token context; the launcher exposes prompt, answer, critique, context, per-GPU token-budget, and one/two-node dimensions for larger cells. Each critique is encoded as a genuine, context-aware follow-up user turn using the rollout worker's actor tokenizer and exact original conversation. The worker records the exact prompt token IDs used for sampling, and the trainer reuses those IDs verbatim. Chat-template options pass through unchanged, so Qwen uses its native thinking mode unless the run explicitly supplies `enable_thinking=False`; all generated thinking and visible critique tokens remain part of the trainable response. Free-form analysis is encouraged but optional and an otherwise valid response may begin directly with `<prefix>`. A critique ends with a locator `<prefix>P</prefix>` and a joint `<prefix + new continuation>P+C</prefix + new continuation>` field. The joint field must begin character-for-character with `P`; only the nonempty appended `C` is the new continuation. The parser prefers one exact unique location for `P`. When that text is absent, it lowercases and deletes non-alphanumeric characters, requires one uniquely best maximum-prefix location without a length threshold, and recovers only a stable token boundary inside the adjacent formatting-only gap. The revision replaces the original trajectory from the matched location onward with generated `P+C`, allowing the model to produce a natural transition jointly. Both boundaries around `P` must be stable token boundaries and outside `$$...$$`, `\[...\]`, LaTeX environments, and fenced code blocks; a complete delimited block may be included. The parser also requires ordered tags, no trailing text, and no final-answer marker in `C`.
+The small seeded-revision cell uses Qwen3-1.7B on one exclusive eight-GPU OCI-IAD node, four original rollouts per each of eight prompts, four IID recovery critiques for every incorrect original whose prompt also has a successful original, four IID compression critiques for every correct original, one revised continuation per learnability-accepted edit, and a real actor optimizer step. Each recovery critique receives an independently selected successful original from its prompt. Prompt-logprob OOM acceptance applies only to `seeded_revision` and uses the documented five-step Qwen3-4B cell below; a one-step run is only a plumbing check. Original solutions have a 2,048-token cap, and a valid branch must leave at least 128 tokens of continuation capacity. `--model-path`, `--n-prompts`, `--n-samples`, `--num-critiques`, and `--seed` may select or scale a timestamped acceptance retry; the launcher applies the critique count to both objectives and keeps the model, dataset batch, rollout multiplicity, and verifier expectations synchronized.
 
-After critique parsing, a separate blocking score phase asks vLLM for `prompt_logprobs=0` and `max_tokens=1`. It reuses the chosen-token prompt probabilities for only `C`, conditioned on the exact original prompt plus the matched pre-prefix trajectory and generated `P`. VeRL slices the result on the rollout replica, transports float32 `C` token scores, and fails closed on any alignment error; no separate trainer-model forward pass is required. The trainer then applies the global learnability gate and launches long suffix generation only for accepted edits, without prompt log probabilities. `learnability_logprob_statistic` selects either `mean` (the average `C`-token log probability) or `min` (the least likely `C` token). For each distinct `C` length, the trainer enumerates every contiguous window of exactly that length from every eligible original rollout and gives every window equal mass. Float64 prefix sums compute exhaustive means, while an exact reusable range-minimum index computes exhaustive minima; each length-specific distribution is built and sorted once. The default `stddev` threshold mode accepts an edit when its score is no more than 15 population standard deviations below its length-matched reference mean; accepted edits receive learnability weight one and rejected edits receive zero. Explicit `percentile` mode retains the historical 20th-percentile gate and linear credit ramp to full strength at the 50th percentile. Correct-parent critique credit additionally requires a correct continuation and scales with relative token compression, reaching full credit at 25% compression.
+The default smoke allows up to 2,560 critique tokens inside an 8,192-token context; the launcher exposes prompt, answer, critique, context, per-GPU token-budget, and one/two-node dimensions for larger cells. Each critique is encoded as a genuine, context-aware follow-up user turn using the rollout worker's actor tokenizer and exact original conversation. The worker records the exact prompt token IDs used for sampling, and the trainer reuses those IDs verbatim. Chat-template options pass through unchanged, so Qwen uses its native thinking mode unless the run explicitly supplies `enable_thinking=False`; all generated thinking and visible critique tokens remain part of the trainable response. Free-form analysis is encouraged but optional and an otherwise valid response may begin directly with `<prefix>`.
+
+In `branch_only`, the response ends with exactly one locator `<prefix>P</prefix>` and contains no proposed direction or continuation. The uniquely matched end of `P` is the branch boundary. Everything through that exact original token boundary is retained, the original suffix is discarded, and the actor samples the complete new suffix naturally. In `seeded_revision`, the response ends with `<prefix>P</prefix>` and `<prefix + new continuation>P+C</prefix + new continuation>`; only nonempty `C` is the proposed seed. Both parsers prefer one exact unique location for `P`. When that text is absent, they lowercase and delete non-alphanumeric characters, require one uniquely best maximum-prefix location without a length threshold, and recover only a stable token boundary inside the adjacent formatting-only gap. Every accepted boundary must be a stable token boundary outside `$$...$$`, `\[...\]`, LaTeX environments, and fenced code blocks; a complete delimited block may be included.
+
+Only `seeded_revision` runs the blocking vLLM score phase. It asks for `prompt_logprobs=0` and `max_tokens=1`, reuses the chosen-token prompt probabilities for only `C`, and applies the global learnability gate before launching long suffix generation. `branch_only` has no generated seed to score, so it launches no prompt-logprob request, builds no reference-window distribution, and applies no learnability rejection. In both modes, the actor trains only on naturally generated suffix tokens; retained original-prefix tokens are context and remain masked from the continuation-row loss.
 
 Prompt-logprob scoring is uncapped by default: the production path does not use the earlier 8,192-token weighted admission mechanism. It still requests only chosen-token probabilities with `prompt_logprobs=0`, scores edits in a separate blocking phase with `max_tokens=1`, applies the global learnability gate, and generates long suffixes only for accepted edits without prompt log probabilities. Normal original, critique, and suffix generation retain `max_num_seqs=32` and the normal 32K batched-token setting. The repaired cell reserves headroom with vLLM memory utilization `0.6`. It deliberately does not set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, because vLLM sleep mode uses a CUDA memory pool that rejects expandable segments during engine startup. Schema-v5 audits require admission evidence to be absent when the configured cap is `null`. The optional `--prompt-logprob-max-inflight-tokens` argument remains available for a controlled capped comparison, but it is not part of the default fix.
 
-`critique_advantage_mode=counterfactual_uplift` adds one paired no-diagnosis control for every recovery critique. The same critique-policy snapshot and exact critique prompt are reused, with the literal assistant prefill `<think>\n\n</think>\n\n<prefix>` forced before sampling. Diagnostic and control proposals independently pass through the same structural parser, vLLM prompt-logprob learnability gate, actor continuation generation, and binary environment reward. The diagnostic critique reward is `max(0, diagnostic_success - control_success)`; control tokens never enter either policy batch. Compression rows in a mixed run retain their existing correctness-times-compression reward and do not receive controls. Schema-v7 evidence records both paths, their exact token boundaries, the paired outcomes, uplift reward, and the absence of control actor rows.
+`critique_advantage_mode=counterfactual_uplift` adds one paired no-diagnosis control for every recovery critique. The same critique-policy snapshot and exact critique prompt are reused, with the literal assistant prefill `<think>\n\n</think>\n\n<prefix>` forced before sampling. In `branch_only`, diagnostic and control each select a branch, then receive independent natural actor continuations from their exact retained prefixes. In `seeded_revision`, both paths retain the structural parser and learnability gate before actor suffix generation. The diagnostic critique reward is `max(0, diagnostic_success - control_success)`; control tokens never enter either policy batch. Compression rows in a mixed run retain their existing correctness-times-compression reward and do not receive controls.
 
 For recovery reporting, `branch_revision/flip/success_per_valid_continuation` retains the historical accepted-edit denominator. `branch_revision/flip/success_per_continuation` uses every structurally valid recovery edit as its denominator, including generations rejected by the learnability gate, so it exposes the corresponding zero-outcome attempts.
 
@@ -52,7 +56,7 @@ An optional independent critique policy is enabled with `algorithm.branch_revisi
 
 The smoke launcher can prove a real process-boundary restore with `--resume-from-path /output/.../global_step_N --expected-resume-step N`. A resumed smoke fails before mutation if the exact expected step, actor checkpoint, independent `critique_actor_rollout` checkpoint, or dataloader state is missing. Its source and final manifests separately require native model, optimizer, and extra-state shards for both policies; FSDP extra state contains the scheduler and RNG state. The resumed run writes a new output root and audit attempt, trains only steps after `N`, and saves both policies again at the new terminal step. Fresh smokes retain `resume_mode=disable` and require an expected step of zero.
 
-The live GPU cell uses the default `dppo_tv` loss. CPU tests separately exercise both `dppo_tv` and native PPO clipping (`vanilla`) with identical global normalization. Every invocation writes a new schema-v6 audit-attempt directory, and `status.json` identifies the exact completed attempt to verify; an incomplete prior attempt can therefore coexist with a resumed or retried step without blocking it or being mistaken for current evidence. Schema v6 adds deterministic same-prompt successful-reference selection, per-critique behavior prompts and exact reference provenance, and the configured prompt-weighting mode to schema v5's learnability-threshold evidence. The verifier retains schema-v2 through schema-v5 support for historical evidence. Attempt metadata retains and hashes the exact runtime configuration. The verifier compares it with the saved launch configuration after applying only VeRL's deterministic pre-step normalization of resource-pool sizes and optimizer training-step counts; any other difference fails. For fresh and resumed multi-step runs it derives the exact expected contiguous step range from `starting_global_step`, requires every step in that range to finish, validates prompt-logprob admission evidence on every completed step, and deeply reconstructs the step with the largest admitted prompt-token volume. The integrity verifier independently reconstructs the joint boundary, vLLM `C` scoring slice, admission budget, exhaustive length-matched reference, threshold decision, successful-reference assignment, external prompt weights, and every post-balancing actor row—including masks and behavior log probabilities—from source events and tensor hashes. Strict acceptance requires a nonuniform logical critique reward group, a successful recovery, a finite positive optimizer gradient, and—when positive compression is enabled—a successful positive compression. Thus a complete zero-signal run can prove plumbing integrity without being mislabeled as algorithmic acceptance.
+The live GPU cell uses the default `dppo_tv` loss. CPU tests separately exercise both `dppo_tv` and native PPO clipping (`vanilla`) with identical global normalization. Every invocation writes a new schema-v8 audit-attempt directory, and `status.json` identifies the exact completed attempt to verify. Schema v8 records the explicit revision mode and, for `branch_only`, the original decoded source, locator match kind and offsets, matched source span, exact retained text/tokens, natural continuation tokens/log probabilities, masks, rewards, and absence of seeded-revision scoring evidence. The verifier retains schema-v2 through schema-v7 support for historical evidence. Attempt metadata retains and hashes the exact runtime configuration. Strict acceptance requires a nonuniform logical critique reward group, a successful recovery, a finite positive optimizer gradient, and—when positive compression is enabled—a successful positive compression. Thus a complete zero-signal run can prove plumbing integrity without being mislabeled as algorithmic acceptance.
 
 ## OCI-IAD workflow
 
@@ -65,12 +69,14 @@ RUN_DIR=/home/siddjain/data/intermediate_mc_value_model/verl/branch_revision_grp
 
 python3 -m smoke_tests.branch_revision_grpo.submit_oci_iad dry-run \
   --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR" \
+  --revision-mode seeded_revision \
   --model-path /hf_models/Qwen3-1.7B \
   --n-prompts 8 --n-samples 4 --num-critiques 4 --seed 43 \
   --learnability-logprob-statistic min
 
 python3 -m smoke_tests.branch_revision_grpo.submit_oci_iad submit \
   --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR" \
+  --revision-mode seeded_revision \
   --model-path /hf_models/Qwen3-1.7B \
   --n-prompts 8 --n-samples 4 --num-critiques 4 --seed 43 \
   --learnability-logprob-statistic min
@@ -95,6 +101,7 @@ The two-node 32K-context cell keeps every original and revised answer within an 
 ```bash
 python3 -m smoke_tests.branch_revision_grpo.submit_oci_iad dry-run \
   --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR" \
+  --revision-mode seeded_revision \
   --model-path /hf_models/Qwen3-4B \
   --n-prompts 64 --n-samples 8 --num-critiques 2 --seed 43 \
   --nodes 2 --max-prompt-length 2048 --max-response-length 8192 \
@@ -122,6 +129,7 @@ The two-step independent-policy lifecycle smoke allocates one actor node and one
 ```bash
 python3 -m smoke_tests.branch_revision_grpo.submit_oci_iad dry-run \
   --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR" \
+  --revision-mode seeded_revision \
   --model-path /hf_models/Qwen3-4B \
   --n-prompts 8 --n-samples 4 --num-critiques 2 --seed 43 \
   --nodes 2 --partition interactive --training-steps 2 \
@@ -142,6 +150,47 @@ execution snapshot from authoritative `cw-dfw.yaml`. It preserves CW's native
 route, requests two complete eight-GPU `interactive` nodes, disables W&B and
 validation, and forces the submitted scheduler record to `Requeue=0`.
 
+The branch-only acceptance cell mirrors the intended mixed recovery/compression
+production shape at smaller scale. It uses one actor node and one independent
+critique-policy node, prompt-level solution groups, one iteration-wide critique
+group with equal prompt weight, and paired counterfactual uplift for recovery.
+No candidate continuation or prompt-logprob scoring is permitted in this mode.
+
+```bash
+cd /home/siddjain/workspace/verl/verl_branch_revision_grpo
+RUN_TAG=branch-only-cw-dfw-2n-YYYYMMDDTHHMMSSZ
+RUN_DIR=/home/siddjain/data/intermediate_mc_value_model/verl/branch_only/smoke/$RUN_TAG
+
+COMMON_ARGS=(
+  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+  --revision-mode branch_only
+  --model-path /hf_models/Qwen/Qwen3-4B
+  --n-prompts 32 --n-samples 8 --num-critiques 2
+  --ppo-mini-batch-size 32 --seed 43
+  --nodes 2 --partition interactive --training-steps 2
+  --max-prompt-length 2048 --max-response-length 8192
+  --critique-max-response-length 8192 --max-model-len 32768
+  --max-tokens-per-gpu 32768 --gpu-memory-utilization 0.6
+  --separate-critique-model --critique-warmup-steps 1
+  --critique-model-nnodes 1 --critique-model-n-gpus-per-node 8
+  --critique-grpo-grouping batch
+  --critique-advantage-mode counterfactual_uplift
+  --critique-prompt-weighting equal_prompt
+  --recovery-reference-mode none --loss-mode dppo_tv
+)
+
+python3 -m smoke_tests.branch_revision_grpo.submit_cw_dfw dry-run "${COMMON_ARGS[@]}"
+python3 -m smoke_tests.branch_revision_grpo.submit_cw_dfw submit "${COMMON_ARGS[@]}"
+python3 -m smoke_tests.branch_revision_grpo.submit_cw_dfw status \
+  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+python3 -m smoke_tests.branch_revision_grpo.submit_cw_dfw collect \
+  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+python3 -m smoke_tests.branch_revision_grpo.submit_cw_dfw verify-integrity \
+  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+python3 -m smoke_tests.branch_revision_grpo.submit_cw_dfw verify \
+  --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+```
+
 The external-pass@1 recovery acceptance cell uses one actor node and one
 independent critique-policy node. It keeps every production algorithm setting
 except the deliberately shortened one-step warmup and two-step lifetime:
@@ -153,6 +202,7 @@ RUN_DIR=/home/siddjain/data/intermediate_mc_value_model/verl/cw_dfw_external_pas
 
 COMMON_ARGS=(
   --run-tag "$RUN_TAG" --local-run-dir "$RUN_DIR"
+  --revision-mode seeded_revision
   --model-path /hf_models/Qwen/Qwen3-4B
   --n-prompts 32 --n-samples 8 --num-critiques 2 --seed 43
   --nodes 2 --partition interactive --training-steps 2

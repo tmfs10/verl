@@ -95,6 +95,7 @@ def _resume_source_manifest(config) -> dict[str, Any] | None:
 def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any]) -> None:
     required_contract = {
         "model_path",
+        "revision_mode",
         "n_prompts",
         "n_samples",
         "num_critiques",
@@ -136,6 +137,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "data.train_batch_size": smoke_contract["n_prompts"],
         "data.gen_batch_size": smoke_contract["n_prompts"],
         "actor_rollout_ref.rollout.n": smoke_contract["n_samples"],
+        "algorithm.branch_revision_grpo.revision_mode": smoke_contract["revision_mode"],
         "algorithm.branch_revision_grpo.num_critiques": smoke_contract["num_critiques"],
         "algorithm.branch_revision_grpo.num_positive_critiques": smoke_contract["num_critiques"],
         "actor_rollout_ref.actor.ppo_mini_batch_size": smoke_contract["ppo_mini_batch_size"],
@@ -266,6 +268,8 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("branch-revision smoke prompt_logprob_max_inflight_tokens must be null or a positive integer")
     if not isinstance(smoke_contract["model_path"], str) or not smoke_contract["model_path"].startswith("/"):
         raise ValueError("branch-revision smoke model_path must be an absolute string path")
+    if smoke_contract["revision_mode"] not in {"branch_only", "seeded_revision"}:
+        raise ValueError("branch-revision smoke revision_mode must be branch_only or seeded_revision")
     if smoke_contract["loss_mode"] not in {"dppo_tv", "vanilla"}:
         raise ValueError("branch-revision smoke loss_mode must be dppo_tv or vanilla")
     if smoke_contract["learnability_logprob_statistic"] not in {"mean", "min"}:

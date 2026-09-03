@@ -27,8 +27,8 @@ from typing import Any
 
 import numpy as np
 
-_AUDIT_SCHEMA_VERSION = 7
-_SUPPORTED_AUDIT_SCHEMA_VERSIONS = {2, 3, 4, 5, 6, _AUDIT_SCHEMA_VERSION}
+_AUDIT_SCHEMA_VERSION = 8
+_SUPPORTED_AUDIT_SCHEMA_VERSIONS = {2, 3, 4, 5, 6, 7, _AUDIT_SCHEMA_VERSION}
 _COUNTERFACTUAL_PREFILL_TEXT = "<think>\n\n</think>\n\n<prefix>"
 
 
@@ -95,6 +95,108 @@ def _aggregate(values: Any, statistic: str) -> float:
     if statistic == "min":
         return min(normalized)
     raise ValueError(f"unsupported learnability log-probability statistic: {statistic!r}")
+
+
+def _normalize_locator(text: str) -> tuple[str, tuple[int, ...]]:
+    normalized: list[str] = []
+    offsets: list[int] = []
+    for offset, character in enumerate(text):
+        if not character.isalnum():
+            continue
+        lowered = character.lower()
+        normalized.extend(lowered)
+        offsets.extend([offset] * len(lowered))
+    return "".join(normalized), tuple(offsets)
+
+
+def _z_prefix_lengths(pattern: str, text: str) -> list[int]:
+    if not pattern or not text:
+        return [0] * len(text)
+    combined = f"{pattern}\0{text}"
+    z = [0] * len(combined)
+    left = 0
+    right = 0
+    for index in range(1, len(combined)):
+        if index <= right:
+            z[index] = min(right - index + 1, z[index - left])
+        while index + z[index] < len(combined) and combined[z[index]] == combined[index + z[index]]:
+            z[index] += 1
+        if index + z[index] - 1 > right:
+            left = index
+            right = index + z[index] - 1
+    start = len(pattern) + 1
+    return [min(value, len(pattern)) for value in z[start:]]
+
+
+def _normalized_unique_prefix_span(prefix_text: str, solution_text: str) -> tuple[int, int] | None:
+    normalized_prefix, _ = _normalize_locator(prefix_text)
+    normalized_solution, offsets = _normalize_locator(solution_text)
+    if not normalized_prefix or not normalized_solution:
+        return None
+    lengths = _z_prefix_lengths(normalized_prefix, normalized_solution)
+    best = max(lengths, default=0)
+    if best <= 0:
+        return None
+    positions = [index for index, value in enumerate(lengths) if value == best]
+    if len(positions) != 1:
+        return (-1, -1)
+    start = offsets[positions[0]]
+    end = offsets[positions[0] + best - 1] + 1
+    if best == len(normalized_prefix):
+        last_alphanumeric = max(index for index, character in enumerate(prefix_text) if character.isalnum())
+        if prefix_text[last_alphanumeric + 1 :]:
+            while end < len(solution_text) and not solution_text[end].isalnum():
+                end += 1
+    return start, end
+
+
+def _verify_branch_only_boundary(
+    candidate: dict[str, Any],
+    original: dict[str, Any],
+    *,
+    label: str,
+) -> None:
+    prefix = str(candidate.get("prefix", ""))
+    solution_text = str(original.get("editable_solution_text", ""))
+    match_kind = str(candidate.get("match_kind", ""))
+    match_start = int(candidate.get("match_start", -1))
+    branch_end = int(candidate.get("branch_end", -1))
+    if not prefix.strip() or not solution_text:
+        raise ValueError(f"{label} omitted its locator or decoded source text")
+    if match_kind == "exact":
+        expected_start = solution_text.find(prefix)
+        expected_span = (
+            None
+            if expected_start < 0 or solution_text.find(prefix, expected_start + 1) >= 0
+            else (expected_start, expected_start + len(prefix))
+        )
+    elif match_kind == "normalized":
+        expected_span = _normalized_unique_prefix_span(prefix, solution_text)
+    else:
+        raise ValueError(f"{label} used an unknown locator match kind")
+    if expected_span != (match_start, branch_end) or not 0 <= match_start < branch_end <= len(solution_text):
+        raise ValueError(f"{label} has inconsistent unique-match offsets")
+    if candidate.get("matched_source_text") != solution_text[match_start:branch_end]:
+        raise ValueError(f"{label} has inconsistent matched source text")
+    retained_text = solution_text[:branch_end]
+    if candidate.get("retained_text") != retained_text:
+        raise ValueError(f"{label} has inconsistent retained source text")
+    editable_ids = [int(token) for token in original["solution_ids"][: int(original["editable_solution_length"])]]
+    retained_ids = [int(token) for token in candidate.get("revised_prefix_ids", ())]
+    if not retained_ids or editable_ids[: len(retained_ids)] != retained_ids:
+        raise ValueError(f"{label} did not retain an exact token prefix of the original solution")
+    if [int(token) for token in candidate.get("continuation_prefix_ids", ())] != retained_ids:
+        raise ValueError(f"{label} changed its natural continuation prefix")
+    forbidden = (
+        "branch_prefix_ids",
+        "prefix_ids",
+        "new_continuation_ids",
+        "new_continuation_log_probs",
+        "prefix_plus_new_continuation",
+        "new_continuation",
+    )
+    if any(candidate.get(field) for field in forbidden):
+        raise ValueError(f"{label} unexpectedly retained a replacement seed")
 
 
 def _exhaustive_reference(
@@ -289,6 +391,10 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         raise ValueError("the current completed smoke invocation also has failure evidence")
     resolved_config = _read_json(root / "resolved_config.json")
     branch_config = resolved_config["algorithm"]["branch_revision_grpo"]
+    configured_revision_mode = branch_config.get("revision_mode")
+    revision_mode = str(configured_revision_mode or "seeded_revision")
+    if revision_mode not in {"branch_only", "seeded_revision"}:
+        raise ValueError(f"unsupported branch-revision mode in smoke evidence: {revision_mode!r}")
     trainer_config = resolved_config["trainer"]
     resume_mode = str(trainer_config.get("resume_mode", "disable"))
     expected_resume_step = int(trainer_config.get("expected_resume_step", 0) or 0)
@@ -391,6 +497,12 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     audit_schema_version = int(attempt.get("schema_version", -1))
     if audit_schema_version not in _SUPPORTED_AUDIT_SCHEMA_VERSIONS or attempt.get("attempt_id") != attempt_id:
         raise ValueError("audit attempt metadata has the wrong schema or attempt ID")
+    if audit_schema_version >= 8 and (
+        configured_revision_mode is None or attempt.get("revision_mode") != revision_mode
+    ):
+        raise ValueError("schema-v8 audit omitted or changed the explicit branch-revision mode")
+    if audit_schema_version < 8:
+        revision_mode = "seeded_revision"
     if audit_schema_version < 6:
         critique_prompt_weighting = "headroom"
         recovery_reference_mode = "none"
@@ -432,9 +544,10 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             int(event.get("schema_version", -1)) != audit_schema_version
             or event.get("attempt_id") != attempt_id
             or int(event.get("global_step", -1)) != filename_step
+            or (audit_schema_version >= 8 and event.get("revision_mode") != revision_mode)
             for event in step_events
         ):
-            raise ValueError("step audit mixes schema versions, attempt IDs, or global steps")
+            raise ValueError("step audit mixes schema versions, attempt IDs, global steps, or revision modes")
         if (
             step_events[-1].get("event") != "step_complete"
             or sum(event.get("event") == "step_complete" for event in step_events) != 1
@@ -487,15 +600,19 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             f"expected={expected_step_numbers!r} actual={actual_step_numbers!r}"
         )
 
-    # Deeply validate the completed step with the heaviest prompt-logprob
-    # workload. Every step's admission evidence was already validated above;
-    # the selected step receives the more expensive end-to-end reconstruction.
+    # Deeply validate the completed post-warmup step with the heaviest child
+    # workload. Seeded mode uses prompt-logprob pressure; branch-only mode uses
+    # the number of continuations because it intentionally has no score phase.
     deep_candidates = [item for item in audited_steps if int(item[1][0]["global_step"]) > critique_warmup_steps]
     if not deep_candidates:
         deep_candidates = audited_steps
     selected_audit_file, events, _ = max(
         deep_candidates,
-        key=lambda item: item[2],
+        key=(
+            (lambda item: item[2])
+            if revision_mode == "seeded_revision"
+            else (lambda item: sum(event.get("event") == "continuation" for event in item[1]))
+        ),
     )
     selected_step = int(events[0]["global_step"])
     event_counts = Counter(str(event.get("event")) for event in events)
@@ -507,7 +624,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     original_rewards = [_require_binary(value, "original reward") for value in iteration["original_rewards"]]
     if len(original_rewards) != expected_originals:
         raise ValueError(f"iteration audit must retain all {expected_originals} original binary rewards")
-    if iteration.get("learnability_logprob_statistic") != statistic:
+    if iteration.get("revision_mode", revision_mode) != revision_mode:
+        raise ValueError("iteration audit used a different revision mode than the resolved config")
+    if revision_mode == "seeded_revision" and iteration.get("learnability_logprob_statistic") != statistic:
         raise ValueError("iteration audit used a different learnability statistic than the resolved config")
     if iteration.get("critique_grpo_grouping", "per_original") != critique_grpo_grouping:
         raise ValueError("iteration audit used a different critique GRPO grouping than the resolved config")
@@ -568,6 +687,10 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             raise ValueError("original audit token/log-probability evidence is incomplete")
         if not 0 < editable_length <= len(solution_ids):
             raise ValueError("original audit has an invalid editable solution length")
+        if audit_schema_version >= 8 and revision_mode == "branch_only" and not isinstance(
+            original.get("editable_solution_text"), str
+        ):
+            raise ValueError("branch-only original audit omitted its decoded editable solution")
         _require_binary(original.get("reward"), "audited original reward")
 
     successful_by_prompt: defaultdict[str, list[str]] = defaultdict(list)
@@ -654,6 +777,8 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     ]
     reference_events = [event for event in events if event.get("event") == "learnability_reference"]
     learnability_events = [event for event in events if event.get("event") == "learnability"]
+    if revision_mode == "branch_only" and (reference_events or learnability_events):
+        raise ValueError("branch-only smoke unexpectedly ran replacement-seed learnability scoring")
     critique_advantage_events = [event for event in events if event.get("event") == "critique_advantage"]
     expected_critiques = len(eligible_recovery_ids) * num_critiques + (
         correct * num_positive_critiques if positive_compression_enabled else 0
@@ -661,7 +786,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     if len(critiques) != expected_critiques:
         raise ValueError(f"expected {expected_critiques} IID critiques, got {len(critiques)}")
     if require_algorithm_signal and not continuations:
-        raise ValueError("smoke produced no learnability-accepted revision and therefore no rewarded continuation")
+        raise ValueError("smoke produced no valid branch candidate and therefore no rewarded continuation")
 
     critique_keys: set[tuple[str, int]] = set()
     critique_by_key: dict[tuple[str, int], dict[str, Any]] = {}
@@ -756,7 +881,13 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
                 control_replacement_ids = [int(token) for token in control.get("new_continuation_ids", ())]
                 control_replacement_log_probs = _float32_values(control.get("new_continuation_log_probs", ()))
                 control_revised_prefix = [int(token) for token in control.get("revised_prefix_ids", ())]
-                if (
+                if revision_mode == "branch_only":
+                    _verify_branch_only_boundary(
+                        control,
+                        original,
+                        label=f"valid counterfactual control {key!r}",
+                    )
+                elif (
                     not control_prefix_ids
                     or not control_replacement_ids
                     or control_continuation_prefix != [*control_branch_prefix, *control_prefix_ids]
@@ -860,7 +991,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             revised_prefix_ids = [int(token) for token in critique.get("revised_prefix_ids", ())]
             generated_ids = [int(token) for token in critique.get("generated_continuation_ids", ())]
             generated_log_probs = _float32_values(critique.get("generated_continuation_log_probs", ()))
-            if audit_schema_version >= 4:
+            if revision_mode == "branch_only":
+                _verify_branch_only_boundary(critique, original, label=f"valid critique {key!r}")
+            elif audit_schema_version >= 4:
                 prefix = str(critique.get("prefix", ""))
                 joint = str(critique.get("prefix_plus_new_continuation", ""))
                 new_continuation = str(critique.get("new_continuation", ""))
@@ -884,7 +1017,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
                     or revised_prefix_ids != [*branch_prefix_ids, *replacement_ids]
                 ):
                     raise ValueError(f"valid critique {key!r} has inconsistent replacement boundaries")
-            if len(replacement_ids) != len(replacement_log_probs):
+            if revision_mode == "seeded_revision" and len(replacement_ids) != len(replacement_log_probs):
                 raise ValueError(f"valid critique {key!r} replacement token/log-probability lengths differ")
             if accepted:
                 if not generated_ids or len(generated_ids) != len(generated_log_probs):
@@ -1069,9 +1202,14 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     }
     if len(learnability_by_key) != len(learnability_events):
         raise ValueError("duplicate learnability evidence")
-    expected_learnability_keys = {
-        (rollout_id, critique_index, "diagnostic") for rollout_id, critique_index in structurally_valid_keys
-    } | {(rollout_id, critique_index, "control") for rollout_id, critique_index in control_structurally_valid_keys}
+    expected_learnability_keys = (
+        {
+            (rollout_id, critique_index, "diagnostic") for rollout_id, critique_index in structurally_valid_keys
+        }
+        | {(rollout_id, critique_index, "control") for rollout_id, critique_index in control_structurally_valid_keys}
+        if revision_mode == "seeded_revision"
+        else set()
+    )
     if set(learnability_by_key) != expected_learnability_keys:
         raise ValueError("every structurally valid edit must have exactly one learnability assessment")
     prompt_logprob_admissions: list[dict[str, Any]] = []
@@ -1321,7 +1459,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         (rollout_id, critique_index, "diagnostic") for rollout_id, critique_index in accepted_keys
     } | {(rollout_id, critique_index, "control") for rollout_id, critique_index in control_accepted_keys}
     if continuation_keys != expected_continuation_keys:
-        raise ValueError("learnability-accepted critiques and rewarded continuation evidence must be one-to-one")
+        raise ValueError("accepted branch candidates and rewarded continuation evidence must be one-to-one")
 
     expected_sources: dict[str, dict[str, Any]] = {}
     for rollout_id, original in original_by_rollout.items():
@@ -1596,7 +1734,9 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             correct * num_positive_critiques if positive_compression_enabled else 0
         ),
         "branch_revision/valid_edits": float(len(structurally_valid_keys)),
-        "branch_revision/learnability_accepted_edits": float(len(accepted_keys)),
+        "branch_revision/learnability_accepted_edits": float(
+            len(accepted_keys) if revision_mode == "seeded_revision" else 0
+        ),
         "branch_revision/continuations": float(len(continuations)),
         "branch_revision/policy_loss_is_dppo_tv": float(loss_mode == "dppo_tv"),
         "branch_revision/critique_grpo_grouping_is_batch": float(critique_grpo_grouping == "batch"),
@@ -1607,6 +1747,14 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         ),
         "branch_revision/critique_grpo_group_size_max": float(max(critique_groups.values(), default=0)),
     }
+    if audit_schema_version >= 8:
+        required_metrics.update(
+            {
+                "branch_revision/valid_branches": float(len(structurally_valid_keys)),
+                "branch_revision/accepted_branches": float(len(accepted_keys)),
+                "branch_revision/revision_mode_is_branch_only": float(revision_mode == "branch_only"),
+            }
+        )
     if "enable_recovery" in branch_config:
         required_metrics["branch_revision/recovery_enabled"] = float(recovery_enabled)
     if audit_schema_version >= 6:
@@ -1740,13 +1888,15 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         "audit_schema_version": audit_schema_version,
         "audit_attempt_id": attempt_id,
         "audit_file": str(selected_audit_file),
+        "revision_mode": revision_mode,
         "audit_files": [str(path) for path in audit_files],
         "selected_global_step": selected_step,
         "event_counts": dict(sorted(event_counts.items())),
         "incorrect_originals": incorrect,
         "correct_originals": correct,
         "valid_edits": len(structurally_valid_keys),
-        "learnability_accepted_edits": len(accepted_keys),
+        "learnability_accepted_edits": len(accepted_keys) if revision_mode == "seeded_revision" else 0,
+        "accepted_branches": len(accepted_keys),
         "successful_revisions": successful_revisions,
         "successful_compression_credit": successful_compressions,
         "policy_loss_mode": loss_mode,
@@ -1772,7 +1922,7 @@ def main() -> None:
     parser.add_argument(
         "--integrity-only",
         action="store_true",
-        help="verify complete schema-v2 through schema-v7 evidence without requiring nonzero revision learning signal",
+        help="verify complete schema-v2 through schema-v8 evidence without requiring nonzero revision learning signal",
     )
     args = parser.parse_args()
     result = verify(args.root, require_algorithm_signal=not args.integrity_only)

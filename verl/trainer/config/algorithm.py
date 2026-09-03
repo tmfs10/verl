@@ -25,6 +25,10 @@ __all__ = [
     "BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT",
     "BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT",
     "BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT",
+    "BRANCH_SELECTION_CORRECT_CRITIQUE_PROMPT",
+    "BRANCH_SELECTION_CRITIQUE_PROMPT",
+    "BRANCH_SELECTION_INCORRECT_CRITIQUE_PROMPT",
+    "BRANCH_SELECTION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT",
     "BranchRevisionGRPOConfig",
     "FilterGroupsConfig",
     "INTERMEDIATE_MC_CRITIQUE_PROMPT",
@@ -237,11 +241,142 @@ nothing after the closing </prefix + new continuation> tag."""
 BRANCH_REVISION_CRITIQUE_PROMPT = BRANCH_REVISION_INCORRECT_CRITIQUE_PROMPT
 
 
+BRANCH_SELECTION_INCORRECT_CRITIQUE_PROMPT = """\
+The attempted solution above is incorrect. Analyze it to identify where its
+reasoning trajectory first became unproductive or committed to a mistaken path.
+
+Reason about which parts or steps meaningfully narrowed the available
+possibilities or pruned the search space and which did not. Diagnose the
+mistake, dead end, unsupported assumption, or other failure that most affected
+the trajectory. Then select a branch point immediately before the trajectory
+committed to that failure.
+
+Everything after the selected branch point will be discarded. The model will
+generate a new continuation naturally from the question and the retained
+portion of the attempted solution. Do not propose, describe, or write a
+replacement direction or continuation.
+
+The text inside <prefix> is a locator, not the entire retained trajectory. Copy
+character-for-character from the attempted solution one complete line or short
+coherent span whose end is exactly the desired branch point. The system will
+retain everything from the beginning of the attempted solution through the end
+of the matched text.
+
+Choose the branch point so that:
+
+- It falls between coherent reasoning steps, thoughts, actions, or statements,
+  not in the middle of one.
+- It occurs immediately before the mistake or unproductive path that should be
+  reconsidered.
+- It preserves the useful reasoning that preceded the failure.
+- It leaves enough context to continue coherently and enough remaining token
+  budget to solve the task.
+- It does not fall inside an unfinished structural block, including between an
+  opening and closing $$ delimiter, inside a code fence, inside a tag, or
+  inside another explicitly delimited block.
+- It occurs before any final-answer declaration or statement that the task has
+  been completed.
+
+Copy the locator exactly. Include enough distinctive adjacent text that it
+occurs exactly once in the attempted solution. Do not correct, normalize,
+paraphrase, or reformat anything inside <prefix>.
+
+After the free-form analysis, end with exactly one <prefix> tag pair. Do not use
+the tag anywhere else, and write nothing after the closing </prefix> tag.
+
+<prefix>the exact unique span ending at the selected branch point</prefix>"""
+
+
+_BRANCH_SELECTION_REFERENCE_INSERT_AFTER = """\
+The attempted solution above is incorrect. Analyze it to identify where its
+reasoning trajectory first became unproductive or committed to a mistaken path."""
+
+_BRANCH_SELECTION_REFERENCE_INSERT = """\
+
+
+A different original rollout sampled independently for the same task was
+successful. Use it only as privileged evidence for comparing the trajectories
+and diagnosing where the attempted solution went wrong:
+
+<successful_rollout>
+{successful_rollout}
+</successful_rollout>
+
+The successful rollout is a diagnostic reference only. The text inside
+<prefix> must locate a span of the incorrect attempted solution, never a span
+of the successful rollout. Do not propose, describe, or write a replacement
+direction or continuation from the successful rollout."""
+
+
+def _build_branch_selection_successful_reference_prompt() -> str:
+    if BRANCH_SELECTION_INCORRECT_CRITIQUE_PROMPT.count(_BRANCH_SELECTION_REFERENCE_INSERT_AFTER) != 1:
+        raise RuntimeError("branch-selection prompt lost its successful-reference insertion boundary")
+    return BRANCH_SELECTION_INCORRECT_CRITIQUE_PROMPT.replace(
+        _BRANCH_SELECTION_REFERENCE_INSERT_AFTER,
+        _BRANCH_SELECTION_REFERENCE_INSERT_AFTER + _BRANCH_SELECTION_REFERENCE_INSERT,
+        1,
+    )
+
+
+BRANCH_SELECTION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT = _build_branch_selection_successful_reference_prompt()
+
+
+BRANCH_SELECTION_CORRECT_CRITIQUE_PROMPT = """\
+The solution above is correct. Analyze it to identify where its reasoning became
+unnecessarily long, repetitive, indirect, or otherwise inefficient.
+
+Reason about which parts or steps meaningfully narrowed the available
+possibilities or pruned the search space and which did not. Diagnose the
+redundancy, repetition, unnecessary detour, or other inefficiency that most
+increased the amount of reasoning required. Then select a branch point
+immediately before that inefficient portion began.
+
+Everything after the selected branch point will be discarded. The model will
+generate a new continuation naturally from the question and the retained
+portion of the solution. Do not propose, describe, or write a replacement
+direction or continuation.
+
+The text inside <prefix> is a locator, not the entire retained trajectory. Copy
+character-for-character from the solution one complete line or short coherent
+span whose end is exactly the desired branch point. The system will retain
+everything from the beginning of the solution through the end of the matched
+text.
+
+Choose the branch point so that:
+
+- It falls between coherent reasoning steps, thoughts, actions, or statements,
+  not in the middle of one.
+- It occurs immediately before the redundant, repetitive, or unnecessarily
+  indirect portion.
+- It preserves the useful and efficient reasoning that preceded that portion.
+- It leaves enough context for the model to continue coherently and reach the
+  correct result.
+- It leaves a meaningful opportunity to produce a shorter solution.
+- It does not fall inside an unfinished structural block, including between an
+  opening and closing $$ delimiter, inside a code fence, inside a tag, or
+  inside another explicitly delimited block.
+- It occurs before any final-answer declaration or statement that the task has
+  been completed.
+
+Copy the locator exactly. Include enough distinctive adjacent text that it
+occurs exactly once in the solution. Do not correct, normalize, paraphrase, or
+reformat anything inside <prefix>.
+
+After the free-form analysis, end with exactly one <prefix> tag pair. Do not use
+the tag anywhere else, and write nothing after the closing </prefix> tag.
+
+<prefix>the exact unique span ending at the selected branch point</prefix>"""
+
+
+BRANCH_SELECTION_CRITIQUE_PROMPT = BRANCH_SELECTION_INCORRECT_CRITIQUE_PROMPT
+
+
 @dataclass
 class BranchRevisionGRPOConfig(BaseConfig):
     """Synchronous policy-only GRPO over branch critiques and revised rollouts."""
 
     enable: bool = False
+    revision_mode: Optional[str] = None
     separate_critique_model: bool = False
     critique_warmup_steps: int = 0
     critique_model_nnodes: int = 1
@@ -274,9 +409,38 @@ class BranchRevisionGRPOConfig(BaseConfig):
     critique_prompt: str = BRANCH_REVISION_CRITIQUE_PROMPT
     successful_reference_critique_prompt: str = BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
     positive_critique_prompt: str = BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT
+    branch_selection_critique_prompt: str = BRANCH_SELECTION_CRITIQUE_PROMPT
+    branch_selection_successful_reference_critique_prompt: str = (
+        BRANCH_SELECTION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
+    )
+    branch_selection_positive_critique_prompt: str = BRANCH_SELECTION_CORRECT_CRITIQUE_PROMPT
     audit_output_dir: Optional[str] = None
 
+    @property
+    def active_critique_prompt(self) -> str:
+        return self.branch_selection_critique_prompt if self.revision_mode == "branch_only" else self.critique_prompt
+
+    @property
+    def active_successful_reference_critique_prompt(self) -> str:
+        if self.revision_mode == "branch_only":
+            return self.branch_selection_successful_reference_critique_prompt
+        return self.successful_reference_critique_prompt
+
+    @property
+    def active_positive_critique_prompt(self) -> str:
+        if self.revision_mode == "branch_only":
+            return self.branch_selection_positive_critique_prompt
+        return self.positive_critique_prompt
+
     def __post_init__(self):
+        if self.revision_mode is not None and self.revision_mode not in {"branch_only", "seeded_revision"}:
+            raise ValueError(
+                "algorithm.branch_revision_grpo.revision_mode must be explicitly set to branch_only or seeded_revision"
+            )
+        if self.enable and self.revision_mode is None:
+            raise ValueError(
+                "algorithm.branch_revision_grpo.revision_mode must be explicitly set when branch revision is enabled"
+            )
         if not isinstance(self.separate_critique_model, bool):
             raise ValueError("algorithm.branch_revision_grpo.separate_critique_model must be boolean")
         if (
@@ -392,6 +556,23 @@ class BranchRevisionGRPOConfig(BaseConfig):
         if self.positive_critique_prompt != BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT:
             raise ValueError(
                 "branch_revision_grpo.positive_critique_prompt must exactly match the positive-compression instruction"
+            )
+        if self.branch_selection_critique_prompt != BRANCH_SELECTION_CRITIQUE_PROMPT:
+            raise ValueError(
+                "branch_revision_grpo.branch_selection_critique_prompt must exactly match the branch-only instruction"
+            )
+        if (
+            self.branch_selection_successful_reference_critique_prompt
+            != BRANCH_SELECTION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
+        ):
+            raise ValueError(
+                "branch_revision_grpo.branch_selection_successful_reference_critique_prompt must exactly match the "
+                "branch-only successful-reference instruction"
+            )
+        if self.branch_selection_positive_critique_prompt != BRANCH_SELECTION_CORRECT_CRITIQUE_PROMPT:
+            raise ValueError(
+                "branch_revision_grpo.branch_selection_positive_critique_prompt must exactly match the branch-only "
+                "positive-compression instruction"
             )
 
 

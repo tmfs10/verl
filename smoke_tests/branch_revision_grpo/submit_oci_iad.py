@@ -142,6 +142,7 @@ def _force_no_requeue(profile: SmokeClusterProfile, job_id: str) -> str:
 def _extra_args(
     remote_evidence: str,
     *,
+    revision_mode: str | None = None,
     n_prompts: int = 8,
     n_samples: int = 4,
     num_critiques: int = 4,
@@ -174,6 +175,8 @@ def _extra_args(
     resume_from_path: str | None = None,
     expected_resume_step: int = 0,
 ) -> str:
+    if revision_mode not in {"branch_only", "seeded_revision"}:
+        raise ValueError("revision_mode must be explicitly set to branch_only or seeded_revision")
     if loss_mode not in {"dppo_tv", "vanilla"}:
         raise ValueError("loss_mode must be dppo_tv or vanilla")
     if critique_grpo_grouping not in {"per_original", "batch"}:
@@ -218,6 +221,7 @@ def _extra_args(
         "algorithm.use_kl_in_reward=false",
         "algorithm.intermediate_mc_value.enable=false",
         "algorithm.branch_revision_grpo.enable=true",
+        f"algorithm.branch_revision_grpo.revision_mode={revision_mode}",
         f"algorithm.branch_revision_grpo.separate_critique_model={str(separate_critique_model).lower()}",
         f"algorithm.branch_revision_grpo.critique_warmup_steps={critique_warmup_steps}",
         f"algorithm.branch_revision_grpo.critique_model_nnodes={critique_model_nnodes}",
@@ -296,7 +300,7 @@ def _extra_args(
         "trainer.critic_warmup=0",
         "trainer.logger=[file]",
         "trainer.project_name=branch_revision_grpo_smoke",
-        f"trainer.experiment_name=branch_revision_{loss_mode}_{learnability_logprob_statistic}_{learnability_threshold_mode}",
+        f"trainer.experiment_name=branch_revision_{revision_mode}_{loss_mode}",
         f"trainer.default_local_dir={remote_evidence}/../checkpoints",
         f"trainer.total_training_steps={training_steps}",
         "trainer.total_epochs=1",
@@ -312,6 +316,7 @@ def _extra_args(
         "trainer.load_dataloader_state_on_resume=true",
         "trainer.balance_batch=true",
         f"+branch_revision_smoke.output_dir={remote_evidence}",
+        f"+branch_revision_smoke.revision_mode={revision_mode}",
         f"+branch_revision_smoke.n_prompts={n_prompts}",
         f"+branch_revision_smoke.n_samples={n_samples}",
         f"+branch_revision_smoke.num_critiques={num_critiques}",
@@ -359,6 +364,7 @@ def build_command(
     verl_root: Path,
     reward_file: Path,
     config_dir: Path,
+    revision_mode: str | None = None,
     n_prompts: int = 8,
     n_samples: int = 4,
     num_critiques: int = 4,
@@ -393,6 +399,8 @@ def build_command(
     resume_from_path: str | None = None,
     expected_resume_step: int = 0,
 ) -> tuple[list[str], str]:
+    if revision_mode not in {"branch_only", "seeded_revision"}:
+        raise ValueError("revision_mode must be explicitly set to branch_only or seeded_revision")
     positive = {
         "n_prompts": n_prompts,
         "n_samples": n_samples,
@@ -596,6 +604,7 @@ def build_command(
         "--extra_args",
         _extra_args(
             remote_evidence,
+            revision_mode=revision_mode,
             n_prompts=n_prompts,
             n_samples=n_samples,
             num_critiques=num_critiques,
@@ -657,6 +666,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
     parser.add_argument("--verl-root", type=Path, default=DEFAULT_VERL)
     parser.add_argument("--reward-file", type=Path, default=DEFAULT_REWARD)
     parser.add_argument("--config-dir", type=Path, default=DEFAULT_CONFIG_DIR)
+    parser.add_argument("--revision-mode", choices=("branch_only", "seeded_revision"))
     parser.add_argument("--n-prompts", type=int, default=8)
     parser.add_argument("--n-samples", type=int, default=4)
     parser.add_argument("--num-critiques", type=int, default=4)
@@ -769,6 +779,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
         verl_root=repo_root,
         reward_file=args.reward_file,
         config_dir=execution_config_dir,
+        revision_mode=args.revision_mode,
         n_prompts=args.n_prompts,
         n_samples=args.n_samples,
         num_critiques=args.num_critiques,
@@ -826,6 +837,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
             verl_root=repo_root,
             reward_file=args.reward_file,
             config_dir=execution_config_dir,
+            revision_mode=args.revision_mode,
             n_prompts=args.n_prompts,
             n_samples=args.n_samples,
             num_critiques=args.num_critiques,
