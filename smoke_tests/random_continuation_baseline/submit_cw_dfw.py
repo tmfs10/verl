@@ -86,7 +86,7 @@ def _extra_args(remote_output: str, *, prompts: int, points: int, seed: int) -> 
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.top_p=1.0",
         "actor_rollout_ref.rollout.top_k=-1",
-        "actor_rollout_ref.rollout.repetition_penalty=1.0",
+        "+actor_rollout_ref.rollout.repetition_penalty=1.0",
         "actor_rollout_ref.rollout.logprobs_mode=processed_logprobs",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.max_model_len=32768",
