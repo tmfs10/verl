@@ -37,8 +37,14 @@ class RandomMarkSelection:
 
 
 def stable_random(seed: int, *parts: object) -> random.Random:
+    return random.Random(stable_seed(seed, *parts))
+
+
+def stable_seed(seed: int, *parts: object) -> int:
+    """Return a deterministic nonnegative per-request seed."""
+
     payload = "\x1f".join([str(seed), *(str(part) for part in parts)]).encode("utf-8")
-    return random.Random(int.from_bytes(hashlib.sha256(payload).digest()[:8], "big"))
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
 
 
 def strict_candidate_bounds(
@@ -112,7 +118,7 @@ def descriptive(values: Iterable[float]) -> dict[str, float | int | None]:
     array = np.asarray(list(values), dtype=np.float64)
     if not array.size:
         return {"count": 0, "mean": None, "std": None, "min": None, "median": None, "max": None}
-    return {
+    result = {
         "count": int(array.size),
         "mean": float(array.mean()),
         "std": float(array.std(ddof=0)),
@@ -120,6 +126,18 @@ def descriptive(values: Iterable[float]) -> dict[str, float | int | None]:
         "median": float(np.median(array)),
         "max": float(array.max()),
     }
+    for name, quantile in (
+        ("p01", 0.01),
+        ("p05", 0.05),
+        ("p10", 0.10),
+        ("p25", 0.25),
+        ("p75", 0.75),
+        ("p90", 0.90),
+        ("p95", 0.95),
+        ("p99", 0.99),
+    ):
+        result[name] = float(np.quantile(array, quantile))
+    return result
 
 
 def clustered_rate(
@@ -152,6 +170,39 @@ def clustered_rate(
         "successes": int(attempts.sum()),
         "attempt_weighted": float(attempts.mean()),
         "prompt_weighted": float(prompt_rates.mean()),
+        "cluster_bootstrap_ci95_low": float(np.quantile(bootstrap, 0.025)),
+        "cluster_bootstrap_ci95_high": float(np.quantile(bootstrap, 0.975)),
+    }
+
+
+def clustered_mean(
+    prompt_values: Sequence[Sequence[float]],
+    *,
+    bootstrap_samples: int,
+    seed: int,
+) -> dict[str, float | int | None]:
+    """Summarize arbitrary values with prompts as the bootstrap clusters."""
+
+    clusters = [np.asarray(values, dtype=np.float64) for values in prompt_values if values]
+    values = np.concatenate(clusters) if clusters else np.asarray([], dtype=np.float64)
+    if not clusters:
+        return {
+            "prompts": 0,
+            "observations": 0,
+            "observation_weighted": None,
+            "prompt_weighted": None,
+            "cluster_bootstrap_ci95_low": None,
+            "cluster_bootstrap_ci95_high": None,
+        }
+    prompt_means = np.asarray([cluster.mean() for cluster in clusters], dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    draws = rng.integers(0, len(clusters), size=(bootstrap_samples, len(clusters)))
+    bootstrap = prompt_means[draws].mean(axis=1)
+    return {
+        "prompts": len(clusters),
+        "observations": int(values.size),
+        "observation_weighted": float(values.mean()),
+        "prompt_weighted": float(prompt_means.mean()),
         "cluster_bootstrap_ci95_low": float(np.quantile(bootstrap, 0.025)),
         "cluster_bootstrap_ci95_high": float(np.quantile(bootstrap, 0.975)),
     }

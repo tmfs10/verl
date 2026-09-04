@@ -27,6 +27,7 @@ from verl.trainer.ppo.random_continuation_baseline import (
     RandomMarkSelection,
     select_structurally_valid_random_marks,
     stable_random,
+    stable_seed,
 )
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.tokenizer import normalize_token_ids
@@ -40,6 +41,7 @@ RANDOM_CONTINUATION_RECORD_FIELD = "__random_continuation_baseline_record__"
 class RandomContinuationGeneration:
     mark: int
     sample_index: int
+    sampling_seed: int
     token_ids: tuple[int, ...]
     log_probs: tuple[float, ...]
     finish_reason: str | None
@@ -48,6 +50,8 @@ class RandomContinuationGeneration:
 @dataclass(frozen=True)
 class RandomContinuationRecord:
     rollout_id: str
+    original_sample_index: int
+    original_sampling_seed: int
     editable_solution_length: int
     selection: RandomMarkSelection
     continuations: tuple[RandomContinuationGeneration, ...]
@@ -75,7 +79,7 @@ class RandomContinuationAgentLoop(AgentLoopBase):
         self.max_model_len = int(self.rollout_config.max_model_len)
 
     @staticmethod
-    def _sampling_params(base: dict[str, Any], *, max_tokens: int) -> dict[str, Any]:
+    def _sampling_params(base: dict[str, Any], *, max_tokens: int, sampling_seed: int) -> dict[str, Any]:
         if max_tokens <= 0:
             raise ValueError("random-continuation max_tokens must be positive")
         result = dict(base)
@@ -88,6 +92,7 @@ class RandomContinuationAgentLoop(AgentLoopBase):
                 "top_k": -1,
                 "repetition_penalty": 1.0,
                 "logprobs": True,
+                "seed": int(sampling_seed),
             }
         )
         return result
@@ -99,6 +104,7 @@ class RandomContinuationAgentLoop(AgentLoopBase):
         sampling_params: dict[str, Any],
         *,
         max_tokens: int,
+        sampling_seed: int,
         kind: str,
     ) -> TokenOutput:
         if len(prompt_ids) + max_tokens > self.max_model_len:
@@ -109,7 +115,11 @@ class RandomContinuationAgentLoop(AgentLoopBase):
         return await self.server_manager.generate(
             request_id=route_key,
             prompt_ids=prompt_ids,
-            sampling_params=self._sampling_params(sampling_params, max_tokens=max_tokens),
+            sampling_params=self._sampling_params(
+                sampling_params,
+                max_tokens=max_tokens,
+                sampling_seed=sampling_seed,
+            ),
         )
 
     @staticmethod
@@ -130,12 +140,21 @@ class RandomContinuationAgentLoop(AgentLoopBase):
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         started = time.monotonic()
         rollout_id = str(kwargs["random_continuation_rollout_id"])
+        original_sample_index = int(kwargs["random_continuation_original_sample_index"])
+        dataset_index = kwargs.get("index", rollout_id)
         prompt_ids = await self._prompt_ids(kwargs)
+        original_sampling_seed = stable_seed(
+            self.feature.selection_seed,
+            dataset_index,
+            original_sample_index,
+            "original",
+        )
         parent = await self._generate(
-            rollout_id,
+            f"{rollout_id}:original",
             prompt_ids,
             sampling_params,
             max_tokens=self.response_length,
+            sampling_seed=original_sampling_seed,
             kind="original solution",
         )
         solution_ids, solution_log_probs = self._validated_output(
@@ -151,7 +170,12 @@ class RandomContinuationAgentLoop(AgentLoopBase):
             min_prefix_fraction=self.feature.min_prefix_fraction,
             response_budget=self.response_length,
             min_continuation_tokens=self.feature.min_continuation_tokens,
-            rng=stable_random(self.feature.selection_seed, kwargs.get("index", rollout_id)),
+            rng=stable_random(
+                self.feature.selection_seed,
+                dataset_index,
+                original_sample_index,
+                "marks",
+            ),
             structural_boundaries_only=self.feature.structural_boundaries_only,
         )
 
@@ -159,18 +183,28 @@ class RandomContinuationAgentLoop(AgentLoopBase):
         metadata: list[tuple[int, int]] = []
         for mark in selection.marks:
             max_tokens = self.response_length - mark
-            tasks.append(
-                asyncio.create_task(
-                    self._generate(
-                        rollout_id,
-                        [*prompt_ids, *editable_solution_ids[:mark]],
-                        sampling_params,
-                        max_tokens=max_tokens,
-                        kind=f"random continuation[{mark},0]",
+            for sample_index in range(self.feature.continuations_per_mark):
+                continuation_seed = stable_seed(
+                    self.feature.selection_seed,
+                    dataset_index,
+                    original_sample_index,
+                    "continuation",
+                    mark,
+                    sample_index,
+                )
+                tasks.append(
+                    asyncio.create_task(
+                        self._generate(
+                            f"{rollout_id}:continuation:{mark}:{sample_index}",
+                            [*prompt_ids, *editable_solution_ids[:mark]],
+                            sampling_params,
+                            max_tokens=max_tokens,
+                            sampling_seed=continuation_seed,
+                            kind=f"random continuation[{mark},{sample_index}]",
+                        )
                     )
                 )
-            )
-            metadata.append((mark, 0))
+                metadata.append((mark, sample_index))
 
         results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
         continuations: list[RandomContinuationGeneration] = []
@@ -196,6 +230,14 @@ class RandomContinuationAgentLoop(AgentLoopBase):
                 RandomContinuationGeneration(
                     mark=mark,
                     sample_index=sample_index,
+                    sampling_seed=stable_seed(
+                        self.feature.selection_seed,
+                        dataset_index,
+                        original_sample_index,
+                        "continuation",
+                        mark,
+                        sample_index,
+                    ),
                     token_ids=tuple(token_ids),
                     log_probs=tuple(log_probs),
                     finish_reason=None if finish_reason is None else str(finish_reason),
@@ -204,6 +246,8 @@ class RandomContinuationAgentLoop(AgentLoopBase):
 
         record = RandomContinuationRecord(
             rollout_id=rollout_id,
+            original_sample_index=original_sample_index,
+            original_sampling_seed=original_sampling_seed,
             editable_solution_length=len(editable_solution_ids),
             selection=selection,
             continuations=tuple(continuations),

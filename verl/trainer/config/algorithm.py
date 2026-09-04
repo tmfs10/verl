@@ -698,6 +698,7 @@ class RandomContinuationBaselineConfig(BaseConfig):
 
     enable: bool = False
     points_per_rollout: int = 8
+    continuations_per_mark: int = 1
     min_prefix_fraction: float = 0.10
     min_continuation_tokens: int = 128
     structural_boundaries_only: bool = True
@@ -708,6 +709,7 @@ class RandomContinuationBaselineConfig(BaseConfig):
     def __post_init__(self):
         positive_ints = {
             "points_per_rollout": self.points_per_rollout,
+            "continuations_per_mark": self.continuations_per_mark,
             "min_continuation_tokens": self.min_continuation_tokens,
             "bootstrap_samples": self.bootstrap_samples,
         }

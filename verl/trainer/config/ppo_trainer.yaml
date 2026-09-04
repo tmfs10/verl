@@ -201,6 +201,9 @@ algorithm:
     # Number of distinct uniformly random valid positions per original rollout.
     points_per_rollout: 8
 
+    # Number of independent natural continuations sampled from each selected prefix.
+    continuations_per_mark: 1
+
     # Strict lower bound: selected prefix fraction must be greater than this value.
     min_prefix_fraction: 0.10
 

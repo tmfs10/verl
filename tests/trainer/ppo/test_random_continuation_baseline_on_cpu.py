@@ -18,8 +18,10 @@ import pytest
 
 from verl.trainer.config import RandomContinuationBaselineConfig
 from verl.trainer.ppo.random_continuation_baseline import (
+    clustered_mean,
     clustered_rate,
     select_structurally_valid_random_marks,
+    stable_seed,
     strict_candidate_bounds,
 )
 
@@ -38,6 +40,8 @@ def _ids(text: str) -> list[int]:
 def test_config_rejects_invalid_values():
     with pytest.raises(ValueError, match="points_per_rollout"):
         RandomContinuationBaselineConfig(points_per_rollout=0)
+    with pytest.raises(ValueError, match="continuations_per_mark"):
+        RandomContinuationBaselineConfig(continuations_per_mark=0)
     with pytest.raises(ValueError, match="min_prefix_fraction"):
         RandomContinuationBaselineConfig(min_prefix_fraction=1.0)
 
@@ -125,3 +129,19 @@ def test_clustered_rate_uses_prompt_clusters():
     assert result["prompt_weighted"] == pytest.approx(0.5)
     assert result["prompts"] == 2
     assert result["attempts"] == 9
+
+
+def test_clustered_mean_uses_prompt_clusters_for_signed_differences():
+    result = clustered_mean([[1.0, 1.0], [-1.0]], bootstrap_samples=1000, seed=3)
+    assert result["observation_weighted"] == pytest.approx(1 / 3)
+    assert result["prompt_weighted"] == pytest.approx(0.0)
+    assert result["prompts"] == 2
+    assert result["observations"] == 3
+
+
+def test_stable_seed_is_repeatable_and_namespaced_by_original_mark_and_sample():
+    first = stable_seed(46, 12, 0, "continuation", 500, 0)
+    assert first == stable_seed(46, 12, 0, "continuation", 500, 0)
+    assert first != stable_seed(46, 12, 1, "continuation", 500, 0)
+    assert first != stable_seed(46, 12, 0, "continuation", 500, 1)
+    assert first != stable_seed(46, 12, 0, "marks")

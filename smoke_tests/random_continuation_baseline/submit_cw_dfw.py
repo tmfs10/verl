@@ -47,7 +47,17 @@ DEFAULT_REWARD = Path("/home/siddjain/workspace/scripts/src/nemo_verl/reward/ver
 MODEL_PATH = "/hf_models/Qwen/Qwen3-4B"
 
 
-def _extra_args(remote_output: str, *, prompts: int, points: int, seed: int) -> str:
+def _extra_args(
+    remote_output: str,
+    *,
+    prompts: int,
+    rollouts: int,
+    points: int,
+    continuations: int,
+    seed: int,
+) -> str:
+    world_size = 16
+    ppo_mini_batch_size = max(prompts, (world_size + rollouts - 1) // rollouts)
     overrides = [
         "~critic.append_solution_to_prompt",
         "algorithm.adv_estimator=grpo",
@@ -56,6 +66,7 @@ def _extra_args(remote_output: str, *, prompts: int, points: int, seed: int) -> 
         "algorithm.branch_revision_grpo.enable=false",
         "algorithm.random_continuation_baseline.enable=true",
         f"algorithm.random_continuation_baseline.points_per_rollout={points}",
+        f"algorithm.random_continuation_baseline.continuations_per_mark={continuations}",
         "algorithm.random_continuation_baseline.min_prefix_fraction=0.10",
         "algorithm.random_continuation_baseline.min_continuation_tokens=128",
         "algorithm.random_continuation_baseline.structural_boundaries_only=true",
@@ -73,7 +84,7 @@ def _extra_args(remote_output: str, *, prompts: int, points: int, seed: int) -> 
         "actor_rollout_ref.model.use_remove_padding=true",
         "actor_rollout_ref.model.enable_gradient_checkpointing=true",
         "actor_rollout_ref.actor.strategy=fsdp",
-        f"actor_rollout_ref.actor.ppo_mini_batch_size={prompts}",
+        f"actor_rollout_ref.actor.ppo_mini_batch_size={ppo_mini_batch_size}",
         "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=null",
         "actor_rollout_ref.actor.ppo_epochs=1",
         "actor_rollout_ref.actor.use_dynamic_bsz=true",
@@ -82,7 +93,7 @@ def _extra_args(remote_output: str, *, prompts: int, points: int, seed: int) -> 
         "actor_rollout_ref.actor.fsdp_config.param_offload=false",
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=false",
         "actor_rollout_ref.rollout.name=vllm",
-        "actor_rollout_ref.rollout.n=1",
+        f"actor_rollout_ref.rollout.n={rollouts}",
         "actor_rollout_ref.rollout.temperature=1.0",
         "actor_rollout_ref.rollout.top_p=1.0",
         "actor_rollout_ref.rollout.top_k=-1",
@@ -118,11 +129,13 @@ def _extra_args(remote_output: str, *, prompts: int, points: int, seed: int) -> 
         "trainer.validation_data_dir=null",
         "trainer.resume_mode=disable",
         "trainer.resume_from_path=null",
-        "trainer.balance_batch=true",
+        "trainer.balance_batch=false",
         f"+random_continuation_run.output_dir={remote_output}",
         f"+random_continuation_run.model_path={MODEL_PATH}",
         f"+random_continuation_run.n_prompts={prompts}",
+        f"+random_continuation_run.rollouts_per_prompt={rollouts}",
         f"+random_continuation_run.points_per_rollout={points}",
+        f"+random_continuation_run.continuations_per_mark={continuations}",
         f"+random_continuation_run.seed={seed}",
         "+random_continuation_run.nodes=2",
         "+random_continuation_run.max_prompt_length=2048",
@@ -139,12 +152,21 @@ def build_command(
     verl_root: Path,
     reward_file: Path,
     prompts: int,
+    rollouts: int,
     points: int,
+    continuations: int,
     seed: int,
     dry_run: bool,
 ) -> tuple[list[str], str]:
-    if prompts != 256 or points != 8:
-        raise ValueError("the requested experiment contract is exactly 256 prompts by 8 random points")
+    cardinalities = {
+        "prompts": prompts,
+        "rollouts": rollouts,
+        "points": points,
+        "continuations": continuations,
+    }
+    for name, value in cardinalities.items():
+        if isinstance(value, bool) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
     if len(run_tag) > 80:
         raise ValueError("run tag is too long to keep generated scheduler identities below 128 characters")
     remote_output = f"/output/smoke_tests/random_continuation_baseline/{run_tag}"
@@ -188,7 +210,7 @@ def build_command(
         "--n_prompts",
         str(prompts),
         "--n_samples",
-        "1",
+        str(rollouts),
         "--n_val_samples",
         "1",
         "--val_batch_size",
@@ -236,7 +258,14 @@ def build_command(
         "--partition",
         "interactive",
         "--extra_args",
-        _extra_args(remote_output, prompts=prompts, points=points, seed=seed),
+        _extra_args(
+            remote_output,
+            prompts=prompts,
+            rollouts=rollouts,
+            points=points,
+            continuations=continuations,
+            seed=seed,
+        ),
     ]
     if dry_run:
         command.append("--dry_run")
@@ -259,7 +288,9 @@ def main() -> None:
     parser.add_argument("--reward-file", type=Path, default=DEFAULT_REWARD)
     parser.add_argument("--config-dir", type=Path, default=DEFAULT_CONFIG_DIR)
     parser.add_argument("--prompts", type=int, default=256)
+    parser.add_argument("--rollouts", type=int, default=1)
     parser.add_argument("--points", type=int, default=8)
+    parser.add_argument("--continuations", type=int, default=1)
     parser.add_argument("--seed", type=int, default=46)
     args = parser.parse_args()
 
@@ -307,7 +338,9 @@ def main() -> None:
         verl_root=verl_root,
         reward_file=args.reward_file,
         prompts=args.prompts,
+        rollouts=args.rollouts,
         points=args.points,
+        continuations=args.continuations,
         seed=args.seed,
         dry_run=False,
     )
@@ -326,7 +359,9 @@ def main() -> None:
             verl_root=verl_root,
             reward_file=args.reward_file,
             prompts=args.prompts,
+            rollouts=args.rollouts,
             points=args.points,
+            continuations=args.continuations,
             seed=args.seed,
             dry_run=True,
         )
