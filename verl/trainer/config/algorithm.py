@@ -39,6 +39,7 @@ __all__ = [
     "OPSDConfig",
     "OPSDSteeringConfig",
     "OPSDTokenKLLoggingConfig",
+    "RandomContinuationBaselineConfig",
     "RolloutCorrectionConfig",
 ]
 
@@ -689,6 +690,36 @@ class IntermediateMCValueConfig(BaseConfig):
             raise ValueError("critique_normalization_epsilon must be finite and positive")
         if self.critique_prompt != INTERMEDIATE_MC_CRITIQUE_PROMPT:
             raise ValueError("critique_prompt must exactly match the intermediate MC critique instruction")
+
+
+@dataclass
+class RandomContinuationBaselineConfig(BaseConfig):
+    """Evaluation-only natural continuations from random valid rollout prefixes."""
+
+    enable: bool = False
+    points_per_rollout: int = 8
+    min_prefix_fraction: float = 0.10
+    min_continuation_tokens: int = 128
+    structural_boundaries_only: bool = True
+    selection_seed: int = 0
+    bootstrap_samples: int = 10_000
+    audit_output_dir: Optional[str] = None
+
+    def __post_init__(self):
+        positive_ints = {
+            "points_per_rollout": self.points_per_rollout,
+            "min_continuation_tokens": self.min_continuation_tokens,
+            "bootstrap_samples": self.bootstrap_samples,
+        }
+        for name, value in positive_ints.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                raise ValueError(f"algorithm.random_continuation_baseline.{name} must be a positive integer")
+        if not math.isfinite(self.min_prefix_fraction) or not 0.0 <= self.min_prefix_fraction < 1.0:
+            raise ValueError("algorithm.random_continuation_baseline.min_prefix_fraction must be in [0, 1)")
+        if not isinstance(self.structural_boundaries_only, bool):
+            raise ValueError("algorithm.random_continuation_baseline.structural_boundaries_only must be boolean")
+        if not isinstance(self.selection_seed, int) or isinstance(self.selection_seed, bool):
+            raise ValueError("algorithm.random_continuation_baseline.selection_seed must be an integer")
 
 
 @dataclass
@@ -1958,6 +1989,9 @@ class AlgoConfig(BaseConfig):
     rollout_correction: Optional[RolloutCorrectionConfig] = None
     branch_revision_grpo: BranchRevisionGRPOConfig = field(default_factory=BranchRevisionGRPOConfig)
     intermediate_mc_value: IntermediateMCValueConfig = field(default_factory=IntermediateMCValueConfig)
+    random_continuation_baseline: RandomContinuationBaselineConfig = field(
+        default_factory=RandomContinuationBaselineConfig
+    )
     opsd: OPSDConfig = field(default_factory=OPSDConfig)
     # GDPO (Group reward-Decoupled Normalization Policy Optimization) settings.
     # gdpo_reward_keys: keys in non_tensor_batch (from compute_score's return dict) that

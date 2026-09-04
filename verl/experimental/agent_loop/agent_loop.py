@@ -60,6 +60,7 @@ def _drain_synchronous_feature_tasks_on_error(config: DictConfig | None) -> bool
     return bool(
         OmegaConf.select(config, "algorithm.intermediate_mc_value.enable", default=False)
         or OmegaConf.select(config, "algorithm.branch_revision_grpo.enable", default=False)
+        or OmegaConf.select(config, "algorithm.random_continuation_baseline.enable", default=False)
     )
 
 

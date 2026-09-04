@@ -189,6 +189,36 @@ algorithm:
     # Optional structural JSONL audit directory used by smoke verification.
     audit_output_dir: null
 
+  # Evaluation-only random-prefix continuation baseline. This never trains.
+  random_continuation_baseline:
+
+    # Structured configuration target.
+    _target_: verl.trainer.config.RandomContinuationBaselineConfig
+
+    # Enable evaluation-only random-prefix continuation sampling.
+    enable: false
+
+    # Number of distinct uniformly random valid positions per original rollout.
+    points_per_rollout: 8
+
+    # Strict lower bound: selected prefix fraction must be greater than this value.
+    min_prefix_fraction: 0.10
+
+    # Minimum remaining natural-continuation token budget.
+    min_continuation_tokens: 128
+
+    # Apply the existing production open-block checks to every selected boundary.
+    structural_boundaries_only: true
+
+    # Seed for deterministic per-rollout point selection.
+    selection_seed: 0
+
+    # Number of deterministic prompt-cluster bootstrap resamples.
+    bootstrap_samples: 10000
+
+    # Required directory for append-only evidence and the aggregate summary.
+    audit_output_dir: null
+
   # Synchronous actor-only branch-revision GRPO.
   branch_revision_grpo:
 

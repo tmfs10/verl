@@ -569,8 +569,18 @@ class RayPPOTrainer(OneLoggerInstrumented):
             from verl.trainer.ppo.ray_trainer_branch_revision import BranchRevisionGRPOController
 
             self.branch_revision_controller = BranchRevisionGRPOController(self)
-        if self.intermediate_mc_controller is not None and self.branch_revision_controller is not None:
-            raise ValueError("intermediate MC and branch-revision GRPO controllers are mutually exclusive")
+        self.random_continuation_controller = None
+        if bool(OmegaConf.select(self.config, "algorithm.random_continuation_baseline.enable", default=False)):
+            from verl.trainer.ppo.ray_trainer_random_continuation import RandomContinuationBaselineController
+
+            self.random_continuation_controller = RandomContinuationBaselineController(self)
+        controllers = [
+            self.intermediate_mc_controller,
+            self.branch_revision_controller,
+            self.random_continuation_controller,
+        ]
+        if sum(controller is not None for controller in controllers) > 1:
+            raise ValueError("intermediate MC, branch revision, and random continuation are mutually exclusive")
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -592,6 +602,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
         return (
             getattr(self, "intermediate_mc_controller", None) is not None
             or getattr(self, "branch_revision_controller", None) is not None
+            or getattr(self, "random_continuation_controller", None) is not None
         )
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
@@ -2036,6 +2047,8 @@ class RayPPOTrainer(OneLoggerInstrumented):
                     self.intermediate_mc_controller.prepare_generation_batch(gen_batch_output)
                 elif self.branch_revision_controller is not None:
                     self.branch_revision_controller.prepare_original_generation_batch(gen_batch_output)
+                elif self.random_continuation_controller is not None:
+                    self.random_continuation_controller.prepare_generation_batch(gen_batch_output)
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -2255,6 +2268,13 @@ class RayPPOTrainer(OneLoggerInstrumented):
                                 profile_rollout=curr_step_profile,
                             )
                             metrics["branch_revision/actor_updated"] = float(actor_updated)
+                        elif self.random_continuation_controller is not None:
+                            actor_updated = self.random_continuation_controller.run_evaluation(
+                                batch,
+                                reward_tensor,
+                                metrics,
+                            )
+                            metrics["random_continuation/actor_updated"] = float(actor_updated)
                         else:
                             # Compute rollout correction: IS weights, rejection sampling, and metrics
                             # Only runs in decoupled mode (computes once per batch using stable π_old)
@@ -2338,7 +2358,7 @@ class RayPPOTrainer(OneLoggerInstrumented):
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
-                    if self._has_custom_synchronous_actor_update():
+                    if self._has_custom_synchronous_actor_update() and self.random_continuation_controller is None:
                         # Keep VeRL's native checkpoint cadence and timeout handling during both
                         # critic-only warmup and joint actor/critic updates.
                         esi_close_to_expiration = should_save_ckpt_esi(

@@ -421,6 +421,9 @@ class TaskRunner:
             OmegaConf.select(config, "algorithm.intermediate_mc_value.enable", default=False)
         )
         branch_revision_enabled = bool(OmegaConf.select(config, "algorithm.branch_revision_grpo.enable", default=False))
+        random_continuation_enabled = bool(
+            OmegaConf.select(config, "algorithm.random_continuation_baseline.enable", default=False)
+        )
         if intermediate_mc_enabled:
             from verl.trainer.ppo.ray_trainer_intermediate_mc import validate_intermediate_mc_runtime_config
 
@@ -429,6 +432,12 @@ class TaskRunner:
             from verl.trainer.ppo.ray_trainer_branch_revision import validate_branch_revision_runtime_config
 
             validate_branch_revision_runtime_config(config)
+        if random_continuation_enabled:
+            from verl.trainer.ppo.ray_trainer_random_continuation import (
+                validate_random_continuation_runtime_config,
+            )
+
+            validate_random_continuation_runtime_config(config)
 
         actor_rollout_cls, ray_worker_group_cls = self.add_actor_rollout_worker(config)
         self.add_critique_actor_rollout_worker(config, actor_rollout_cls)
