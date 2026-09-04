@@ -47,7 +47,11 @@ def test_launcher_preserves_requested_cardinalities(prompts, rollouts, points, c
         continuations=continuations,
     )
     rendered = " ".join(command)
-    assert f"--n_prompts {prompts}" in rendered
+    launcher_prompts = ((prompts + 15) // 16) * 16
+    assert f"--n_prompts {launcher_prompts}" in rendered
+    assert f"data.train_batch_size={prompts}" in rendered
+    assert f"++data.gen_batch_size={prompts}" in rendered
+    assert f"+random_continuation_run.n_prompts={prompts}" in rendered
     assert f"--n_samples {rollouts}" in rendered
     assert f"actor_rollout_ref.rollout.n={rollouts}" in rendered
     assert f"algorithm.random_continuation_baseline.points_per_rollout={points}" in rendered

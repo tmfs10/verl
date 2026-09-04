@@ -167,6 +167,12 @@ def build_command(
     for name, value in cardinalities.items():
         if isinstance(value, bool) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
+    # The shared submitter statically requires --n_prompts to be divisible by
+    # the 16 trainer ranks. The authoritative batch size is the explicit Hydra
+    # override and run contract emitted below; round up only this outer-launcher
+    # placeholder so a four-prompt, evaluation-only smoke remains possible.
+    trainer_world_size = 16
+    launcher_prompts = ((prompts + trainer_world_size - 1) // trainer_world_size) * trainer_world_size
     if len(run_tag) > 80:
         raise ValueError("run tag is too long to keep generated scheduler identities below 128 characters")
     remote_output = f"/output/smoke_tests/random_continuation_baseline/{run_tag}"
@@ -208,7 +214,7 @@ def build_command(
         "--eval_data",
         VAL_DATA,
         "--n_prompts",
-        str(prompts),
+        str(launcher_prompts),
         "--n_samples",
         str(rollouts),
         "--n_val_samples",
