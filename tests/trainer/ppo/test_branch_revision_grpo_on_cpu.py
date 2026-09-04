@@ -1133,6 +1133,13 @@ def test_branch_revision_config_defaults_to_fifteen_stddevs() -> None:
     assert feature.learnability_threshold_mode == "stddev"
     assert feature.max_seed_window_stddevs == 15.0
     assert feature.critique_prompt_weighting == "equal_prompt"
+    assert feature.min_rewarded_prefix_fraction == 0.10
+
+
+@pytest.mark.parametrize("value", [-0.01, 1.01, float("nan")])
+def test_branch_revision_config_rejects_invalid_min_rewarded_prefix_fraction(value) -> None:
+    with pytest.raises(ValueError, match="min_rewarded_prefix_fraction must be in"):
+        BranchRevisionGRPOConfig(min_rewarded_prefix_fraction=value)
 
 
 @pytest.mark.parametrize("grouping", ["per_original", "batch"])
@@ -2091,23 +2098,24 @@ def _branch_only_critique(
     *,
     continuation: str,
     counterfactual: BranchRevisionCounterfactualGeneration | None = None,
+    prefix: str = "start ",
 ) -> BranchRevisionCritiqueGeneration:
-    text = "The next step is where the trajectory stopped pruning.\n<prefix>start </prefix>"
+    text = f"The next step is where the trajectory stopped pruning.\n<prefix>{prefix}</prefix>"
     critique_ids = _ids(text)
     return BranchRevisionCritiqueGeneration(
         token_ids=tuple(critique_ids),
         log_probs=tuple([-0.2] * len(critique_ids)),
         finish_reason="stop",
         parse_reason="valid",
-        prefix_text="start ",
+        prefix_text=prefix,
         prefix_plus_new_continuation_text="",
         new_continuation_text="",
         branch_prefix_ids=(),
         prefix_ids=(),
-        continuation_prefix_ids=tuple(_ids("start ")),
+        continuation_prefix_ids=tuple(_ids(prefix)),
         new_continuation_ids=(),
         new_continuation_log_probs=(),
-        revised_prefix_ids=tuple(_ids("start ")),
+        revised_prefix_ids=tuple(_ids(prefix)),
         continuation_ids=tuple(_ids(continuation)),
         continuation_log_probs=tuple([-0.3] * len(_ids(continuation))),
         continuation_finish_reason="stop",
@@ -2116,8 +2124,8 @@ def _branch_only_critique(
         revision_mode="branch_only",
         match_kind="exact",
         match_start=0,
-        branch_end=len("start "),
-        matched_source_text="start ",
+        branch_end=len(prefix),
+        matched_source_text=prefix,
     )
 
 
@@ -2329,6 +2337,59 @@ def test_actor_batch_uses_prompt_and_original_grpo_groups_and_masks_reused_revis
     assert actor_batch.batch["advantages"][original_rows[0]].min().item() < 0
     assert actor_batch.batch["advantages"][original_rows[1]].max().item() > 0
     assert actor_batch.meta_info["use_global_loss_normalization"] is True
+
+
+@pytest.mark.parametrize(
+    ("objective", "original_reward"),
+    [("recovery", 0.0), ("compression", 1.0)],
+)
+def test_prefix_at_or_before_ten_percent_zeros_only_the_critique_reward(objective, original_reward) -> None:
+    controller = _controller()
+    audit_events = []
+    controller._audit = lambda event, **payload: audit_events.append({"event": event, **payload})
+    controller.feature = BranchRevisionGRPOConfig(
+        enable=True,
+        revision_mode="branch_only",
+        enable_positive_compression=objective == "compression",
+        enable_recovery=objective == "recovery",
+        num_critiques=2,
+        num_positive_critiques=2,
+        min_rewarded_prefix_fraction=0.10,
+    )
+    early = _branch_only_critique(continuation=" solved", prefix="st")
+    later = _branch_only_critique(continuation=" solved", prefix="sta")
+    bundle = _Bundle(
+        source_row=0,
+        rollout_id="p:0",
+        prompt_group_id="p",
+        prompt_ids=_ids("q"),
+        solution_ids=_ids("start dead and waste"),
+        solution_log_probs=[-0.1] * len(_ids("start dead and waste")),
+        original_reward=original_reward,
+        record=BranchRevisionGenerationRecord(
+            "p:0",
+            objective,
+            (early, later),
+            tuple(_ids("critique prompt")),
+            revision_mode="branch_only",
+        ),
+        continuation_rewards={0: 1.0, 1: 1.0},
+        compression_credits={0: 1.0, 1: 1.0} if objective == "compression" else {},
+    )
+
+    rows = controller._actor_rows([bundle])
+    critique_rows = [row for row in rows if row.kind == "critique"]
+    continuation_rows = [row for row in rows if row.kind == "continuation"]
+
+    assert len(_ids("st")) / len(_ids("start dead and waste")) == 0.10
+    assert [row.reward for row in critique_rows] == pytest.approx([0.0, 1.0])
+    assert [row.reward for row in continuation_rows] == pytest.approx([1.0, 1.0])
+
+    critique_events = [event for event in audit_events if event["event"] == "critique"]
+    assert critique_events[0]["prefix_reward_suppressed"] is True
+    assert critique_events[0]["prefix_location_fraction"] == pytest.approx(0.10)
+    assert critique_events[1]["prefix_reward_suppressed"] is False
+    assert critique_events[1]["prefix_location_fraction"] == pytest.approx(0.15)
 
 
 @pytest.mark.parametrize(

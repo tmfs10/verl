@@ -902,9 +902,10 @@ class BranchRevisionGRPOController:
                             solution_text = decode_exact(editable_solution, self.tokenizer)
                             if not 0 <= candidate.match_start < candidate.branch_end <= len(solution_text):
                                 raise RuntimeError("branch-only candidate returned invalid source offsets")
-                            if candidate.matched_source_text != solution_text[
-                                candidate.match_start : candidate.branch_end
-                            ]:
+                            if (
+                                candidate.matched_source_text
+                                != solution_text[candidate.match_start : candidate.branch_end]
+                            ):
                                 raise RuntimeError("branch-only candidate source span does not match its offsets")
                             if decode_exact(revised_prefix, self.tokenizer) != solution_text[: candidate.branch_end]:
                                 raise RuntimeError("branch-only candidate boundary changed after tokenization")
@@ -1596,6 +1597,24 @@ class BranchRevisionGRPOController:
             prompt_rewards[bundle.prompt_group_id].append(bundle.original_reward)
         return dict(prompt_rewards)
 
+    def _prefix_reward_gate(self, bundle: _Bundle, candidate: Any) -> tuple[int, int, float | None, bool]:
+        original_tokens = len(strip_terminal_eos(bundle.solution_ids, self.tokenizer))
+        if original_tokens <= 0:
+            raise RuntimeError("branch-revision reward gate received an empty original rollout")
+        if not candidate.valid:
+            return 0, original_tokens, None, False
+        if self.feature.revision_mode != "branch_only":
+            return 0, original_tokens, None, False
+        prefix_tokens = len(candidate.revised_prefix_ids)
+        if not 0 < prefix_tokens <= original_tokens:
+            raise RuntimeError(
+                "valid branch-revision candidate has an invalid prefix location: "
+                f"prefix={prefix_tokens}, original={original_tokens}"
+            )
+        fraction = prefix_tokens / original_tokens
+        suppressed = fraction <= self.feature.min_rewarded_prefix_fraction
+        return prefix_tokens, original_tokens, fraction, suppressed
+
     def _actor_rows(self, bundles: list[_Bundle]) -> list[_ActorRow]:
         rows: list[_ActorRow] = []
         prompt_rewards = self._prompt_rewards(bundles)
@@ -1641,6 +1660,9 @@ class BranchRevisionGRPOController:
                 learnability_rejected = bool(
                     self.feature.revision_mode == "seeded_revision" and critique.valid and not accepted
                 )
+                prefix_tokens, original_tokens, prefix_fraction, prefix_reward_suppressed = self._prefix_reward_gate(
+                    bundle, critique
+                )
                 invalid_penalty = 0.0
                 learnability_rejection_penalty = 0.0
                 if bundle.record.objective == "recovery":
@@ -1662,6 +1684,8 @@ class BranchRevisionGRPOController:
                     critique_reward = objective_credit * learnability_weight
                 else:
                     raise RuntimeError(f"unknown branch-revision objective {bundle.record.objective!r}")
+                if prefix_reward_suppressed:
+                    critique_reward = 0.0
                 rows.append(
                     _ActorRow(
                         audit_row_id=f"critique:{bundle.rollout_id}:{critique_index}",
@@ -1708,6 +1732,11 @@ class BranchRevisionGRPOController:
                     counterfactual_delta=counterfactual_delta,
                     counterfactual_uplift=counterfactual_uplift,
                     prompt_pass_at_1=baseline,
+                    prefix_location_tokens=prefix_tokens,
+                    original_solution_tokens=original_tokens,
+                    prefix_location_fraction=prefix_fraction,
+                    min_rewarded_prefix_fraction=self.feature.min_rewarded_prefix_fraction,
+                    prefix_reward_suppressed=prefix_reward_suppressed,
                     learnability_accepted=accepted,
                     learnability_percentile=learnability.percentile if learnability is not None else None,
                     learnability_weight=learnability_weight,
@@ -2198,6 +2227,16 @@ class BranchRevisionGRPOController:
         ]
         compression_fractions = [value for bundle in correct for value in bundle.compression_fractions.values()]
         compression_credits = [value for bundle in correct for value in bundle.compression_credits.values()]
+        prefix_locations = [
+            self._prefix_reward_gate(bundle, critique)[2]
+            for bundle in selected
+            for critique in bundle.record.critiques
+            if critique.valid
+        ]
+        prefix_locations = [value for value in prefix_locations if value is not None]
+        prefix_rewards_suppressed = sum(
+            self._prefix_reward_gate(bundle, critique)[3] for bundle in selected for critique in bundle.record.critiques
+        )
         counterfactual_scores = [score for bundle in incorrect for score in bundle.counterfactual_learnability.values()]
         counterfactual_valid = sum(control.valid for control in counterfactuals)
         counterfactual_accepted = (
@@ -2367,6 +2406,10 @@ class BranchRevisionGRPOController:
             "branch_revision/compression/mean_credit": (
                 float(sum(compression_credits) / len(compression_credits)) if compression_credits else 0.0
             ),
+            "branch_revision/prefix_reward_suppressed": float(prefix_rewards_suppressed),
+            "branch_revision/prefix_reward_suppressed_fraction": (
+                float(prefix_rewards_suppressed / len(critiques)) if critiques else 0.0
+            ),
             "branch_revision/tokens/generated_continuations": float(sum(generated_continuation_tokens)),
             "branch_revision/tokens/learnability_rejected_continuations": float(sum(rejected_continuation_tokens)),
             "branch_revision/actor_rows": float(total_policy_rows - total_padding_rows),
@@ -2480,6 +2523,7 @@ class BranchRevisionGRPOController:
             ),
         }
         metrics.update(distribution_metrics(critique_rewards, "branch_revision/critique_reward"))
+        metrics.update(distribution_metrics(prefix_locations, "branch_revision/prefix_location_fraction"))
         metrics.update(distribution_metrics(counterfactual_deltas, "branch_revision/counterfactual/raw_delta"))
         metrics.update(distribution_metrics(counterfactual_uplifts, "branch_revision/counterfactual/uplift_reward"))
         metrics.update(distribution_metrics(critique_raw_advantages, "branch_revision/critique_raw_advantage"))
@@ -2669,6 +2713,7 @@ class BranchRevisionGRPOController:
             correct=sum(bundle.original_reward == 1.0 for bundle in bundles),
             recovery_enabled=self.feature.enable_recovery,
             positive_compression_enabled=self.feature.enable_positive_compression,
+            min_rewarded_prefix_fraction=self.feature.min_rewarded_prefix_fraction,
             critique_grpo_grouping=self.feature.critique_grpo_grouping,
             critique_advantage_mode=self.feature.critique_advantage_mode,
             critique_prompt_weighting=self.feature.critique_prompt_weighting,

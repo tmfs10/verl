@@ -107,6 +107,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         "recovery_reference_selection_seed",
         "enable_recovery",
         "enable_positive_compression",
+        "min_rewarded_prefix_fraction",
         "loss_mode",
         "learnability_logprob_statistic",
         "learnability_threshold_mode",
@@ -150,6 +151,7 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         ],
         "algorithm.branch_revision_grpo.enable_recovery": smoke_contract["enable_recovery"],
         "algorithm.branch_revision_grpo.enable_positive_compression": smoke_contract["enable_positive_compression"],
+        "algorithm.branch_revision_grpo.min_rewarded_prefix_fraction": smoke_contract["min_rewarded_prefix_fraction"],
         "actor_rollout_ref.model.path": smoke_contract["model_path"],
         "critic.model.path": smoke_contract["model_path"],
         "actor_rollout_ref.actor.policy_loss.loss_mode": smoke_contract["loss_mode"],
@@ -250,6 +252,14 @@ def _validate_contract(config, output_dir: Path, smoke_contract: dict[str, Any])
         raise ValueError("branch-revision counterfactual_uplift smoke requires recovery")
     if not isinstance(smoke_contract["enable_positive_compression"], bool):
         raise ValueError("branch-revision smoke enable_positive_compression must be boolean")
+    min_rewarded_prefix_fraction = smoke_contract["min_rewarded_prefix_fraction"]
+    if (
+        not isinstance(min_rewarded_prefix_fraction, int | float)
+        or isinstance(min_rewarded_prefix_fraction, bool)
+        or not math.isfinite(float(min_rewarded_prefix_fraction))
+        or not 0.0 <= float(min_rewarded_prefix_fraction) <= 1.0
+    ):
+        raise ValueError("branch-revision smoke min_rewarded_prefix_fraction must be in [0, 1]")
     critique_warmup_steps = smoke_contract["critique_warmup_steps"]
     if (
         not isinstance(critique_warmup_steps, int)

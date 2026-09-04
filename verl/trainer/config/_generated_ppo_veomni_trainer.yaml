@@ -679,6 +679,7 @@ algorithm:
     enable_positive_compression: false
     num_positive_critiques: 4
     positive_compression_target: 0.25
+    min_rewarded_prefix_fraction: 0.1
     learnability_logprob_statistic: mean
     learnability_threshold_mode: stddev
     max_seed_window_stddevs: 15.0

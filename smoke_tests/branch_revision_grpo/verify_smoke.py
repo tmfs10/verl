@@ -469,6 +469,10 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     critique_rms_floor = float(branch_config.get("critique_advantage_rms_floor", 0.10))
     critique_advantage_clip = float(branch_config.get("critique_advantage_clip", 5.0))
     critique_headroom_exponent = float(branch_config.get("critique_prompt_headroom_exponent", 1.0))
+    prefix_reward_gate_configured = "min_rewarded_prefix_fraction" in branch_config
+    min_rewarded_prefix_fraction = float(branch_config.get("min_rewarded_prefix_fraction", 0.0))
+    if not math.isfinite(min_rewarded_prefix_fraction) or not 0.0 <= min_rewarded_prefix_fraction <= 1.0:
+        raise ValueError("smoke evidence has an invalid minimum rewarded prefix fraction")
     if critique_advantage_mode == "pass_at_1" and positive_compression_enabled:
         raise ValueError("pass_at_1 critique advantages currently support recovery-only smoke evidence")
     if critique_advantage_mode == "counterfactual_uplift" and not recovery_enabled:
@@ -659,6 +663,13 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
         )
     ):
         raise ValueError("iteration audit used a different learnability threshold than the resolved config")
+    if prefix_reward_gate_configured and not math.isclose(
+        float(iteration.get("min_rewarded_prefix_fraction", float("nan"))),
+        min_rewarded_prefix_fraction,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("iteration audit used a different minimum rewarded prefix fraction")
     incorrect = int(iteration["incorrect"])
     if incorrect != original_rewards.count(0.0) or incorrect <= 0:
         raise ValueError("smoke must contain and exactly count at least one incorrect original rollout")
@@ -687,8 +698,10 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
             raise ValueError("original audit token/log-probability evidence is incomplete")
         if not 0 < editable_length <= len(solution_ids):
             raise ValueError("original audit has an invalid editable solution length")
-        if audit_schema_version >= 8 and revision_mode == "branch_only" and not isinstance(
-            original.get("editable_solution_text"), str
+        if (
+            audit_schema_version >= 8
+            and revision_mode == "branch_only"
+            and not isinstance(original.get("editable_solution_text"), str)
         ):
             raise ValueError("branch-only original audit omitted its decoded editable solution")
         _require_binary(original.get("reward"), "audited original reward")
@@ -968,6 +981,38 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
                 if objective == "recovery"
                 else objective_credit * learnability_weight
             )
+        if structurally_invalid or revision_mode != "branch_only":
+            expected_prefix_tokens = 0
+            expected_original_tokens = int(original["editable_solution_length"])
+            expected_prefix_fraction = None
+            expected_prefix_suppressed = False
+        else:
+            expected_original_tokens = int(original["editable_solution_length"])
+            expected_prefix_tokens = len(critique.get("revised_prefix_ids", ()))
+            expected_prefix_fraction = expected_prefix_tokens / expected_original_tokens
+            expected_prefix_suppressed = expected_prefix_fraction <= min_rewarded_prefix_fraction
+        if prefix_reward_gate_configured and (
+            int(critique.get("prefix_location_tokens", -1)) != expected_prefix_tokens
+            or int(critique.get("original_solution_tokens", -1)) != expected_original_tokens
+            or bool(critique.get("prefix_reward_suppressed")) != expected_prefix_suppressed
+            or not math.isclose(
+                float(critique.get("min_rewarded_prefix_fraction", float("nan"))),
+                min_rewarded_prefix_fraction,
+                abs_tol=1e-12,
+            )
+            or (expected_prefix_fraction is None and critique.get("prefix_location_fraction") is not None)
+            or (
+                expected_prefix_fraction is not None
+                and not math.isclose(
+                    float(critique.get("prefix_location_fraction", float("nan"))),
+                    expected_prefix_fraction,
+                    abs_tol=1e-12,
+                )
+            )
+        ):
+            raise ValueError(f"critique {key!r} has corrupted prefix reward-gate evidence")
+        if prefix_reward_gate_configured and expected_prefix_suppressed:
+            expected_reward = 0.0
         if not math.isclose(reward, expected_reward, abs_tol=1e-9):
             raise ValueError(
                 f"critique {key!r} reward does not match its objective and learnability credit; "
@@ -1203,9 +1248,7 @@ def verify(root: Path, *, require_algorithm_signal: bool = True) -> dict[str, An
     if len(learnability_by_key) != len(learnability_events):
         raise ValueError("duplicate learnability evidence")
     expected_learnability_keys = (
-        {
-            (rollout_id, critique_index, "diagnostic") for rollout_id, critique_index in structurally_valid_keys
-        }
+        {(rollout_id, critique_index, "diagnostic") for rollout_id, critique_index in structurally_valid_keys}
         | {(rollout_id, critique_index, "control") for rollout_id, critique_index in control_structurally_valid_keys}
         if revision_mode == "seeded_revision"
         else set()

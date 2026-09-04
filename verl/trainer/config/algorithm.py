@@ -396,6 +396,7 @@ class BranchRevisionGRPOConfig(BaseConfig):
     enable_positive_compression: bool = False
     num_positive_critiques: int = 4
     positive_compression_target: float = 0.25
+    min_rewarded_prefix_fraction: float = 0.10
     learnability_logprob_statistic: str = "mean"
     learnability_threshold_mode: str = "stddev"
     max_seed_window_stddevs: float = 15.0
@@ -410,9 +411,7 @@ class BranchRevisionGRPOConfig(BaseConfig):
     successful_reference_critique_prompt: str = BRANCH_REVISION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
     positive_critique_prompt: str = BRANCH_REVISION_CORRECT_CRITIQUE_PROMPT
     branch_selection_critique_prompt: str = BRANCH_SELECTION_CRITIQUE_PROMPT
-    branch_selection_successful_reference_critique_prompt: str = (
-        BRANCH_SELECTION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
-    )
+    branch_selection_successful_reference_critique_prompt: str = BRANCH_SELECTION_SUCCESSFUL_REFERENCE_CRITIQUE_PROMPT
     branch_selection_positive_critique_prompt: str = BRANCH_SELECTION_CORRECT_CRITIQUE_PROMPT
     audit_output_dir: Optional[str] = None
 
@@ -539,6 +538,8 @@ class BranchRevisionGRPOConfig(BaseConfig):
             raise ValueError("algorithm.branch_revision_grpo.reward_tolerance must be finite and positive")
         if not math.isfinite(self.positive_compression_target) or not 0.0 < self.positive_compression_target <= 1.0:
             raise ValueError("algorithm.branch_revision_grpo.positive_compression_target must be in (0, 1]")
+        if not math.isfinite(self.min_rewarded_prefix_fraction) or not 0.0 <= self.min_rewarded_prefix_fraction <= 1.0:
+            raise ValueError("algorithm.branch_revision_grpo.min_rewarded_prefix_fraction must be in [0, 1]")
         if self.learnability_logprob_statistic not in {"mean", "min"}:
             raise ValueError("algorithm.branch_revision_grpo.learnability_logprob_statistic must be mean or min")
         if self.learnability_threshold_mode not in {"stddev", "percentile"}:

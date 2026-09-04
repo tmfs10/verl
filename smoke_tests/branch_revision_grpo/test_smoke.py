@@ -125,6 +125,8 @@ def test_rendered_branch_only_smoke_disables_seeded_revision_by_contract(tmp_pat
     rendered = " ".join(command)
     assert "algorithm.branch_revision_grpo.revision_mode=branch_only" in rendered
     assert "algorithm.branch_revision_grpo.positive_compression_target=0.75" in rendered
+    assert "algorithm.branch_revision_grpo.min_rewarded_prefix_fraction=0.1" in rendered
+    assert "+branch_revision_smoke.min_rewarded_prefix_fraction=0.1" in rendered
     assert "+branch_revision_smoke.revision_mode=branch_only" in rendered
     assert "trainer.experiment_name=branch_revision_branch_only_dppo_tv" in rendered
     assert "actor_rollout_ref.rollout.temperature=1.0" in rendered
@@ -144,6 +146,22 @@ def test_smoke_launcher_rejects_invalid_positive_compression_target(tmp_path: Pa
             reward_file=Path("/reward.py"),
             config_dir=tmp_path,
             positive_compression_target=target,
+        )
+
+
+@pytest.mark.parametrize("fraction", [-0.1, 1.01, float("inf"), float("nan")])
+def test_smoke_launcher_rejects_invalid_min_rewarded_prefix_fraction(tmp_path: Path, fraction: float) -> None:
+    with pytest.raises(ValueError, match="min_rewarded_prefix_fraction must be in"):
+        _build_command(
+            revision_mode="branch_only",
+            run_tag="bad-prefix-fraction",
+            dry_run=True,
+            python=Path("/python"),
+            launcher=Path("/launcher"),
+            verl_root=Path("/verl"),
+            reward_file=Path("/reward.py"),
+            config_dir=tmp_path,
+            min_rewarded_prefix_fraction=fraction,
         )
 
 
@@ -725,6 +743,7 @@ def _scaled_runtime_config(tmp_path: Path):
                     "enable_recovery": True,
                     "enable_positive_compression": True,
                     "num_positive_critiques": 6,
+                    "min_rewarded_prefix_fraction": 0.10,
                     "learnability_logprob_statistic": "mean",
                     "learnability_threshold_mode": "stddev",
                     "max_seed_window_stddevs": 15.0,
@@ -767,6 +786,7 @@ def _scaled_smoke_contract(tmp_path: Path, *, n_prompts: int = 32) -> dict:
         "recovery_reference_selection_seed": 0,
         "enable_recovery": True,
         "enable_positive_compression": True,
+        "min_rewarded_prefix_fraction": 0.10,
         "loss_mode": "dppo_tv",
         "learnability_logprob_statistic": "mean",
         "learnability_threshold_mode": "stddev",

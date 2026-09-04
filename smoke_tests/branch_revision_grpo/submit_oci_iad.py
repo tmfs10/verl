@@ -155,6 +155,7 @@ def _extra_args(
     enable_recovery: bool = True,
     enable_positive_compression: bool = True,
     positive_compression_target: float = 0.25,
+    min_rewarded_prefix_fraction: float = 0.10,
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
     learnability_logprob_statistic: str = "mean",
@@ -208,6 +209,8 @@ def _extra_args(
         raise ValueError("enable_positive_compression must be boolean")
     if not math.isfinite(positive_compression_target) or not 0.0 < positive_compression_target <= 1.0:
         raise ValueError("positive_compression_target must be in (0, 1]")
+    if not math.isfinite(min_rewarded_prefix_fraction) or not 0.0 <= min_rewarded_prefix_fraction <= 1.0:
+        raise ValueError("min_rewarded_prefix_fraction must be in [0, 1]")
     if learnability_logprob_statistic not in {"mean", "min"}:
         raise ValueError("learnability_logprob_statistic must be mean or min")
     if learnability_threshold_mode not in {"stddev", "percentile"}:
@@ -244,6 +247,7 @@ def _extra_args(
         f"algorithm.branch_revision_grpo.enable_positive_compression={str(enable_positive_compression).lower()}",
         f"algorithm.branch_revision_grpo.num_positive_critiques={num_critiques}",
         f"algorithm.branch_revision_grpo.positive_compression_target={positive_compression_target}",
+        f"algorithm.branch_revision_grpo.min_rewarded_prefix_fraction={min_rewarded_prefix_fraction}",
         f"algorithm.branch_revision_grpo.learnability_logprob_statistic={learnability_logprob_statistic}",
         f"algorithm.branch_revision_grpo.learnability_threshold_mode={learnability_threshold_mode}",
         f"algorithm.branch_revision_grpo.max_seed_window_stddevs={max_seed_window_stddevs}",
@@ -331,6 +335,7 @@ def _extra_args(
         f"+branch_revision_smoke.recovery_reference_selection_seed={recovery_reference_selection_seed}",
         f"+branch_revision_smoke.enable_recovery={str(enable_recovery).lower()}",
         f"+branch_revision_smoke.enable_positive_compression={str(enable_positive_compression).lower()}",
+        f"+branch_revision_smoke.min_rewarded_prefix_fraction={min_rewarded_prefix_fraction}",
         f"+branch_revision_smoke.model_path={model_path}",
         f"+branch_revision_smoke.loss_mode={loss_mode}",
         f"+branch_revision_smoke.learnability_logprob_statistic={learnability_logprob_statistic}",
@@ -380,6 +385,7 @@ def build_command(
     enable_recovery: bool = True,
     enable_positive_compression: bool = True,
     positive_compression_target: float = 0.25,
+    min_rewarded_prefix_fraction: float = 0.10,
     seed: int = 43,
     model_path: str = MODEL_PATH,
     loss_mode: str = "dppo_tv",
@@ -459,6 +465,8 @@ def build_command(
         raise ValueError("enable_positive_compression must be boolean")
     if not math.isfinite(positive_compression_target) or not 0.0 < positive_compression_target <= 1.0:
         raise ValueError("positive_compression_target must be in (0, 1]")
+    if not math.isfinite(min_rewarded_prefix_fraction) or not 0.0 <= min_rewarded_prefix_fraction <= 1.0:
+        raise ValueError("min_rewarded_prefix_fraction must be in [0, 1]")
     if (
         not isinstance(critique_warmup_steps, int)
         or isinstance(critique_warmup_steps, bool)
@@ -623,6 +631,7 @@ def build_command(
             enable_recovery=enable_recovery,
             enable_positive_compression=enable_positive_compression,
             positive_compression_target=positive_compression_target,
+            min_rewarded_prefix_fraction=min_rewarded_prefix_fraction,
             model_path=model_path,
             loss_mode=loss_mode,
             learnability_logprob_statistic=learnability_logprob_statistic,
@@ -694,6 +703,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
     parser.add_argument("--disable-recovery", action="store_true")
     parser.add_argument("--disable-positive-compression", action="store_true")
     parser.add_argument("--positive-compression-target", type=float, default=0.25)
+    parser.add_argument("--min-rewarded-prefix-fraction", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=43)
     parser.add_argument(
         "--model-path",
@@ -800,6 +810,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
         enable_recovery=not args.disable_recovery,
         enable_positive_compression=not args.disable_positive_compression,
         positive_compression_target=args.positive_compression_target,
+        min_rewarded_prefix_fraction=args.min_rewarded_prefix_fraction,
         seed=args.seed,
         model_path=args.model_path,
         loss_mode=args.loss_mode,
@@ -859,6 +870,7 @@ def main(profile: SmokeClusterProfile = OCI_IAD_PROFILE) -> None:
             enable_recovery=not args.disable_recovery,
             enable_positive_compression=not args.disable_positive_compression,
             positive_compression_target=args.positive_compression_target,
+            min_rewarded_prefix_fraction=args.min_rewarded_prefix_fraction,
             seed=args.seed,
             model_path=args.model_path,
             loss_mode=args.loss_mode,

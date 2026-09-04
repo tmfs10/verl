@@ -259,6 +259,9 @@ algorithm:
     # Relative length reduction that earns full positive-compression credit.
     positive_compression_target: 0.25
 
+    # In branch-only mode, force the critique reward to zero when its branch boundary is at or before this fraction of the original rollout.
+    min_rewarded_prefix_fraction: 0.10
+
     # Aggregate replacement and matched-window token log-probabilities by mean or minimum.
     learnability_logprob_statistic: mean
 

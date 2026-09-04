@@ -28,6 +28,8 @@ For recovery reporting, `branch_revision/flip/success_per_valid_continuation` re
 
 `branch_revision/self_critique_reward/mean` reports the iteration mean of the raw self-critique reward `continuation_success - original_prompt_pass@1` over every generated critique. Invalid, learnability-rejected, and unsuccessful proposals have continuation success zero. This diagnostic is intentionally separate from the configured critique optimization reward, including compression and learnability weighting.
 
+In `branch_only`, `min_rewarded_prefix_fraction` compares the retained original-prefix token count with the original rollout token count after terminal-EOS removal. A structurally valid branch at or before that inclusive fraction still receives its natural continuation and the continuation keeps its ordinary binary solution reward, but the critique row's optimization reward is forced to zero. The default is `0.10`.
+
 Recovery critiques can optionally receive an independently sampled successful
 original rollout from the same prompt by setting
 `recovery_reference_mode=successful_original`. Selection is uniform with
